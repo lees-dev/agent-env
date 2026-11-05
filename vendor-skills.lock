@@ -1,0 +1,60 @@
+# Vendor skill packs: which skill names come from a vendor, so the repo never vendors them.
+# Resolved 2026-11-04. Pins, commit SHAs and sources live in versions.toml [skills.*].
+# The rules+skills area keeps this list; docs/skills.md says how each pack installs.
+# Format: one `<pack> <skill-name>` per line. `#` starts a comment.
+#
+# mattpocock-skills 1.3.2: Claude Code plugin (enabledPlugins, harness area). Other harnesses
+# read the copies that `npx skills add mattpocock/skills` wrote to ~/.agents/skills.
+mattpocock-skills ask-matt
+mattpocock-skills chief-of-staff
+mattpocock-skills claude-handoff
+mattpocock-skills code-review
+mattpocock-skills codebase-design
+mattpocock-skills diagnosing-bugs
+mattpocock-skills domain-modeling
+mattpocock-skills git-guardrails-claude-code
+mattpocock-skills grill-me
+mattpocock-skills grill-with-docs
+mattpocock-skills grilling
+mattpocock-skills handoff
+mattpocock-skills implement
+mattpocock-skills implement-spec
+mattpocock-skills improve-codebase-architecture
+mattpocock-skills loop-me
+mattpocock-skills migrate-to-shoehorn
+mattpocock-skills pr
+mattpocock-skills prototype
+mattpocock-skills research
+mattpocock-skills retro
+mattpocock-skills scaffold-exercises
+mattpocock-skills setup-matt-pocock-skills
+mattpocock-skills setup-pre-commit
+mattpocock-skills setup-ts-deep-modules
+mattpocock-skills software-factory
+mattpocock-skills tdd
+mattpocock-skills teach
+mattpocock-skills to-questionnaire
+mattpocock-skills to-spec
+mattpocock-skills to-tickets
+mattpocock-skills triage
+mattpocock-skills wait-what
+mattpocock-skills wayfinder
+mattpocock-skills wizard
+mattpocock-skills writing-beats
+mattpocock-skills writing-for-agents
+mattpocock-skills writing-fragments
+mattpocock-skills writing-shape
+#
+# higgsfield 0.14.0: `npx skills add higgsfield-ai/skills` after the Higgsfield CLI (1.2.2) is installed.
+higgsfield higgsfield-brandkit
+higgsfield higgsfield-faceless-video
+higgsfield higgsfield-generate
+higgsfield higgsfield-marketplace-cards
+higgsfield higgsfield-product-photoshoot
+higgsfield higgsfield-soul-id
+higgsfield higgsfield-video-explainer
+higgsfield higgsfield-websites
+higgsfield higgsfield-youtube-thumbnail
+#
+# typesafe 0.6.2: Claude Code plugin typesafe@typesafe-ai; WSL also has the npx skills copy.
+typesafe typesafe-ai

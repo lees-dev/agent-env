@@ -1,0 +1,53 @@
+{{- if and (eq .osFlavour "windows") (has "muse" .harnesses) -}}
+# agent-env harness: give Muse this machine's CPA client key through its documented
+# credential path, `muse auth set --provider meta --api-key-stdin` (the key never appears on
+# a command line or in settings.json). The key comes from the cpa token helper, which reads
+# 1Password; this script holds it in one variable and prints nothing of it.
+# Re-runs when the machine's 1Password item, the helper path or the key itself changes: the
+# key-sha256 line below is the SHA-256 of the key (never the key), so a rotation under the same
+# item re-runs this script on the next apply. scripts/verify compares Muse's stored key with
+# ~/.config/agent-env/cpa-key.
+# inputs: item={{ .opCpaItem }} vault={{ .opVault }} helper={{ includeTemplate "harness/cpa-token-path" . }}
+# key-sha256={{ includeTemplate "secrets/cpa-client-key" . | sha256sum }}
+# Windows PowerShell 5.1, ASCII only.
+$ErrorActionPreference = 'Stop'
+
+$helper = '{{ includeTemplate "harness/cpa-token-path" . }}'
+$local = $env:LOCALAPPDATA
+if (-not $local) { $local = Join-Path $HOME 'AppData\Local' }
+$muse = Join-Path $local 'Programs\muse\muse.cmd'
+if (-not (Test-Path -LiteralPath $muse)) {
+    $cmd = Get-Command muse -ErrorAction SilentlyContinue
+    if ($cmd) { $muse = $cmd.Source } else { $muse = $null }
+}
+if (-not $muse) {
+    [Console]::Error.WriteLine('harness-muse-auth: muse is not installed (the packages step installs it)')
+    exit 1
+}
+if (-not (Test-Path -LiteralPath $helper)) {
+    [Console]::Error.WriteLine('harness-muse-auth: the cpa token helper is missing: ' + $helper)
+    exit 1
+}
+
+$ErrorActionPreference = 'Continue'
+$key = [string](& $helper 2>$null | Where-Object { $_ } | Select-Object -Last 1)
+$rc = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+$key = $key.Trim()
+if ($rc -ne 0 -or -not $key) {
+    $key = $null
+    [Console]::Error.WriteLine('harness-muse-auth: the cpa token helper failed or printed nothing (is the 1Password CLI signed in?)')
+    exit 1
+}
+
+$ErrorActionPreference = 'Continue'
+$key | & $muse auth set --provider meta --api-key-stdin *> $null
+$rc = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+$key = $null
+if ($rc -ne 0) {
+    [Console]::Error.WriteLine('harness-muse-auth: muse auth set failed')
+    exit 1
+}
+Write-Host 'harness-muse-auth: 1 credential stored for provider meta'
+{{- end }}

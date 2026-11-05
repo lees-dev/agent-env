@@ -1,0 +1,16 @@
+{{- /*
+  The absolute path of the CPA token helper, which prints this machine's CPA client key on
+  stdout and nothing else (contract: docs/cpa.md, "No harness config holds a key").
+  The cpa area owns and deploys the helper: home/dot_config/agent-env/executable_cpa-token
+  (POSIX sh) and home/dot_config/agent-env/cpa-token.cmd (Windows).
+  The harness configs only point at it: Claude Code apiKeyHelper, Codex
+  model_providers.cpa.auth.command, Grok auth.auth_provider_command, and the Muse
+  `muse auth set` run script. This partial is the one place the path is written.
+  Tested on Windows with Claude Code 2.1.318, Codex 0.166.0 and Grok 1.0.70: each runs a
+  .cmd helper given as a plain path (Claude through cmd; Codex and Grok directly).
+*/ -}}
+{{- if eq .osFlavour "windows" -}}
+{{-   joinPath .chezmoi.homeDir ".config" "agent-env" "cpa-token.cmd" | replace "/" "\\" -}}
+{{- else -}}
+{{-   joinPath .chezmoi.homeDir ".config" "agent-env" "cpa-token" -}}
+{{- end -}}

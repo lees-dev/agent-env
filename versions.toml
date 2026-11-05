@@ -1,0 +1,198 @@
+# Pinned versions for every harness and tool this repo installs or checks.
+#
+# Resolved 2026-11-04 from each registry or release page (sources and docs: docs/research.md).
+# Re-resolve from the registry before you bump a pin; never bump from memory.
+#
+# Format contract (scripts/preflight, scripts/verify and run_onchange_ scripts parse this file
+# with a line reader, not a TOML library, so keep to it):
+#   - one [section] per item, named [<area>.<name>]
+#   - flat `key = "value"` lines only, double-quoted, no inline tables or arrays
+#   - `version` is the pin; `observed` is what a machine reported when it was not resolvable
+#     from a registry; `source` is the registry or release URL the pin came from
+#   - [overrides.<machine>] sections pin a different version on one machine (key = tool name)
+#
+# Templates read it with:
+#   {{ $versions := include (joinPath .repoDir "versions.toml") | fromToml }}
+# and run_onchange_ scripts hash it with:
+#   # versions.toml: {{ include (joinPath .repoDir "versions.toml") | sha256sum }}
+
+[meta]
+resolved = "2026-11-04"
+
+# ---- Harnesses ---------------------------------------------------------------
+
+[harness.claude]
+version = "2.1.318"
+source = "https://www.npmjs.com/package/@anthropic-ai/claude-code"
+package = "@anthropic-ai/claude-code"
+
+[harness.codex]
+version = "0.166.0"
+source = "https://www.npmjs.com/package/@openai/codex"
+package = "@openai/codex"
+
+[harness.grok]
+# No public registry found; pin is what Beast and server report (`grok --version`). [UNVERIFIED]
+version = "1.0.70"
+observed = "1.0.70 (f50904eaee6c) [stable]"
+source = "observed"
+
+[harness.muse]
+# No public registry found; pin is what Beast and server report (`muse --version`). [UNVERIFIED]
+version = "1.4.14"
+observed = "Muse Code 1.4.14 (1.4.14-R7309.1)"
+source = "observed"
+
+# ---- Bootstrap tools -----------------------------------------------------------
+
+[tools.chezmoi]
+version = "2.74.0"
+source = "https://github.com/twpayne/chezmoi/releases/tag/v2.74.0"
+
+[tools.op]
+# 1Password CLI, latest stable (2.42-2.44 are betas on 2026-11-04).
+version = "2.41.1"
+source = "https://app-updates.agilebits.com/product_history/CLI2"
+
+[tools.tailscale]
+# Re-resolved 2026-11-04 (cpa): still the latest release. Beast runs 1.104.4, server 1.102.3.
+version = "1.104.5"
+source = "https://github.com/tailscale/tailscale/releases/tag/v1.104.5"
+
+[tools.git]
+version = "2.56.0"
+source = "https://github.com/git/git/tags"
+windows = "2.56.0.windows.4"
+windows_source = "https://github.com/git-for-windows/git/releases/tag/v2.56.0.windows.4"
+# `winget` is the winget manifest version (Git.Git) when it differs from `version`.
+winget = "2.56.0.4"
+
+[tools.gh]
+version = "2.103.3"
+source = "https://github.com/cli/cli/releases/tag/v2.103.3"
+
+[tools.node]
+# Node 24 LTS (Krypton) is the machine standard; 26.13.0 (Lithium) is also LTS today.
+version = "24.22.2"
+source = "https://nodejs.org/dist/index.json"
+# winget OpenJS.NodeJS.LTS has no 24.22.2 manifest yet (newest 24.x is 24.22.1 on 2026-11-04).
+winget = "24.22.1"
+
+[tools.uv]
+version = "0.13.7"
+source = "https://github.com/astral-sh/uv/releases/tag/0.13.7"
+
+[tools.python]
+# Python 3.13 for general use. Linux/macOS: `uv python install 3.13` (newest patch uv knows).
+# Windows: winget Python.Python.3.13 (python.org installer, gives `py` and `python`).
+version = "3.13.18"
+minor = "3.13"
+source = "https://www.python.org/downloads/release/python-31318/"
+winget = "3.13.17"
+
+[tools.python312]
+# Python 3.12 for repos that pin it (server). Every OS: `uv python install 3.12`.
+# python.org ships no Windows installer for 3.12 security releases, so winget stops at 3.12.10.
+version = "3.12.16"
+minor = "3.12"
+source = "https://www.python.org/downloads/release/python-31216/"
+
+[tools.mise]
+version = "2026.11.0"
+source = "https://github.com/jdx/mise/releases/tag/v2026.11.0"
+
+[tools.oh-my-posh]
+version = "31.9.1"
+source = "https://github.com/JanDeDobbeleer/oh-my-posh/releases/tag/v31.9.1"
+
+[tools.coderabbit]
+# Linux and macOS only (no Windows build). Installer: https://cli.coderabbit.ai/install.sh
+version = "0.9.2"
+source = "https://cli.coderabbit.ai/install.sh"
+
+[tools.pwsh]
+# Optional. Every .ps1 in this repo must also run on Windows PowerShell 5.1.
+version = "7.6.9"
+source = "https://github.com/PowerShell/PowerShell/releases/tag/v7.6.9"
+
+[tools.winget]
+version = "1.29.380"
+source = "https://github.com/microsoft/winget-cli/releases/tag/v1.29.380"
+
+# ---- Hub only -------------------------------------------------------------------
+
+[hub.cliproxyapi]
+# Upstream core. Beast runs it inside the EasyCLIProxyAPI GUI, which updates the core itself,
+# so `version` records what Beast ran on 2026-11-04 and `latest` what upstream had released.
+# Nothing installs the core from this pin yet (docs/cpa.md, "Stable install path").
+version = "8.0.54"
+source = "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.54"
+latest = "8.0.55"
+latest_source = "https://github.com/router-for-me/CLIProxyAPI/releases/tag/v8.0.55"
+
+[hub.easycliproxyapi]
+# The GUI that runs the core. install_dir is the default relative to home; persist a
+# machine-local CPA_APP_DIR override before apply when restoring to another location.
+version = "0.3.73"
+source = "https://github.com/router-for-me/EasyCLIProxyAPI/releases/tag/v0.3.73"
+latest = "0.3.74"
+latest_source = "https://github.com/router-for-me/EasyCLIProxyAPI/releases/tag/v0.3.74"
+install_dir = "Downloads/EasyCLIProxyAPI-v0.3.73-Windows-amd64/EasyCLIProxyAPI-v0.3.73-Windows-amd64"
+listen = "127.0.0.1:8317"
+
+[hub.rebalancer]
+# Scheduled task "CPA Soonest-Reset Rebalancer" (run_onchange_after_40-cpa-rebalancer-task.ps1).
+version = "2026-11-04"
+source = "observed"
+interval_minutes = "5"
+time_limit_minutes = "4"
+
+# ---- Vendor skill packs (rules+skills) -----------------------------------------
+# Installed by their own tools at these pins, never copied into home/ (vendor-skills.lock
+# lists the skill names each pack provides; docs/skills.md says how each one installs).
+
+[skills.mattpocock-skills]
+# Claude Code plugin mattpocock-skills@mattpocock (marketplace github mattpocock/skills).
+version = "1.3.2"
+sha = "d1478fcb140db0b93c0c8df17bcfd311844749d0"
+source = "https://github.com/mattpocock/skills/releases/tag/v1.3.2"
+observed_beast = "plugin 1.3.2; ~/.agents/skills copies from npx skills on 2026-10-07"
+
+[skills.higgsfield]
+# Skill pack higgsfield-ai/skills (no tags; VERSION file). Needs the Higgsfield CLI.
+version = "0.14.0"
+sha = "4d0757471a704dac8729ea3c2ef0f3f330e0d9b6"
+source = "https://github.com/higgsfield-ai/skills/blob/4d0757471a704dac8729ea3c2ef0f3f330e0d9b6/VERSION"
+cli_package = "@higgsfield/cli"
+cli_version = "1.2.2"
+cli_source = "https://www.npmjs.com/package/@higgsfield/cli"
+
+[skills.typesafe]
+# Claude Code plugin typesafe@typesafe-ai (marketplace github typesafe-ai/skills).
+version = "0.6.2"
+sha = "302eea662c54bca6730873fe245bec1d69ebc23d"
+source = "https://github.com/typesafe-ai/skills/tree/v0.6.2"
+observed_wsl = "0.5.7"
+
+# ---- CI -------------------------------------------------------------------------
+
+[ci.gitleaks]
+version = "8.30.1"
+source = "https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1"
+sha256_linux_x64 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+[ci.shellcheck]
+# scripts/check.sh runs it in the guard job; sha256 of shellcheck-v<v>.linux.x86_64.tar.xz.
+version = "0.11.0"
+source = "https://github.com/koalaman/shellcheck/releases/tag/v0.11.0"
+sha256_linux_x64 = "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+
+[ci.actions-checkout]
+version = "7.0.1"
+sha = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+source = "https://github.com/actions/checkout/releases/tag/v7.0.1"
+
+# ---- Per-machine overrides --------------------------------------------------------
+
+# None committed. Put a machine's intentional pins in its untracked
+# ~/.config/agent-env/versions.local.toml [overrides] (docs/packages.md).

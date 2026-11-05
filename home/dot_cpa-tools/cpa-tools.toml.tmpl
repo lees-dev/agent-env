@@ -1,0 +1,11 @@
+{{- $v := include (joinPath .repoDir "versions.toml") | fromToml -}}
+{{- $gui := index $v.hub "easycliproxyapi" -}}
+# Rendered by chezmoi (agent-env) from versions.toml [hub.easycliproxyapi]. Set CPA_APP_DIR before apply for a local install path.
+# The ~/.cpa-tools scripts read app_dir from here. CPA_APP_DIR in the environment overrides it.
+# No secrets here: the scripts read the management key from the GUI's own config.toml at run time.
+{{ $appDir := env "CPA_APP_DIR" -}}
+{{- if not $appDir -}}{{- $appDir = joinPath .chezmoi.homeDir $gui.install_dir -}}{{- end }}
+app_dir = {{ $appDir | quote }}
+# Loopback only: the management API is never served over the tailnet (docs/cpa.md).
+base_url = "http://127.0.0.1:8317"
+management_path = "/v8/management"

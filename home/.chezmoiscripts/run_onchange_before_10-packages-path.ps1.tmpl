@@ -1,0 +1,83 @@
+{{- if eq .osFlavour "windows" -}}
+# packages 10 (Windows): PATH for the user-level install dirs.
+#   1. The user PATH (HKCU\Environment\Path) gets any missing entry of: ~\.local\bin
+#      (claude, uv's python3.12), ~\.grok\bin (grok), %LOCALAPPDATA%\Programs\muse (muse.cmd),
+#      %APPDATA%\npm (codex). Existing entries keep their order and their %VAR% form; the
+#      previous value is saved to the backup root first. New terminals see the change.
+#   2. Git Bash: ~/.bashrc gets one marked block that sources ~/.config/agent-env/env.sh
+#      (deployed by chezmoi after this script), which also puts a `muse` forwarder on PATH,
+#      because bash cannot run muse.cmd by its bare name. ~/.bash_profile gets the same block
+#      only if it exists and does not already source ~/.bashrc.
+# role={{ .role }} harnesses={{ join "," .harnesses }}
+$ErrorActionPreference = 'Stop'
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.ps1" . }}
+Pk-AssertNotMsix
+
+$backupRoot = {{ .backupRoot | replace "/" "\\" | squote }}
+$want = @("$env:USERPROFILE\.local\bin")
+{{- if has "grok" .harnesses }}
+$want += "$env:USERPROFILE\.grok\bin"
+{{- end }}
+{{- if has "muse" .harnesses }}
+$want += "$env:LOCALAPPDATA\Programs\muse"
+{{- end }}
+{{- if has "codex" .harnesses }}
+$want += "$env:APPDATA\npm"
+{{- end }}
+
+# 1. User PATH, read and written raw (REG_EXPAND_SZ) so %USERPROFILE%-style entries survive.
+$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+$raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+$have = @{}
+foreach ($e in $raw.Split(';')) {
+    if ($e) { $have[[Environment]::ExpandEnvironmentVariables($e).TrimEnd('\').ToLowerInvariant()] = $true }
+}
+$add = @()
+foreach ($w in $want) {
+    if (-not $have.ContainsKey($w.TrimEnd('\').ToLowerInvariant())) { $add += $w }
+}
+if ($add.Count -eq 0) {
+    Pk-Say ("user PATH has all {0} agent-env entries" -f $want.Count)
+} elseif (Pk-Dry) {
+    Pk-Say ("dry-run: would add {0} user PATH entries: {1}" -f $add.Count, ($add -join ', '))
+} else {
+    # Save the old value into this session's backup (scripts/backup ran just before the apply).
+    $last = $null
+    if (Test-Path -LiteralPath $backupRoot) { $last = Get-ChildItem -LiteralPath $backupRoot -Directory | Where-Object { $_.Name -match '^\d{8}T\d{6}Z$' } | Sort-Object Name | Select-Object -Last 1 }
+    if (-not $last) { $last = New-Item -ItemType Directory -Force -Path (Join-Path $backupRoot ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))) }
+    $bdir = $last.FullName
+    [IO.File]::WriteAllText((Join-Path $bdir 'user-path-before-packages.txt'), $raw, (New-Object Text.UTF8Encoding($false)))
+    $new = (@($raw.TrimEnd(';')) + $add | Where-Object { $_ }) -join ';'
+    $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    # Tell Explorer and new terminals that the environment changed (WM_SETTINGCHANGE).
+    try {
+        Add-Type -Namespace AgentEnv -Name Native -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern System.IntPtr SendMessageTimeout(System.IntPtr h, uint m, System.UIntPtr w, string l, uint f, uint t, out System.UIntPtr r);' -ErrorAction Stop
+        $r = [UIntPtr]::Zero
+        [void][AgentEnv.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$r)
+    } catch { }
+    $script:PkChanged += $add.Count
+    Pk-Say ("added {0} user PATH entries (previous value saved under {1})" -f $add.Count, $bdir)
+}
+$key.Close()
+
+# 2. Git Bash startup files. LF only, no BOM.
+$begin = '# >>> agent-env >>>'
+$block = "`n$begin`n" + '[ -r "$HOME/.config/agent-env/env.sh" ] && . "$HOME/.config/agent-env/env.sh"' + "`n# <<< agent-env <<<`n"
+$utf8 = New-Object Text.UTF8Encoding($false)
+function Add-Hook {
+    param([string]$file)
+    $name = Split-Path -Leaf $file
+    if ((Test-Path -LiteralPath $file) -and ([IO.File]::ReadAllText($file).Contains($begin))) { return }
+    if (Pk-Dry) { Pk-Say "dry-run: would add the agent-env block to ~/$name"; return }
+    [IO.File]::AppendAllText($file, $block, $utf8)
+    $script:PkChanged++
+    Pk-Say "added the agent-env block to ~/$name"
+}
+Add-Hook (Join-Path $HOME '.bashrc')
+$bp = Join-Path $HOME '.bash_profile'
+if ((Test-Path -LiteralPath $bp) -and -not ([IO.File]::ReadAllText($bp) -match '\.bashrc')) { Add-Hook $bp }
+
+Pk-Finish '10-packages-path'
+{{ end -}}

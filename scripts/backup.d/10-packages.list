@@ -1,0 +1,9 @@
+# Shell startup files that run_onchange_before_10-packages-path adds the agent-env block to
+# (WSL, Linux, macOS, and Git Bash on Windows). Relative to the home directory.
+# The Windows user PATH is a registry value, not a file: that script saves its previous
+# value as user-path-before-packages.txt in the latest ~/.agent-env-backups/<UTC timestamp>/.
+.bashrc
+.bash_profile
+.bash_login
+.profile
+.zshrc

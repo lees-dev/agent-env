@@ -1,0 +1,3 @@
+# backup lists
+
+Each `<NN>-<area>.list` names files that the area's run scripts change outside chezmoi's view, such as `~/.claude.json`, which `claude mcp add` rewrites. `scripts/backup` and `scripts/backup.ps1` copy them along with every managed target. Write one path per line, relative to `~` (a leading `~/` is fine). `#` starts a comment. A path that does not exist yet is counted and skipped. A directory is copied whole, without following links inside it (`cp -RP` keeps them as links; robocopy `/XJ` on Windows skips them): list the target of every `exact_` source directory, because apply deletes files in it that `chezmoi managed` does not list.

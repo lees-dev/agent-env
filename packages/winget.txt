@@ -1,0 +1,24 @@
+# Windows packages installed with winget by run_onchange_before_11-packages-winget.ps1.tmpl.
+# One package per line, columns separated by '|':
+#   winget id | versions.toml tools.<name> | probe command | scope | match
+#
+# - The pin is tools.<name>.winget when present, else tools.<name>.version (after machine
+#   overrides). A pin of "skip" leaves the package alone on that machine.
+# - probe: the command whose first x.y.z is compared with the pin ("not installed" when absent).
+# - scope: user    = per-user installer, no elevation (`--scope user`)
+#          any     = portable or MSIX package, no elevation, no scope flag
+#          machine = per-machine installer: needs UAC, so it runs only when the owner opted in
+#                    with AGENT_ENV_SYSTEM_PACKAGES=1 for this apply (docs/packages.md)
+# - match: exact = x.y.z must equal the pin; minor = x.y must match (installs if missing)
+#
+# Never add the harnesses here: run_onchange_before_13-packages-harnesses installs them with
+# each vendor's own installer. Never add winget's own App Installer or the Claude desktop app.
+Git.Git                 | git        | git --version        | machine | exact
+GitHub.cli              | gh         | gh --version         | machine | exact
+OpenJS.NodeJS.LTS       | node       | node --version       | machine | exact
+Tailscale.Tailscale     | tailscale  | tailscale version    | machine | exact
+astral-sh.uv            | uv         | uv --version         | any     | exact
+Python.Python.3.13      | python     | py -3.13 --version   | user    | minor
+twpayne.chezmoi         | chezmoi    | chezmoi --version    | any     | exact
+AgileBits.1Password.CLI | op         | op --version         | any     | exact
+JanDeDobbeleer.OhMyPosh | oh-my-posh | oh-my-posh version   | any     | exact

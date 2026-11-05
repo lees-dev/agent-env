@@ -1,0 +1,42 @@
+{{- /*
+  Resolved version pins for this machine, as one JSON object keyed "<area>.<name>":
+    {"tools.node": {"version": "24.22.2", "winget": "24.22.1", ...}, "harness.codex": {...}}
+  Use: {{ $pins := includeTemplate "packages/pins.json" . | fromJson }}
+
+  Precedence for `version` (highest first):
+    1. ~/.config/agent-env/versions.local.toml [overrides] <name> = "x.y.z"
+       (a machine-local file this repo never manages; see docs/packages.md)
+    2. versions.toml [overrides.<machine>] <name> = "x.y.z"
+    3. the section's own `version`
+  An override also replaces `winget` (so Windows installs the same version) and sets
+  `overridden = true`. The value "skip" means: do not install or upgrade it on this machine.
+*/ -}}
+{{- $v := include (joinPath .repoDir "versions.toml") | fromToml -}}
+{{- $mo := dict -}}
+{{- if hasKey $v "overrides" -}}
+{{-   if hasKey $v.overrides .machine -}}{{- $mo = index $v.overrides .machine -}}{{- end -}}
+{{- end -}}
+{{- $lo := dict -}}
+{{- $lf := joinPath .chezmoi.homeDir ".config/agent-env/versions.local.toml" -}}
+{{- if stat $lf -}}
+{{-   $lt := include $lf | fromToml -}}
+{{-   if hasKey $lt "overrides" -}}{{- $lo = $lt.overrides -}}{{- end -}}
+{{- end -}}
+{{- $out := dict -}}
+{{- range $area := list "tools" "harness" -}}
+{{-   if hasKey $v $area -}}
+{{-     range $name, $sec := index $v $area -}}
+{{-       $p := deepCopy $sec -}}
+{{-       $ov := "" -}}
+{{-       if hasKey $mo $name -}}{{- $ov = index $mo $name | toString -}}{{- end -}}
+{{-       if hasKey $lo $name -}}{{- $ov = index $lo $name | toString -}}{{- end -}}
+{{-       if ne $ov "" -}}
+{{-         $p = set $p "version" $ov -}}
+{{-         $p = set $p "winget" $ov -}}
+{{-         $p = set $p "overridden" true -}}
+{{-       end -}}
+{{-       $out = set $out (printf "%s.%s" $area $name) $p -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- $out | toJson -}}

@@ -1,0 +1,91 @@
+{{- if ne .osFlavour "windows" -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+#!/bin/sh
+# packages 13: the harness binaries on WSL, Linux and macOS, each with its vendor's own
+# installer, user-level (no sudo) on every role. Configuration is the harness area's job.
+#   claude  https://claude.ai/install.sh <version>   -> ~/.local/bin/claude (native build)
+#   grok    https://x.ai/cli/install.sh <version>    -> ~/.grok/bin/grok
+#   muse    https://dev.meta.ai/install.sh           -> ~/.local/bin/muse (channel launcher:
+#           it cannot be pinned, so it is installed when missing and only reported after)
+#   codex   comes from mise (run_onchange_before_12), from its GitHub release binary.
+# Installers that edit shell startup files are told not to (SHELL unset for grok,
+# MUSE_NO_MODIFY_PATH=1): env.d/10-packages.sh owns PATH.
+# harnesses={{ join "," .harnesses }} role={{ .role }} os={{ .osFlavour }}
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }}
+set -eu
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.sh" . }}
+{{- if eq .osFlavour "wsl" }}
+pk_no_windows_path
+{{- end }}
+pk_path_prepend "$HOME/.local/bin"
+pk_path_prepend "$HOME/.grok/bin"
+mkdir -p "$HOME/.local/bin"
+cd /
+
+need_bash() {
+  command -v bash >/dev/null 2>&1 && return 0
+  pk_fail "$1" "the $1 installer needs bash, which is not installed"; return 1
+}
+{{- if has "claude" .harnesses }}
+
+# claude: the native installer downloads a bootstrap build, checks it against the signed
+# release manifest, and runs `claude install <version>`. A build that auto-updated past the
+# pin is put back on the pin (the harness area turns auto-update off; docs/packages.md).
+pin={{ (index $pins "harness.claude").version | quote }}
+bin="$HOME/.local/bin/claude"
+have=$(pk_version "$bin" --version)
+if [ "$pin" = skip ]; then pk_say "claude: skipped on this machine"
+elif [ "$(pk_cmp "$have" "$pin")" = eq ]; then pk_say "claude $have"
+elif pk_dry; then pk_say "dry-run: would install claude $pin (have ${have:-none})"
+elif need_bash claude; then
+  pk_get_installer claude https://claude.ai/install.sh && bash "$PK_INSTALLER" "$pin" >/dev/null ||
+    pk_fail claude "claude installer failed"
+  have=$(pk_version "$bin" --version)
+  if [ "$have" = "$pin" ]; then pk_say "claude $have installed"; PK_CHANGED=$((PK_CHANGED + 1))
+  else pk_fail claude "claude is ${have:-missing} after install, pin $pin"; fi
+fi
+{{- end }}
+{{- if has "grok" .harnesses }}
+
+# grok: the official installer verifies the download and puts it in ~/.grok/bin.
+pin={{ (index $pins "harness.grok").version | quote }}
+bin="$HOME/.grok/bin/grok"
+have=$(pk_version "$bin" --version)
+if [ "$pin" = skip ]; then pk_say "grok: skipped on this machine"
+elif [ "$(pk_cmp "$have" "$pin")" = eq ]; then pk_say "grok $have"
+elif pk_dry; then pk_say "dry-run: would install grok $pin (have ${have:-none})"
+elif need_bash grok; then
+  pk_get_installer grok https://x.ai/cli/install.sh &&
+    env SHELL= GROK_CHANNEL=stable bash "$PK_INSTALLER" "$pin" >/dev/null ||
+    pk_fail grok "grok installer failed"
+  have=$(pk_version "$bin" --version)
+  if [ "$have" = "$pin" ]; then pk_say "grok $have installed"; PK_CHANGED=$((PK_CHANGED + 1))
+  else pk_fail grok "grok is ${have:-missing} after install, pin $pin"; fi
+fi
+{{- end }}
+{{- if has "muse" .harnesses }}
+
+# muse: installs a launcher that keeps itself on the muse-stable channel. No version pin is
+# possible; verify compares the version with versions.toml and warns.
+pin={{ (index $pins "harness.muse").version | quote }}
+bin="$HOME/.local/bin/muse"
+if [ "$pin" = skip ]; then pk_say "muse: skipped on this machine"
+elif [ -x "$bin" ]; then pk_say "muse present (channel launcher; versions.toml records $pin)"
+elif pk_dry; then pk_say "dry-run: would install muse (muse-stable channel)"
+elif need_bash muse; then
+  pk_get_installer muse https://dev.meta.ai/install.sh &&
+    env MUSE_NO_MODIFY_PATH=1 MUSE_INSTALL_DIR="$HOME/.local/bin" bash "$PK_INSTALLER" >/dev/null ||
+    pk_fail muse "muse installer failed"
+  if [ -x "$bin" ]; then pk_say "muse installed (channel launcher)"; PK_CHANGED=$((PK_CHANGED + 1))
+  else pk_fail muse "muse launcher missing after install"; fi
+fi
+{{- end }}
+{{- if has "codex" .harnesses }}
+
+pk_say "codex: installed by mise (12-packages-mise)"
+{{- end }}
+
+pk_finish 13-packages-harnesses
+{{ end -}}

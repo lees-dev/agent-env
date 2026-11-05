@@ -1,0 +1,256 @@
+#!/bin/sh
+# Read-only preflight for WSL, Linux and macOS. Windows native: scripts/preflight.ps1.
+#
+# Usage: scripts/preflight [--role hub|client|server] [--machine REMARK] [--vault NAME] [--cpa-url URL]
+# Values fall back to AGENT_ENV_ROLE / AGENT_ENV_MACHINE / AGENT_ENV_OP_VAULT / AGENT_ENV_CPA_URL,
+# then to this machine's chezmoi data, then to the defaults in home/.chezmoi.toml.tmpl
+# (service mode by default; hub vault agent-env, other devices agent-env-<machine>).
+#
+# It changes nothing: no installs, no writes, no sign-ins. It never prints a secret or an
+# account email (every command that could print one is sent to /dev/null).
+# Exit 0 when nothing FAILed, 1 otherwise. WARNs are things the apply step will fix.
+set -u
+
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+. "$REPO/scripts/lib/common.sh"
+PATH="$HOME/.local/bin:$PATH"; export PATH
+VERSIONS="$REPO/versions.toml"
+. "$REPO/scripts/lib/load-cpa-dir.sh"
+ae_load_cpa_dir || { ae_fail "persisted CPA path environment file rejected"; exit 1; }
+
+ROLE=${AGENT_ENV_ROLE:-}
+MACHINE=${AGENT_ENV_MACHINE:-}
+VAULT=${AGENT_ENV_OP_VAULT:-}
+CPA_URL=${AGENT_ENV_CPA_URL:-}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role) ROLE=$2; shift 2 ;;
+    --machine) MACHINE=$2; shift 2 ;;
+    --vault) VAULT=$2; shift 2 ;;
+    --cpa-url) CPA_URL=$2; shift 2 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$ROLE" ] || ROLE=$(ae_chezmoi_data role)
+[ -n "$MACHINE" ] || MACHINE=$(ae_chezmoi_data machine)
+[ -n "$VAULT" ] || VAULT=$(ae_chezmoi_data opVault)
+[ -n "$CPA_URL" ] || CPA_URL=$(ae_chezmoi_data cpaUrl)
+[ -n "$ROLE" ] || ROLE=client
+OS=$(ae_os_flavour)
+if [ -z "$MACHINE" ]; then
+  MACHINE=$(hostname 2>/dev/null | cut -d. -f1 | tr 'A-Z' 'a-z')
+  [ "$OS" != wsl ] || MACHINE="$MACHINE-wsl"
+fi
+OP_MODE=${AGENT_ENV_OP_MODE:-}
+[ -n "$OP_MODE" ] || OP_MODE=$(ae_chezmoi_data opMode)
+[ -n "$OP_MODE" ] || OP_MODE=service
+if [ -z "$VAULT" ]; then
+  if [ "$OP_MODE" = service ] && [ "$ROLE" != hub ]; then VAULT="agent-env-$MACHINE"; else VAULT=agent-env; fi
+fi
+[ -n "$CPA_URL" ] || CPA_URL=https://beast-1.tail7f661e.ts.net
+CPA_URL=${CPA_URL%/}; CPA_URL=${CPA_URL%/v1}
+
+echo "agent-env preflight (read-only)"
+echo "  role=$ROLE machine=$MACHINE os=$OS vault=$VAULT hub=$CPA_URL"
+
+# ---------------------------------------------------------------------------------------
+ae_section "Platform"
+case "$OS" in
+  wsl|linux|macos) ae_ok "OS flavour $OS" ;;
+  windows-shell)
+    ae_fail "Git Bash/MSYS on Windows: this machine is a Windows-native target"
+    ae_hint "run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/preflight.ps1"
+    ae_summary preflight; exit 1 ;;
+  *) ae_fail "unsupported OS $(uname -s 2>/dev/null)"; ae_summary preflight; exit 1 ;;
+esac
+case "$ROLE" in
+  hub|client|server) ae_ok "role $ROLE" ;;
+  *) ae_fail "role '$ROLE' must be hub, client or server" ;;
+esac
+if printf '%s' "$MACHINE" | grep -Eq '^[a-z0-9][a-z0-9-]{0,62}$'; then
+  ae_ok "machine remark $MACHINE"
+else
+  ae_fail "machine remark '$MACHINE' must match ^[a-z0-9][a-z0-9-]{0,62}\$"
+fi
+if [ "$ROLE" = server ] && [ "$(id -u)" -eq 0 ]; then
+  ae_fail "running as root: the server role is user-level only (no sudo, no system units)"
+fi
+if [ "$ROLE" = hub ] && [ "$OS" != macos ]; then
+  ae_warn "hub role on $OS: the hub is Beast (Windows) today; see docs/cpa.md before moving it"
+fi
+
+# ---------------------------------------------------------------------------------------
+ae_section "Repository"
+if ae_have git; then
+  ae_ok "git $(ae_semver "$(git --version)") (pin $(ae_toml_get "$VERSIONS" tools.git version))"
+  bad=$(git -C "$REPO" ls-files --eol 2>/dev/null | awk '$1 ~ /i\/(crlf|mixed)/ || ($2 ~ /w\/(crlf|mixed)/ && $3 !~ /eol=crlf/)' | wc -l | tr -d ' ')
+  if [ "$bad" -eq 0 ]; then ae_ok "checkout line endings are LF"
+  else ae_fail "$bad tracked files have CRLF line endings in this checkout"
+       ae_hint "git -C \"$REPO\" config core.autocrlf false && git -C \"$REPO\" checkout -- ."
+  fi
+else
+  ae_fail "git not found"
+fi
+case "$HOME/.agent-env-backups/" in
+  "$REPO"/*) ae_fail "backup root would be inside the repo" ;;
+  *) ae_ok "backup root $HOME/.agent-env-backups is outside the repo" ;;
+esac
+
+# ---------------------------------------------------------------------------------------
+ae_section "chezmoi"
+pin=$(ae_toml_get "$VERSIONS" tools.chezmoi version)
+if ae_have chezmoi; then
+  have=$(ae_semver "$(chezmoi --version 2>/dev/null)")
+  if [ "$have" = "$pin" ]; then ae_ok "chezmoi $have"
+  else ae_warn "chezmoi $have, pin $pin"; ae_hint "AGENTS.md step 2 installs the pinned version"; fi
+else
+  ae_warn "chezmoi not installed (pin $pin)"; ae_hint "AGENTS.md step 2 installs it"
+fi
+
+# ---------------------------------------------------------------------------------------
+ae_section "1Password (op)"
+. "$REPO/scripts/lib/load-token.sh"
+ae_load_token "$OP_MODE" || ae_fail "persisted service token file rejected"
+pin=$(ae_toml_get "$VERSIONS" tools.op version)
+op_ready=0
+if ! ae_have op; then
+  ae_fail "1Password CLI 'op' not found (pin $pin)"
+  ae_hint "AGENTS.md step 1 installs the pinned CLI; refresh PATH there, then rerun preflight"
+else
+  ae_ok "op $(ae_semver "$(op --version </dev/null 2>/dev/null)") (pin $pin)"
+  if [ "$OP_MODE" != service ] && [ "$OP_MODE" != account ]; then
+    ae_fail "1Password mode must be service or account"
+  elif [ "$OP_MODE" = service ] && [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+    ae_fail "service mode needs OP_SERVICE_ACCOUNT_TOKEN; no desktop sign-in attempted"
+  elif op whoami </dev/null >/dev/null 2>&1; then
+    ae_ok "op signed in ($OP_MODE mode)"; op_ready=1
+  else
+    ae_fail "op is not signed in ($OP_MODE mode)"
+  fi
+  if [ "$op_ready" -eq 0 ]; then
+    ae_hint "default: persist this device's service token for its user (docs/cpa.md '1Password vaults')"
+    if [ "$ROLE" = hub ]; then
+      ae_hint "hub: owner restores its service token; client-key vault agent-env"
+    else
+      ae_hint "BEAST can create vault 'agent-env-$MACHINE' and mint its key; the owner approves"
+      ae_hint "  creating its read-only service account once on BEAST (the only 1Password prompt)"
+    fi
+    ae_hint "owner: use the no-echo entry and persistence procedure in docs/cpa.md in your own terminal"
+    ae_hint "persist in mode-0600 ~/.config/op/agent-env-token; apply deploys its mode-0600 env.d loader"
+    ae_hint "  owner runs the no-echo commands in their own terminal (docs/cpa.md); rerun without restarting the agent"
+    ae_hint "account mode is opt-in: desktop CLI integration or op signin (may prompt)"
+  fi
+fi
+if [ "$op_ready" -eq 1 ]; then
+  if op vault get "$VAULT" </dev/null >/dev/null 2>&1; then
+    ae_ok "vault '$VAULT' readable"
+    item="cpa-client-$MACHINE"
+    # Lists titles only; the JSON never leaves the pipe and no field value is fetched.
+    if op item list --vault "$VAULT" --format json </dev/null 2>/dev/null | grep -Eq "\"title\": *\"$item\""; then
+      ae_ok "item '$item' exists"
+    else
+      ae_fail "item '$item' not found in vault '$VAULT'"
+      ae_hint "mint a key for remark '$MACHINE' on the hub and store it as item '$item' (docs/cpa.md)"
+    fi
+  else
+    ae_fail "vault '$VAULT' not readable by this op session"
+    ae_hint "create it or grant this account/service account read access, then rerun"
+  fi
+fi
+# BEAST's hub admin account may read all agent vaults. Device accounts see their key only.
+# Counts titles only; no field value is fetched and no title is printed.
+if [ "$op_ready" -eq 1 ] && [ "$OP_MODE" = service ]; then
+  if [ "$ROLE" = hub ]; then
+    ae_ok "hub service mode: device scope check does not apply"
+  else
+    [ "$VAULT" = "agent-env-$MACHINE" ] ||
+      ae_warn "service mode reads vault '$VAULT': use a vault of its own, 'agent-env-$MACHINE' (docs/cpa.md '1Password vaults')"
+    _op_nv=0; _op_extra=0
+    _op_vaults=$(op vault list --format json </dev/null 2>/dev/null) || ae_fail "cannot list service-account vaults to check scope"
+    for _op_v in $(printf '%s' "$_op_vaults" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'); do
+      _op_nv=$((_op_nv + 1))
+      _op_items=$(op item list --vault "$_op_v" --format json </dev/null 2>/dev/null) || ae_fail "cannot list service-account items to check scope"
+      for _op_t in $(printf '%s' "$_op_items" | grep -o '"title": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | tr ' ' '_'); do
+        case "$_op_t" in
+          "cpa-client-$MACHINE") ;;
+          *) _op_extra=$((_op_extra + 1)) ;;
+        esac
+      done
+    done
+    if [ "$_op_nv" -eq 1 ] && [ "$_op_extra" -eq 0 ]; then
+      ae_ok "device service account sees one vault and only its own key"
+    else
+      [ "$_op_nv" -eq 1 ] || ae_warn "device service account sees $_op_nv vault(s), expected one"
+      [ "$_op_extra" -eq 0 ] || ae_warn "device service account can read $_op_extra unexpected item(s)"
+      ae_hint "scope this machine's service account read-only to vault 'agent-env-$MACHINE' only (docs/cpa.md)"
+    fi
+    unset _op_nv _op_extra _op_v _op_t _op_vaults _op_items
+  fi
+fi
+
+# ---------------------------------------------------------------------------------------
+ae_section "Tailscale and hub"
+ts_cli=$(command -v tailscale 2>/dev/null || true)
+if [ -z "$ts_cli" ] && [ "$OS" = macos ] && [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+  ts_cli=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+fi
+if [ -n "$ts_cli" ]; then
+  ae_ok "tailscale $(ae_semver "$("$ts_cli" version 2>/dev/null)") (pin $(ae_toml_get "$VERSIONS" tools.tailscale version))"
+  if "$ts_cli" status --json --peers=false 2>/dev/null | grep -Eq '"BackendState": *"Running"'; then
+    ae_ok "tailscale is up"
+  else
+    ae_fail "tailscale is not running or not logged in"; ae_hint "tailscale up   (interactive login)"
+  fi
+elif [ "$OS" = wsl ]; then
+  ae_info "no tailscale inside WSL: relying on the Windows host (mirrored networking)"
+elif [ "$OS" = macos ]; then
+  ae_warn "Tailscale CLI unavailable: enable CLI integration in the app; hub probe below checks connectivity"
+else
+  ae_fail "tailscale not found"; ae_hint "install: https://tailscale.com/download , then 'tailscale up'"
+fi
+if ae_have curl; then
+  # No key is sent: 401/403 proves the hub answered, 200 means it is open (report it).
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$CPA_URL/v1/models" 2>/dev/null)
+  case "$code" in
+    401|403) ae_ok "hub reachable at $CPA_URL (HTTP $code without a key)" ;;
+    200) ae_warn "hub answered 200 without a key: client-key auth looks off (docs/cpa.md)" ;;
+    000|"") ae_fail "hub $CPA_URL unreachable"
+            ae_hint "check 'tailscale status', the tailnet grant for this device, and that Beast is on" ;;
+    *) ae_warn "hub answered HTTP $code" ;;
+  esac
+  if [ "$ROLE" = hub ]; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8317/v1/models 2>/dev/null)
+    case "$code" in 000|"") ae_fail "CLIProxyAPI not listening on 127.0.0.1:8317" ;;
+      *) ae_ok "CLIProxyAPI on 127.0.0.1:8317 (HTTP $code)" ;; esac
+  fi
+else
+  ae_fail "curl not found"
+fi
+
+# ---------------------------------------------------------------------------------------
+ae_section "Harnesses"
+for h in claude codex grok muse; do
+  pin=$(ae_pin "$VERSIONS" harness "$h" "$MACHINE")
+  bin=$(command -v "$h" 2>/dev/null || true)
+  [ -n "$bin" ] || { [ "$h" = grok ] && [ -x "$HOME/.grok/bin/grok" ] && bin="$HOME/.grok/bin/grok"; }
+  if [ -z "$bin" ]; then ae_warn "$h not installed (pin $pin)"; continue; fi
+  have=$(ae_semver "$("$bin" --version 2>/dev/null | head -n 1)")
+  if ! command -v "$h" >/dev/null 2>&1; then
+    ae_warn "$h $have found at $bin but not on PATH"
+  elif [ "$have" = "$pin" ]; then ae_ok "$h $have"
+  else ae_warn "$h $have, pin $pin"
+  fi
+done
+
+ae_section "Other tools"
+for t in node npm gh uv; do
+  pin=$(ae_pin "$VERSIONS" tools "$t" "$MACHINE")
+  if ae_have "$t"; then ae_ok "$t $(ae_semver "$("$t" --version 2>/dev/null | head -n 1)")${pin:+ (pin $pin)}"
+  else ae_warn "$t not installed${pin:+ (pin $pin)}"; fi
+done
+
+# ---------------------------------------------------------------------------------------
+ae_run_dropins "$REPO/scripts/preflight.d" "preflight"
+
+ae_summary preflight

@@ -1,0 +1,2 @@
+{{- /* Renders ~/.codex/AGENTS.md (default CODEX_HOME) from the shared rules (home/.chezmoitemplates/rules/global.md). */ -}}
+{{ includeTemplate "rules/global.md" (merge (dict "harness" "codex") .) | trim }}

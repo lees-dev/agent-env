@@ -1,0 +1,171 @@
+{{- /*
+  agent-env chezmoi config template. chezmoi renders it once at `chezmoi init`
+  (and again on `chezmoi init` after an edit). Every data key is documented in
+  docs/layout.md ("Template data keys"). Add a key here and there in the same commit.
+
+  Answers come from, in order: an AGENT_ENV_* environment variable, the value
+  already in this machine's chezmoi config, then an interactive prompt.
+  Non-interactive init (the runbook uses this; POSIX shell shown):
+    AGENT_ENV_ROLE=client AGENT_ENV_MACHINE=wsl AGENT_ENV_HARNESSES=claude,codex,grok,muse \
+    AGENT_ENV_CPA_URL=https://beast-1.tail7f661e.ts.net \
+    AGENT_ENV_OP_VAULT=agent-env-wsl AGENT_ENV_OP_MODE=service \
+      chezmoi init --source <repo>
+  (chezmoi's own --promptString flags key on the prompt text, not the data key,
+  so the runbook does not use them.)
+
+  This template reads no secret. Service mode is the default on every device.
+*/ -}}
+
+{{- /* ---- OS flavour: windows | wsl | linux | macos ---- */ -}}
+{{- $osFlavour := "linux" -}}
+{{- if eq .chezmoi.os "windows" -}}
+{{-   $osFlavour = "windows" -}}
+{{- else if eq .chezmoi.os "darwin" -}}
+{{-   $osFlavour = "macos" -}}
+{{- else if eq .chezmoi.os "linux" -}}
+{{-   if (.chezmoi.kernel.osrelease | lower | contains "microsoft") -}}
+{{-     $osFlavour = "wsl" -}}
+{{-   end -}}
+{{- end -}}
+
+{{- /* ---- Distro and package manager ---- */ -}}
+{{- $distro := .chezmoi.os -}}
+{{- if eq .chezmoi.os "darwin" -}}{{- $distro = "macos" -}}{{- end -}}
+{{- if eq .chezmoi.os "linux" -}}
+{{-   $distro = dig "osRelease" "id" "linux" .chezmoi -}}
+{{- end -}}
+{{- $distroFamily := $distro -}}
+{{- if has $distro (list "ubuntu" "debian" "pop" "linuxmint") -}}
+{{-   $distroFamily = "debian" -}}
+{{- else if has $distro (list "rocky" "rhel" "almalinux" "centos" "fedora" "ol") -}}
+{{-   $distroFamily = "rhel" -}}
+{{- end -}}
+{{- $pkgManager := "none" -}}
+{{- if eq $osFlavour "windows" -}}{{- $pkgManager = "winget" -}}
+{{- else if eq $osFlavour "macos" -}}{{- $pkgManager = "brew" -}}
+{{- else if eq $distroFamily "debian" -}}{{- $pkgManager = "apt" -}}
+{{- else if eq $distroFamily "rhel" -}}{{- $pkgManager = "dnf" -}}
+{{- end -}}
+
+{{- /* ---- Questions (asked once, then remembered in the config file) ---- */ -}}
+{{- $role := env "AGENT_ENV_ROLE" | lower | trim -}}
+{{- if eq $role "" -}}
+{{-   $role = promptChoiceOnce . "role" "Role of this machine (hub runs CLIProxyAPI; client uses it; server is a headless, user-level-only client for remote work)" (list "hub" "client" "server") "client" -}}
+{{- end -}}
+{{- if not (has $role (list "hub" "client" "server")) -}}
+{{-   fail (printf "role %q must be hub, client or server" $role) -}}
+{{- end -}}
+{{- $machineDefault := .chezmoi.hostname | lower -}}
+{{- if eq $osFlavour "wsl" -}}{{- $machineDefault = printf "%s-wsl" $machineDefault -}}{{- end -}}
+{{- $machine := env "AGENT_ENV_MACHINE" -}}
+{{- if eq $machine "" -}}
+{{-   $machine = promptStringOnce . "machine" "Machine remark (names this machine's CPA client key and its 1Password item; lowercase, a-z 0-9 -)" $machineDefault -}}
+{{- end -}}
+{{- $machine = $machine | lower | trim -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9-]{0,62}$" $machine) -}}
+{{-   fail (printf "machine remark %q must match ^[a-z0-9][a-z0-9-]{0,62}$" $machine) -}}
+{{- end -}}
+{{- $cpaUrl := env "AGENT_ENV_CPA_URL" -}}
+{{- if eq $cpaUrl "" -}}
+{{-   $cpaUrl = promptStringOnce . "cpaUrl" "CLIProxy hub URL, without /v1" "https://beast-1.tail7f661e.ts.net" -}}
+{{- end -}}
+{{- $cpaUrl = $cpaUrl | trim | trimSuffix "/" | trimSuffix "/v1" -}}
+{{- /* https:// (the Tailscale serve URL) everywhere. WSL on the hub host reaches CPA on
+       loopback through mirrored networking instead (docs/cpa.md, "WSL on the hub host"). */ -}}
+{{- $loopbackOk := and (eq $osFlavour "wsl") (regexMatch "^http://(127\\.0\\.0\\.1|localhost):[0-9]{1,5}$" $cpaUrl) -}}
+{{- if not (or (hasPrefix "https://" $cpaUrl) $loopbackOk) -}}
+{{-   fail (printf "cpaUrl %q must be an https:// Tailscale serve URL (WSL on the hub host may use http://127.0.0.1:<port>)" $cpaUrl) -}}
+{{- end -}}
+{{- $opModeDefault := "service" -}}
+{{- $opMode := env "AGENT_ENV_OP_MODE" | lower | trim -}}
+{{- if eq $opMode "" -}}
+{{-   $opMode = promptChoiceOnce . "opMode" "1Password access (account = desktop-app integration or op signin; service = OP_SERVICE_ACCOUNT_TOKEN)" (list "account" "service") $opModeDefault -}}
+{{- end -}}
+{{- if not (has $opMode (list "account" "service")) -}}
+{{-   fail (printf "opMode %q must be account or service" $opMode) -}}
+{{- end -}}
+{{- /* Hub service mode uses the hub credential and agent-env. Every other
+       device gets agent-env-<machine> with its own key only. Account mode is opt-in. */ -}}
+{{- $opVaultDefault := "agent-env" -}}
+{{- if and (eq $opMode "service") (ne $role "hub") -}}{{- $opVaultDefault = printf "agent-env-%s" $machine -}}{{- end -}}
+{{- $opVault := env "AGENT_ENV_OP_VAULT" | trim -}}
+{{- if eq $opVault "" -}}
+{{-   $opVault = promptStringOnce . "opVault" "1Password client-key vault (hub/account: agent-env; other service devices: agent-env-<machine>)" $opVaultDefault -}}
+{{- end -}}
+
+{{- $allHarnesses := list "claude" "codex" "grok" "muse" -}}
+{{- $harnesses := list -}}
+{{- if ne (env "AGENT_ENV_HARNESSES") "" -}}
+{{-   range (env "AGENT_ENV_HARNESSES" | lower | splitList ",") -}}
+{{-     $h := trim . -}}
+{{-     if not (has $h $allHarnesses) -}}{{- fail (printf "harness %q must be one of claude, codex, grok, muse" $h) -}}{{- end -}}
+{{-     $harnesses = append $harnesses $h -}}
+{{-   end -}}
+{{- else -}}
+{{-   $harnesses = promptMultichoiceOnce . "harnesses" "Harnesses to install and configure on this machine" $allHarnesses $allHarnesses -}}
+{{- end -}}
+
+{{- /* ---- Test mode: AGENT_ENV_NO_SECRETS=1 ----
+       For rendering into a throwaway --destination only (docs/testing.md). The secret partials
+       return a fixed placeholder instead of calling 1Password, so op is never run. Every
+       command fails when the destination is the real home directory (.chezmoiignore guard). */ -}}
+{{- $noSecrets := has (env "AGENT_ENV_NO_SECRETS" | lower | trim) (list "1" "true" "yes") -}}
+
+{{- /* ---- Derived ---- */ -}}
+{{- $headless := or (eq $role "server") (and (ne $osFlavour "windows") (ne $osFlavour "macos")) -}}
+{{- $linkMode := "symlink" -}}
+{{- if eq $osFlavour "windows" -}}{{- $linkMode = "junction" -}}{{- end -}}
+{{- /* The repo root: the source dir minus the .chezmoiroot directory. Not .chezmoi.workingTree,
+       which is whatever git repo encloses the source and can be a parent directory. */ -}}
+{{- $repoDir := .chezmoi.sourceDir | trimSuffix "/" | trimSuffix "/home" -}}
+
+sourceDir = {{ $repoDir | quote }}
+
+[data]
+    # Asked
+    role = {{ $role | quote }}
+    machine = {{ $machine | quote }}
+    cpaUrl = {{ $cpaUrl | quote }}
+    opVault = {{ $opVault | quote }}
+    opMode = {{ $opMode | quote }}
+    harnesses = {{ $harnesses | toToml }}
+    # Test mode (AGENT_ENV_NO_SECRETS=1): placeholders instead of 1Password; throwaway destinations only
+    noSecrets = {{ $noSecrets }}
+    # Derived from the OS
+    osFlavour = {{ $osFlavour | quote }}
+    distro = {{ $distro | quote }}
+    distroFamily = {{ $distroFamily | quote }}
+    pkgManager = {{ $pkgManager | quote }}
+    headless = {{ $headless }}
+    linkMode = {{ $linkMode | quote }}
+    # Derived from the answers
+    cpaAnthropicBaseUrl = {{ $cpaUrl | quote }}
+    cpaOpenAIBaseUrl = {{ printf "%s/v1" $cpaUrl | quote }}
+    opCpaItem = {{ printf "cpa-client-%s" $machine | quote }}
+    repoDir = {{ $repoDir | quote }}
+    backupRoot = {{ printf "%s/.agent-env-backups" .chezmoi.homeDir | quote }}
+
+[onepassword]
+    mode = {{ $opMode | quote }}
+    # Never let chezmoi start an interactive sign-in mid-apply; preflight proves sign-in first.
+    prompt = false
+
+[git]
+    autoCommit = false
+    autoPush = false
+
+[scriptEnv]
+    AGENT_ENV_REPO = {{ $repoDir | quote }}
+    AGENT_ENV_HARNESSES = {{ join "," $harnesses | quote }}
+    AGENT_ENV_ROLE = {{ $role | quote }}
+    AGENT_ENV_OS = {{ $osFlavour | quote }}
+    AGENT_ENV_MACHINE = {{ $machine | quote }}
+    AGENT_ENV_BACKUP_ROOT = {{ printf "%s/.agent-env-backups" .chezmoi.homeDir | quote }}
+    AGENT_ENV_NO_SECRETS = {{ ternary "1" "0" $noSecrets | quote }}
+{{- if eq $osFlavour "windows" }}
+
+# Windows PowerShell 5.1 ships with every Windows; pwsh does not. Every .ps1 here runs on 5.1.
+[interpreters.ps1]
+    command = "powershell"
+    args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+{{- end }}

@@ -1,0 +1,59 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- /*
+  ~/.codex/config.toml: merge the keys agent-env manages and keep every other key.
+
+  Managed: model_provider, model, model_reasoning_effort, model_providers.<provider>
+  (name, base_url, wire_api, supports_websockets, retries, auth.command and its timeouts),
+  mcp_servers.<name>.url, analytics.enabled, feedback.enabled.
+  Removed: model_providers.<provider>.env_key and .experimental_bearer_token (auth.command
+  replaces them; Codex treats them as alternatives), and the legacy providers listed in
+  harness/config.toml, which carry a plaintext key.
+
+  MCP servers are set here, not with `codex mcp add`, which starts a blocking OAuth flow.
+  Sign in once per machine with `codex mcp login <name>`.
+
+  toToml drops comments, so the file is rewritten only when a managed value is wrong;
+  otherwise it is passed through byte for byte. Values: harness/config.toml.
+*/ -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $c := $cfg.codex -}}
+{{- $mo := dig "machines" .machine "codex" dict $cfg -}}
+{{- $orig := dict -}}
+{{- $s := dict -}}
+{{- if trim .chezmoi.stdin -}}
+{{-   $orig = fromToml .chezmoi.stdin -}}
+{{-   $s = fromToml .chezmoi.stdin -}}
+{{- end -}}
+{{- $p := $c.provider -}}
+
+{{- $s = setValueAtPath (list "model_provider") $p $s -}}
+{{- $s = setValueAtPath (list "model") (dig "model" $c.model $mo) $s -}}
+{{- $s = setValueAtPath (list "model_reasoning_effort") (dig "effort" $c.effort $mo) $s -}}
+
+{{- $s = setValueAtPath (list "model_providers" $p "name") $c.provider_name $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "base_url") .cpaOpenAIBaseUrl $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "wire_api") $c.wire_api $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "supports_websockets") $c.supports_websockets $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "request_max_retries") $c.request_max_retries $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "stream_max_retries") $c.stream_max_retries $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "auth" "command") (includeTemplate "harness/cpa-token-path" .) $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "auth" "timeout_ms") $c.auth_timeout_ms $s -}}
+{{- $s = setValueAtPath (list "model_providers" $p "auth" "refresh_interval_ms") $c.auth_refresh_interval_ms $s -}}
+{{- $s = deleteValueAtPath (printf "model_providers.%s.env_key" $p) $s -}}
+{{- $s = deleteValueAtPath (printf "model_providers.%s.experimental_bearer_token" $p) $s -}}
+{{- range $c.legacy_providers -}}
+{{-   if ne . $p -}}{{- $s = deleteValueAtPath (printf "model_providers.%s" .) $s -}}{{- end -}}
+{{- end -}}
+
+{{- range $name, $m := $c.mcp -}}
+{{-   $s = setValueAtPath (list "mcp_servers" $name "url") $m.url $s -}}
+{{- end -}}
+
+{{- $s = setValueAtPath (list "analytics" "enabled") $c.analytics_enabled $s -}}
+{{- $s = setValueAtPath (list "feedback" "enabled") $c.feedback_enabled $s -}}
+
+{{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
+{{-   .chezmoi.stdin -}}
+{{- else -}}
+{{-   toToml $s -}}
+{{- end -}}

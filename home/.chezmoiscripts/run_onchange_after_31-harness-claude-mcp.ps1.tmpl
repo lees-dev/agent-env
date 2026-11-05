@@ -1,0 +1,41 @@
+{{- if and (eq .osFlavour "windows") (has "claude" .harnesses) -}}
+# agent-env harness: register Claude Code's user-scope MCP servers (harness/config.toml
+# [claude.mcp.*]) with `claude mcp add --scope user`. Claude Code keeps them in
+# ~/.claude.json, which agent-env never writes itself (scripts/backup.d/30-harness.list
+# backs it up). A server that already exists is left as it is, including its auth.
+# Sign-in (OAuth) is left to the owner: run /mcp in Claude Code once.
+# Prints names and counts only. Windows PowerShell 5.1, ASCII only.
+$ErrorActionPreference = 'Stop'
+{{ template "packages/lib.ps1" . }}
+# Each run script inherits chezmoi's PATH from before the apply. The packages step installed
+# claude into ~\.local\bin and put that on the user PATH in the registry only, so rebuild PATH
+# here and call the vendor binary by its absolute path first.
+Pk-RefreshPath
+$claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+if (-not (Test-Path -LiteralPath $claude)) {
+    $c = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { $claude = $c.Source } else {
+        [Console]::Error.WriteLine('harness-claude-mcp: claude is not installed (the packages step installs it into ~\.local\bin)')
+        exit 1
+    }
+}
+
+$script:added = 0
+$script:present = 0
+function Add-Http {
+    param([string]$name, [string]$url)
+    # Native stderr under 'Stop' throws in Windows PowerShell 5.1, so relax it for the call.
+    $ErrorActionPreference = 'Continue'
+    $out = (& $claude mcp add --transport http --scope user $name $url 2>&1 | Out-String)
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rc -eq 0) { $script:added++ }
+    elseif ($out -match 'already exists') { $script:present++ }
+    else { throw ('harness-claude-mcp: adding ' + $name + ' failed') }
+}
+
+{{ range $name, $m := (includeTemplate "harness/config.toml" . | fromToml).claude.mcp -}}
+Add-Http '{{ $name }}' '{{ $m.url }}'
+{{ end -}}
+Write-Host ('harness-claude-mcp: {0} added, {1} already present' -f $script:added, $script:present)
+{{- end }}

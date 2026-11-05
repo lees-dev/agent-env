@@ -1,0 +1,129 @@
+{{- if and (eq .osFlavour "windows") (has "claude" .harnesses) -}}
+# agent-env rules+skills: make ~/.claude/skills/<name> a directory junction to ~/.agents/skills/<name>
+# for every canonical skill in the repo, so the two can never drift (docs/skills.md).
+#
+# Runs after every apply (run_after_): it is idempotent and prints counts and skill names only.
+#   - a correct junction is left alone
+#   - a missing entry gets a junction
+#   - a junction or symlink that points elsewhere, or dangles, is recorded and replaced
+#   - a real directory whose content (LF-normalised) equals the canonical copy is moved to
+#     the backup root, then replaced by a junction
+#   - a real directory that differs is LEFT IN PLACE and reported; scripts/verify fails on it
+#   - links in ~/.claude/skills that point into ~/.agents/skills and dangle are removed
+# It never touches ~/.claude/skills/synced or any name that is not a canonical skill.
+# Junctions need no Developer Mode or elevation. A junction is removed with
+# [IO.Directory]::Delete(path, $false), which deletes the link and never the target.
+# skills: {{ range glob (joinPath .chezmoi.sourceDir "dot_agents/skills/exact_*") }}{{ base . | trimPrefix "exact_" }} {{ end }}
+$ErrorActionPreference = 'Stop'
+
+$names = @({{ range $i, $p := glob (joinPath .chezmoi.sourceDir "dot_agents/skills/exact_*") }}{{ if $i }}, {{ end }}'{{ base $p | trimPrefix "exact_" }}'{{ end }})
+$dest = [IO.Path]::GetFullPath('{{ .chezmoi.destDir }}')
+$agents = Join-Path $dest '.agents\skills'
+$claude = Join-Path $dest '.claude\skills'
+$backupBase = [IO.Path]::GetFullPath('{{ .backupRoot }}')
+$stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+$backup = Join-Path $backupBase ($stamp + '-skills-links')
+
+function Get-LinkTarget([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    if ($item.LinkType -eq 'Junction' -or $item.LinkType -eq 'SymbolicLink') {
+        $t = @($item.Target)[0]
+        if ($t) { return [IO.Path]::GetFullPath($t).TrimEnd('\') }
+        return ''
+    }
+    return $null
+}
+
+function Get-TreeHash([string]$root) {
+    # sha256 over "relpath<TAB>sha256(LF-normalised bytes)<LF>" lines, sorted by relpath.
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $full = [IO.Path]::GetFullPath($root).TrimEnd('\')
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($f in [IO.Directory]::GetFiles($full, '*', [IO.SearchOption]::AllDirectories)) {
+        $rel = $f.Substring($full.Length + 1).Replace('\', '/')
+        $bytes = [IO.File]::ReadAllBytes($f)
+        if ([Array]::IndexOf($bytes, [byte]0) -lt 0) {
+            $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes).Replace("`r`n", "`n")
+            $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes($text)
+        }
+        $h = -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+        $lines.Add($rel + "`t" + $h + "`n")
+    }
+    $sorted = $lines.ToArray()
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $all = [Text.Encoding]::UTF8.GetBytes(-join $sorted)
+    return -join ($sha.ComputeHash($all) | ForEach-Object { $_.ToString('x2') })
+}
+
+function Save-Backup([string]$name, [string]$kind, [string]$detail) {
+    if (-not (Test-Path -LiteralPath $backup)) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $backup 'claude-skills') | Out-Null
+        Set-Content -LiteralPath (Join-Path $backup 'manifest.tsv') -Value ("kind`tpath`tdetail") -Encoding ASCII
+    }
+    Add-Content -LiteralPath (Join-Path $backup 'manifest.tsv') -Value ($kind + "`t.claude/skills/" + $name + "`t" + $detail) -Encoding ASCII
+}
+
+New-Item -ItemType Directory -Force -Path $claude | Out-Null
+$ok = 0; $created = 0; $replaced = 0; $relinked = 0; $pruned = 0; $kept = @(); $missing = @()
+
+foreach ($n in $names) {
+    $src = Join-Path $agents $n
+    $dst = Join-Path $claude $n
+    if (-not (Test-Path -LiteralPath (Join-Path $src 'SKILL.md'))) { $missing += $n; continue }
+    $srcFull = [IO.Path]::GetFullPath($src).TrimEnd('\')
+    if (Test-Path -LiteralPath $dst) {
+        $target = Get-LinkTarget $dst
+        if ($null -ne $target) {
+            if ($target -ieq $srcFull) { $ok++; continue }
+            Save-Backup $n 'link' $target
+            [IO.Directory]::Delete($dst, $false)
+            New-Item -ItemType Junction -Path $dst -Value $srcFull | Out-Null
+            $relinked++
+            continue
+        }
+        if ((Get-Item -LiteralPath $dst -Force).PSIsContainer -and ((Get-TreeHash $dst) -eq (Get-TreeHash $srcFull))) {
+            Save-Backup $n 'dir' 'identical to canonical; moved here'
+            Move-Item -LiteralPath $dst -Destination (Join-Path (Join-Path $backup 'claude-skills') $n)
+            New-Item -ItemType Junction -Path $dst -Value $srcFull | Out-Null
+            $replaced++
+            continue
+        }
+        $kept += $n
+        continue
+    }
+    # Test-Path is false for a dangling link, so check for a reparse point before creating.
+    $stale = Get-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+    if ($stale) {
+        Save-Backup $n 'link' 'dangling'
+        [IO.Directory]::Delete($dst, $false)
+        New-Item -ItemType Junction -Path $dst -Value $srcFull | Out-Null
+        $relinked++
+        continue
+    }
+    New-Item -ItemType Junction -Path $dst -Value $srcFull | Out-Null
+    $created++
+}
+
+# Prune dangling links that point into ~/.agents/skills (a skill removed from the repo).
+$agentsFull = [IO.Path]::GetFullPath($agents).TrimEnd('\')
+foreach ($item in (Get-ChildItem -LiteralPath $claude -Force -Directory)) {
+    if ($item.Name -eq 'synced') { continue }
+    if ($item.LinkType -ne 'Junction' -and $item.LinkType -ne 'SymbolicLink') { continue }
+    $t = @($item.Target)[0]
+    if (-not $t) { continue }
+    $tf = [IO.Path]::GetFullPath($t).TrimEnd('\')
+    if ($tf.StartsWith($agentsFull + '\', [StringComparison]::OrdinalIgnoreCase) -and -not (Test-Path -LiteralPath $tf)) {
+        Save-Backup $item.Name 'link' $tf
+        [IO.Directory]::Delete($item.FullName, $false)
+        $pruned++
+    }
+}
+
+Write-Host ('skills links: ' + $names.Count + ' canonical; ' + $ok + ' ok, ' + $created + ' created, ' + $replaced + ' replaced (backed up), ' + $relinked + ' relinked, ' + $pruned + ' pruned, ' + $kept.Count + ' kept (differ), ' + $missing.Count + ' canonical missing')
+if ($kept.Count -gt 0) { Write-Host ('  kept, differ from the canonical copy: ' + ($kept -join ' ')) }
+if (Test-Path -LiteralPath $backup) { Write-Host ('  backup: ' + $backup) }
+if ($missing.Count -gt 0) {
+    Write-Host ('  canonical copy missing in ~/.agents/skills: ' + ($missing -join ' '))
+    exit 1
+}
+{{- end }}

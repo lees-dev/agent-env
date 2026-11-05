@@ -1,0 +1,61 @@
+{{- if and (eq .role "hub") (eq .osFlavour "windows") -}}
+{{- $v := include (joinPath .repoDir "versions.toml") | fromToml -}}
+{{- $rb := index $v.hub "rebalancer" -}}
+# agent-env, cpa area: the hub's "CPA Soonest-Reset Rebalancer" scheduled task (Windows hub only).
+#
+# Ensures a user-level task (logged-on user, no elevation) runs
+#   pythonw -I ~/.cpa-tools/soonest_reset.py
+# every {{ $rb.interval_minutes }} minutes with a {{ $rb.time_limit_minutes }}-minute limit, as on Beast today.
+# Idempotent: a task whose action, interval and limit already match is left alone. A task that
+# differs is exported to the backup root before it is replaced. Prints names and counts only.
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }}
+$ErrorActionPreference = 'Stop'
+$name = 'CPA Soonest-Reset Rebalancer'
+$intervalMin = {{ $rb.interval_minutes }}
+$limitMin = {{ $rb.time_limit_minutes }}
+$script = Join-Path $HOME '.cpa-tools\soonest_reset.py'
+if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+    Write-Warning "cpa: private rebalancer missing; restore it from the owner's private backup, then rerun this task script"
+    exit 0
+}
+$pathParts = @()
+foreach ($scope in 'Machine', 'User') {
+    $value = [Environment]::GetEnvironmentVariable('Path', $scope)
+    if ($value) { $pathParts += $value.Split(';') }
+}
+$env:Path = (($pathParts + $env:Path.Split(';')) | Where-Object { $_ } | Select-Object -Unique) -join ';'
+$pyCmd = Get-Command 'pythonw.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+$py = ''
+if ($pyCmd) { $py = $pyCmd.Source }
+if (-not $py) {
+    $candidate = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\pythonw.exe'
+    if (Test-Path -LiteralPath $candidate) { $py = $candidate }
+}
+if (-not $py) { throw 'cpa: pythonw.exe missing (apply must install Python 3.11+ for tomllib)' }
+$want = '-I "' + $script + '"'
+
+$t = Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue
+if ($t) {
+    $a = @($t.Actions)
+    $tr = @($t.Triggers)
+    $same = ($a.Count -eq 1) -and ($a[0].Execute -ieq $py) -and ($a[0].Arguments -ieq $want) -and
+        ($tr.Count -eq 1) -and ($tr[0].Repetition.Interval -eq ('PT{0}M' -f $intervalMin)) -and
+        ($t.Settings.ExecutionTimeLimit -eq ('PT{0}M' -f $limitMin))
+    if ($same) { Write-Host "cpa: task '$name' unchanged"; exit 0 }
+    $root = $env:AGENT_ENV_BACKUP_ROOT
+    if (-not $root) { $root = Join-Path $HOME '.agent-env-backups' }
+    $dir = Join-Path $root ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '\scheduled-tasks')
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Export-ScheduledTask -TaskName $name -TaskPath '\' | Set-Content -LiteralPath (Join-Path $dir 'cpa-soonest-reset-rebalancer.xml') -Encoding Unicode
+    Write-Host "cpa: task '$name' differs; exported the old definition to the backup root"
+}
+
+$action = New-ScheduledTaskAction -Execute $py -Argument $want -WorkingDirectory (Join-Path $HOME '.cpa-tools')
+# No -RepetitionDuration: the repetition runs indefinitely, like the task on Beast today.
+$trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes $intervalMin)
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes $limitMin) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $name -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'agent-env: CLIProxyAPI soonest-reset rebalancer (docs/cpa.md)' -Force | Out-Null
+$n = (Get-ScheduledTask -TaskName $name -TaskPath '\' | Select-Object -ExpandProperty Triggers).Repetition.Interval
+Write-Host "cpa: task '$name' registered (interval $n)"
+{{- end }}

@@ -1,0 +1,43 @@
+{{- if and (ne .osFlavour "windows") (has "muse" .harnesses) -}}
+#!/bin/sh
+# agent-env harness: give Muse this machine's CPA client key through its documented
+# credential path, `muse auth set --provider meta --api-key-stdin` (the key never appears on
+# a command line or in settings.json). The key comes from the cpa token helper, which reads
+# 1Password; this script holds it in one shell variable and prints nothing of it.
+# Re-runs when the machine's 1Password item, the helper path or the key itself changes: the
+# key-sha256 line below is the SHA-256 of the key (never the key), so a rotation under the same
+# item re-runs this script on the next apply. scripts/verify compares Muse's stored key with
+# ~/.config/agent-env/cpa-key.
+# inputs: item={{ .opCpaItem }} vault={{ .opVault }} helper={{ includeTemplate "harness/cpa-token-path" . }}
+# key-sha256={{ includeTemplate "secrets/cpa-client-key" . | sha256sum }}
+set -eu
+
+helper={{ includeTemplate "harness/cpa-token-path" . | shellQuote }}
+muse=$(command -v muse 2>/dev/null || true)
+for c in "$HOME/.local/bin/muse" /opt/homebrew/bin/muse /usr/local/bin/muse; do
+  if [ -z "$muse" ] && [ -x "$c" ]; then muse=$c; fi
+done
+if [ -z "$muse" ]; then
+  echo "harness-muse-auth: muse is not installed (the packages step installs it)" >&2
+  exit 1
+fi
+if [ ! -x "$helper" ]; then
+  echo "harness-muse-auth: the cpa token helper is missing or not executable: $helper" >&2
+  exit 1
+fi
+if ! key=$("$helper" 2>/dev/null); then
+  echo "harness-muse-auth: the cpa token helper failed (is the 1Password CLI signed in?)" >&2
+  exit 1
+fi
+if [ -z "$key" ]; then
+  echo "harness-muse-auth: the cpa token helper printed nothing" >&2
+  exit 1
+fi
+if ! printf '%s' "$key" | "$muse" auth set --provider meta --api-key-stdin >/dev/null 2>&1; then
+  key=
+  echo "harness-muse-auth: muse auth set failed" >&2
+  exit 1
+fi
+key=
+echo "harness-muse-auth: 1 credential stored for provider meta"
+{{- end }}

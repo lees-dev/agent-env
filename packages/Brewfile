@@ -1,0 +1,11 @@
+# macOS packages: run_onchange_before_11-packages-system.sh.tmpl runs
+#   brew bundle install --file packages/Brewfile --no-upgrade
+# only when the owner opted in for this apply with AGENT_ENV_SYSTEM_PACKAGES=1.
+# Homebrew does not pin versions, so this list holds only unpinned base tools. Pinned tools
+# (node, uv, gh, oh-my-posh, codex) come from mise; see packages/mise-tools.toml.
+# Tailscale is installed separately, and only when no Tailscale app is present, because
+# brew cannot adopt an App Store or standalone-pkg install.
+brew "git"
+brew "jq"
+brew "ripgrep"
+cask "1password-cli"

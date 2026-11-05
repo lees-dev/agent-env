@@ -1,0 +1,102 @@
+// agent-env, cpa area: tailnet policy for the CLIProxyAPI hub. A SNIPPET, not a whole policy file.
+//
+// Owner decision 2026-11-04: every client reaches the hub at https://beast-1.tail7f661e.ts.net
+// (tailscale serve, /v1 only -> CPA on 127.0.0.1:8317), and only the owner's devices may reach it.
+//
+// What this does
+//   - tag:cpa-hub marks the hub (Beast, node beast-1). Only an admin can apply the tag.
+//   - The hub's tcp:443 (the serve URL) is open only to devices owned by the tailnet Owner that
+//     run a desktop or server OS (posture:agent-os), plus the hub itself.
+//   - The hub keeps its outbound access to the owner's devices and SSH sessions.
+//   - The owner's devices keep full access to each other (autogroup:self).
+//
+// Read before you apply
+//   - Grants only ever allow. If the policy still has the default allow-all rule
+//     (acls: accept src "*" dst "*:*", or a grant with src/dst/ip all "*"), this snippet restricts
+//     nothing. Replacing allow-all changes access for the whole tailnet: the grants below rebuild
+//     the intended access (see docs/cpa.md "Tailnet policy"). Check them first.
+//   - Tagging Beast makes it a tagged node: it stops being one of the owner's devices for rules
+//     such as autogroup:self and the default Tailscale SSH policy, and its node key no longer
+//     expires. Open any other port you use on Beast (RDP, SSH, ...) in the commented grant below.
+//   - Never give tag:cpa-hub the funnel node attribute: Funnel would make the hub public.
+//   - The CPA management API is not covered by any grant here. It stays off the tailnet because
+//     serve mounts /v1 only and CPA listens on 127.0.0.1 (docs/cpa.md "Tailscale serve").
+//
+// Apply in the admin console (preferred)
+//   1. Open https://login.tailscale.com/admin/acls/file and copy the current policy into a scratch
+//      file OUTSIDE this repo (it names people and devices; never commit it).
+//   2. Merge each section below into the matching top-level section. Fill in the placeholders.
+//   3. Remove the default allow-all rule, if present (see above).
+//   4. Save. The editor validates the file and runs "tests"; a failing test rejects the save.
+//   5. Tag the hub: Machines > beast-1 > ... > Edit ACL tags > tag:cpa-hub.
+//   6. Prove it: scripts/verify on two clients (HTTP 200); preflight on the hub shows
+//      "this node carries tag:cpa-hub"; from a phone, the serve URL must time out.
+//
+// Apply with the Tailscale API (alternative; https://tailscale.com/api, "Policy File")
+//   Keep the API access token in an owner-only 1Password admin vault. Never share that
+//   vault with device service accounts. Run this from the owner's own signed-in op session. Never put the token in a file
+//   or on a command line:
+//     TS=$(op read op://<owner-admin-vault>/<policy-token-item>/credential </dev/null)
+//     printf 'Authorization: Bearer %s\n' "$TS" | curl -sS -H @- -H 'Accept: application/hujson' \
+//       -D headers.txt -o policy.hujson https://api.tailscale.com/api/v2/tailnet/-/acl
+//   Merge this snippet into policy.hujson by hand, then validate and set it with the ETag from
+//   headers.txt (If-Match makes the write fail if someone changed the policy meanwhile):
+//     printf 'Authorization: Bearer %s\n' "$TS" | curl -sS -H @- -H 'Content-Type: application/hujson' \
+//       --data-binary @policy.hujson https://api.tailscale.com/api/v2/tailnet/-/acl/validate
+//     printf 'Authorization: Bearer %s\n' "$TS" | curl -sS -H @- -H 'Content-Type: application/hujson' \
+//       -H 'If-Match: "<ETag>"' --data-binary @policy.hujson https://api.tailscale.com/api/v2/tailnet/-/acl
+//     unset TS; rm policy.hujson headers.txt
+//   Work in a scratch directory outside this repo.
+{
+	"tagOwners": {
+		"tag:cpa-hub": ["autogroup:admin"],
+	},
+
+	// Desktop and server operating systems only: keeps phones and tablets off the hub.
+	// node:os values as Tailscale reports them [UNVERIFIED: windows, linux, macos].
+	"postures": {
+		"posture:agent-os": ["node:os IN ['windows', 'linux', 'macos']"],
+	},
+
+	"grants": [
+		// The hub API (tailscale serve on 443), from the Owner's desktop and server devices.
+		{
+			"src":        ["autogroup:owner"],
+			"srcPosture": ["posture:agent-os"],
+			"dst":        ["tag:cpa-hub"],
+			"ip":         ["tcp:443"],
+		},
+		// The hub's own harnesses use the same URL.
+		{
+			"src": ["tag:cpa-hub"],
+			"dst": ["tag:cpa-hub"],
+			"ip":  ["tcp:443"],
+		},
+		// The hub keeps its outbound access to the owner's devices and SSH sessions.
+		{
+			"src": ["tag:cpa-hub"],
+			"dst": ["autogroup:member"],
+			"ip":  ["*"],
+		},
+		// The owner's devices keep full access to each other (replaces allow-all for user-owned nodes).
+		{
+			"src": ["autogroup:member"],
+			"dst": ["autogroup:self"],
+			"ip":  ["*"],
+		},
+		// Other ports you use on Beast from your own devices. Uncomment and list them.
+		// {
+		// 	"src": ["autogroup:owner"],
+		// 	"dst": ["tag:cpa-hub"],
+		// 	"ip":  ["tcp:22", "tcp:3389"],
+		// },
+	],
+
+	// Tests run on every save. Replace <owner-login> with the Owner's login before saving, or
+	// delete the two user tests. Do not commit the filled-in copy.
+	"tests": [
+		{"src": "tag:cpa-hub", "proto": "tcp", "accept": ["tag:cpa-hub:443"]},
+		// {"src": "<owner-login>", "srcPostureAttrs": {"node:os": "linux"}, "proto": "tcp", "accept": ["tag:cpa-hub:443"]},
+		// {"src": "<owner-login>", "srcPostureAttrs": {"node:os": "ios"}, "proto": "tcp", "deny": ["tag:cpa-hub:443"]},
+	],
+}

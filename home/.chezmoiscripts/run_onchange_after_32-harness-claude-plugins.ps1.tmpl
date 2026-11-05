@@ -1,0 +1,48 @@
+{{- if and (eq .osFlavour "windows") (has "claude" .harnesses) -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $mo := dig "machines" .machine "claude" dict $cfg -}}
+# agent-env harness: install the Claude Code plugins that settings.json enables
+# (harness/config.toml claude.plugins) at user scope. Each GitHub marketplace is added
+# first; `claude plugin marketplace add` and `claude plugin install` both succeed when the
+# item is already there. The plugin caches stay Claude Code's (never managed by chezmoi).
+# Prints counts only. Windows PowerShell 5.1, ASCII only.
+$ErrorActionPreference = 'Stop'
+{{ template "packages/lib.ps1" . }}
+# Each run script inherits chezmoi's PATH from before the apply. The packages step installed
+# claude into ~\.local\bin and put that on the user PATH in the registry only, so rebuild PATH
+# here and call the vendor binary by its absolute path first.
+Pk-RefreshPath
+$claude = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+if (-not (Test-Path -LiteralPath $claude)) {
+    $c = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { $claude = $c.Source } else {
+        [Console]::Error.WriteLine('harness-claude-plugins: claude is not installed (the packages step installs it into ~\.local\bin)')
+        exit 1
+    }
+}
+
+$repos = @({{ $first := true }}{{ range $name, $m := $cfg.claude.marketplaces }}{{ if not $first }}, {{ end }}'{{ $m.repo }}'{{ $first = false }}{{ end }})
+$plugins = @({{ $first := true }}{{ range (dig "plugins" $cfg.claude.plugins $mo) }}{{ if not $first }}, {{ end }}'{{ . }}'{{ $first = false }}{{ end }})
+
+$markets = 0
+foreach ($repo in $repos) {
+    $ErrorActionPreference = 'Continue'
+    & $claude plugin marketplace add $repo *> $null
+    $rc = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($rc -ne 0) { throw ('harness-claude-plugins: adding marketplace ' + $repo + ' failed') }
+    $markets++
+}
+
+$installed = 0
+$present = 0
+foreach ($p in $plugins) {
+    $ErrorActionPreference = 'Continue'
+    $out = [string](& $claude plugin install $p --scope user --json 2>$null | Select-Object -Last 1)
+    $ErrorActionPreference = 'Stop'
+    if ($out -match '"outcome":"ok"' -and $out -match 'already installed') { $present++ }
+    elseif ($out -match '"outcome":"ok"') { $installed++ }
+    else { throw ('harness-claude-plugins: installing ' + $p + ' failed') }
+}
+Write-Host ('harness-claude-plugins: {0} marketplaces, {1} plugins installed, {2} already installed' -f $markets, $installed, $present)
+{{- end }}

@@ -1,0 +1,32 @@
+# Every text file is stored and checked out with LF, on every OS.
+# This is what keeps skills and rules byte-identical across Windows, WSL, Linux and macOS.
+* text=auto eol=lf
+
+# PowerShell reads LF fine. Keep .ps1 ASCII-only so Windows PowerShell 5.1 parses it without a BOM.
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+
+# cmd.exe misparses labels and GOTO in LF-only batch files, so these two are the only CRLF exception.
+# The index still stores LF (the CRLF check in scripts/secret-guard.sh reads the index).
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binaries: never normalise, never diff.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tgz  binary
+*.xz   binary
+*.7z   binary
+*.exe  binary
+*.dll  binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary

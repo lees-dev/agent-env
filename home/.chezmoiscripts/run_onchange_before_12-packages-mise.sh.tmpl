@@ -1,0 +1,119 @@
+{{- if ne .osFlavour "windows" -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+{{- $list := include (joinPath .repoDir "packages/mise-tools.toml") | fromToml -}}
+{{- $mise := index $pins "tools.mise" -}}
+{{- $py313 := index $pins "tools.python" -}}
+{{- $py312 := index $pins "tools.python312" -}}
+{{- $cr := index $pins "tools.coderabbit" -}}
+#!/bin/sh
+# packages 12: user-level tools on WSL, Linux and macOS. No sudo, on every role.
+#   1. mise, pinned, at ~/.local/bin/mise (official installer https://mise.run, which checks
+#      the release checksum);
+#   2. through mise: the tools in packages/mise-tools.toml at their versions.toml pins
+#      (node, uv, gh, oh-my-posh, and codex when that harness is selected);
+#   3. Python 3.13 and 3.12 through uv (`uv python install`, into ~/.local/share/uv/python,
+#      with python3.13 / python3.12 links in ~/.local/bin);
+#   4. the CodeRabbit CLI, pinned, at ~/.local/bin/coderabbit (official installer, which
+#      verifies its signed release).
+# ~/.config/mise/conf.d/agent-env.toml (applied after this script) makes these the default
+# versions; env.d/10-packages.sh puts the mise shims first on PATH.
+# role={{ .role }} os={{ .osFlavour }} machine={{ .machine }}
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }} {{ include (joinPath .repoDir "packages/mise-tools.toml") | sha256sum }}
+set -eu
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.sh" . }}
+{{- if eq .osFlavour "wsl" }}
+pk_no_windows_path
+{{- end }}
+pk_path_prepend "$HOME/.local/bin"
+mkdir -p "$HOME/.local/bin"
+# Run from / so mise never picks up (or asks to trust) a project config from the cwd.
+cd /
+
+MISE_PIN={{ $mise.version | quote }}
+MISE="$HOME/.local/bin/mise"
+# Tools as tool@version, rendered from packages/mise-tools.toml and the pins.
+TOOLS='
+{{- range $tool, $ref := $list.tools }}
+{{-   $parts := splitList "." $ref }}
+{{-   $p := index $pins $ref }}
+{{-   if and (or (ne (index $parts 0) "harness") (has (index $parts 1) $.harnesses)) (ne $p.version "skip") }} {{ $tool }}@{{ $p.version }}{{ end }}
+{{- end }}'
+UV_PIN={{ (index $pins "tools.uv").version | quote }}
+PY313={{ $py313.minor | quote }}
+PY312={{ $py312.minor | quote }}
+CR_PIN={{ $cr.version | quote }}
+
+# 1. mise
+have=$(pk_version "$MISE" --version)
+if [ "$MISE_PIN" = skip ]; then
+  pk_say "mise: skipped on this machine"
+elif [ "$have" = "$MISE_PIN" ]; then
+  pk_say "mise $have"
+elif pk_dry; then
+  pk_say "dry-run: would install mise $MISE_PIN (have ${have:-none})"
+else
+  pk_get_installer mise https://mise.run &&
+    env MISE_VERSION="v$MISE_PIN" MISE_INSTALL_PATH="$MISE" MISE_QUIET=1 sh "$PK_INSTALLER" >/dev/null ||
+    pk_fail mise "mise installer failed"
+  have=$(pk_version "$MISE" --version)
+  if [ "$have" = "$MISE_PIN" ]; then pk_say "mise $have installed"; PK_CHANGED=$((PK_CHANGED + 1))
+  else pk_fail mise "mise is ${have:-missing} after install, pin $MISE_PIN"; fi
+fi
+
+# 2. mise tools. `mise install` is a no-op for versions already installed.
+if [ -x "$MISE" ]; then
+  for tv in $TOOLS; do
+    t=${tv%@*}; v=${tv#*@}
+    if "$MISE" where "$tv" >/dev/null 2>&1; then
+      pk_say "$t $v (mise)"
+    elif pk_dry; then
+      pk_say "dry-run: would mise install $tv"
+    elif "$MISE" --quiet install --yes "$tv" >/dev/null; then
+      pk_say "$t $v installed (mise)"; PK_CHANGED=$((PK_CHANGED + 1))
+    else
+      pk_fail "$t" "mise install $tv failed"
+    fi
+  done
+  pk_dry || "$MISE" reshim >/dev/null 2>&1 || true
+elif ! pk_dry; then
+  pk_fail mise-tools "mise is not available, so node, uv, gh, oh-my-posh and codex were not installed"
+fi
+
+# 3. Python through uv (the pinned uv, run by mise so it works before the shims are on PATH).
+for minor in $PY313 $PY312; do
+  [ "$minor" != skip ] || continue
+  if [ -x "$HOME/.local/bin/python$minor" ]; then
+    pk_say "python $(pk_version "$HOME/.local/bin/python$minor" --version) (uv)"
+  elif pk_dry; then
+    pk_say "dry-run: would uv python install $minor"
+  elif [ "$UV_PIN" != skip ] && [ -x "$MISE" ] &&
+       "$MISE" exec "uv@$UV_PIN" -- uv python install "$minor" >/dev/null 2>&1; then
+    pk_say "python $minor installed (uv)"; PK_CHANGED=$((PK_CHANGED + 1))
+  else
+    pk_fail "python$minor" "uv python install $minor failed"
+  fi
+done
+
+# 4. CodeRabbit CLI (Linux and macOS builds only; it ships no Windows build).
+have=$(pk_version "$HOME/.local/bin/coderabbit" --version)
+if [ "$CR_PIN" = skip ]; then
+  pk_say "coderabbit: skipped on this machine"
+elif [ "$have" = "$CR_PIN" ]; then
+  pk_say "coderabbit $have"
+elif pk_dry; then
+  pk_say "dry-run: would install coderabbit $CR_PIN (have ${have:-none})"
+else
+  # CR_CLI_SKIP_LOGIN: no browser login during apply; run `coderabbit auth login` later.
+  pk_get_installer coderabbit https://cli.coderabbit.ai/install.sh &&
+    env CODERABBIT_VERSION="$CR_PIN" CODERABBIT_INSTALL_DIR="$HOME/.local/bin" CR_CLI_SKIP_LOGIN=1 \
+      sh "$PK_INSTALLER" >/dev/null ||
+    pk_fail coderabbit "coderabbit installer failed"
+  have=$(pk_version "$HOME/.local/bin/coderabbit" --version)
+  if [ "$have" = "$CR_PIN" ]; then pk_say "coderabbit $have installed"; PK_CHANGED=$((PK_CHANGED + 1))
+  else pk_fail coderabbit "coderabbit is ${have:-missing} after install, pin $CR_PIN"; fi
+fi
+
+pk_finish 12-packages-mise
+{{ end -}}

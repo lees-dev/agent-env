@@ -1,0 +1,80 @@
+[
+  {
+    "id": "mcp-chrome-devtools",
+    "name": "chrome-devtools",
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "chrome-devtools-mcp@1.11.0"
+    ],
+    "env": {},
+    "url": null,
+    "headers": {},
+    "enabled": true,
+    "description": null
+  },
+  {
+    "id": "mcp-context7",
+    "name": "context7",
+    "transport": "http",
+    "command": null,
+    "args": [],
+    "env": {},
+    "url": "https://mcp.context7.com/mcp",
+    "headers": {},
+    "enabled": true,
+    "description": null
+  },
+  {
+    "id": "mcp-figma",
+    "name": "figma",
+    "transport": "http",
+    "command": null,
+    "args": [],
+    "env": {},
+    "url": "https://mcp.figma.com/mcp",
+    "headers": {},
+    "enabled": true,
+    "description": null
+  },
+  {
+    "id": "mcp-linear-server",
+    "name": "linear-server",
+    "transport": "http",
+    "command": null,
+    "args": [],
+    "env": {},
+    "url": "https://mcp.linear.app/mcp",
+    "headers": {},
+    "enabled": true,
+    "description": null
+  },
+  {
+    "id": "mcp-playwright",
+    "name": "playwright",
+    "transport": "stdio",
+    "command": "npx",
+    "args": [
+      "-y",
+      "@playwright/mcp@latest"
+    ],
+    "env": {},
+    "url": null,
+    "headers": {},
+    "enabled": true,
+    "description": null
+  },
+  {
+    "id": "mcp-vercel",
+    "name": "vercel",
+    "transport": "http",
+    "command": null,
+    "args": [],
+    "env": {},
+    "url": "https://mcp.vercel.com",
+    "headers": {},
+    "enabled": true,
+    "description": null
+  }
+]

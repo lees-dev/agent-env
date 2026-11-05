@@ -1,0 +1,40 @@
+# shellcheck shell=sh
+# agent-env packages: put the user-level install dirs first on PATH. Managed by chezmoi
+# (home/dot_config/agent-env/env.d/10-packages.sh.tmpl); edit it in the repo.
+# Rendered for os={{ .osFlavour }}. Safe to source repeatedly: each dir moves to the front once.
+_ae_path_first() { # _ae_path_first <dir>: move or add dir to the front of PATH, if it exists
+  [ -d "$1" ] || return 0
+  _ae_p=$1
+  _ae_ifs=$IFS; IFS=:
+  for _ae_d in $PATH; do
+    [ "$_ae_d" = "$1" ] || [ -z "$_ae_d" ] || _ae_p="$_ae_p:$_ae_d"
+  done
+  IFS=$_ae_ifs
+  PATH=$_ae_p
+}
+{{- if eq .osFlavour "windows" }}
+# Git Bash: ~/.grok/bin holds grok.exe; muse is a .cmd that bash cannot run by name, so
+# ~/.config/agent-env/gitbash-bin/muse forwards to it; %APPDATA%/npm holds codex.
+{{-   if has "codex" .harnesses }}
+[ -n "${APPDATA:-}" ] && _ae_path_first "$(cygpath -u "$APPDATA" 2>/dev/null)/npm"
+{{-   end }}
+{{-   if has "muse" .harnesses }}
+_ae_path_first "$HOME/.config/agent-env/gitbash-bin"
+{{-   end }}
+{{-   if has "grok" .harnesses }}
+_ae_path_first "$HOME/.grok/bin"
+{{-   end }}
+_ae_path_first "$HOME/.local/bin"
+{{- else }}
+# Order after sourcing: mise shims, ~/.local/bin, ~/.grok/bin, then the rest of PATH.
+# The shims come first so the pinned node/uv/gh/codex win over older copies in ~/.local/bin,
+# /usr/local/bin or a distro package.
+{{-   if has "grok" .harnesses }}
+_ae_path_first "$HOME/.grok/bin"
+{{-   end }}
+_ae_path_first "$HOME/.local/bin"
+_ae_path_first "${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims"
+{{- end }}
+export PATH
+unset _ae_p _ae_d _ae_ifs
+unset -f _ae_path_first 2>/dev/null || true

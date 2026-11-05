@@ -1,0 +1,19 @@
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+{{- $list := include (joinPath .repoDir "packages/mise-tools.toml") | fromToml -}}
+# Managed by chezmoi from the agent-env repo (packages area). Do not edit here: change
+# versions.toml or packages/mise-tools.toml in the repo and run `chezmoi apply`.
+# mise loads ~/.config/mise/conf.d/*.toml before ~/.config/mise/config.toml, so a tool that
+# your own config.toml (or config.local.toml) also pins wins over this file
+# (https://mise.jdx.dev/configuration.html#conf-d). agent-env never edits your files: remove
+# such a line yourself. scripts/verify names any tool that is shadowed this way.
+# machine={{ .machine }} role={{ .role }}
+[tools]
+{{- range $tool, $ref := $list.tools }}
+{{-   $parts := splitList "." $ref }}
+{{-   $area := index $parts 0 }}
+{{-   $name := index $parts 1 }}
+{{-   $p := index $pins $ref }}
+{{-   if and (or (ne $area "harness") (has $name $.harnesses)) (ne $p.version "skip") }}
+{{ $tool | quote }} = {{ $p.version | quote }}
+{{-   end }}
+{{- end }}

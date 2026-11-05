@@ -1,0 +1,32 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- /*
+  ~/.grok/config.toml: merge the keys agent-env manages and keep every other key.
+
+  Managed: endpoints.cli_chat_proxy_base_url (the hub, OpenAI style with /v1),
+  auth.auth_provider_command (the cpa token helper; Grok runs it and reads the token from
+  stdout), auth.auth_token_ttl (the helper prints a bare token, so Grok needs a TTL),
+  models.default.
+
+  toToml drops comments, so the file is rewritten only when a managed value is wrong;
+  otherwise it is passed through byte for byte. Values: harness/config.toml.
+*/ -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $c := $cfg.grok -}}
+{{- $mo := dig "machines" .machine "grok" dict $cfg -}}
+{{- $orig := dict -}}
+{{- $s := dict -}}
+{{- if trim .chezmoi.stdin -}}
+{{-   $orig = fromToml .chezmoi.stdin -}}
+{{-   $s = fromToml .chezmoi.stdin -}}
+{{- end -}}
+
+{{- $s = setValueAtPath (list "endpoints" "cli_chat_proxy_base_url") .cpaOpenAIBaseUrl $s -}}
+{{- $s = setValueAtPath (list "auth" "auth_provider_command") (includeTemplate "harness/cpa-token-path" .) $s -}}
+{{- $s = setValueAtPath (list "auth" "auth_token_ttl") (dig "auth_token_ttl" $c.auth_token_ttl $mo) $s -}}
+{{- $s = setValueAtPath (list "models" "default") (dig "model" $c.model $mo) $s -}}
+
+{{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
+{{-   .chezmoi.stdin -}}
+{{- else -}}
+{{-   toToml $s -}}
+{{- end -}}

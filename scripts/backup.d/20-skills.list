@@ -1,0 +1,69 @@
+# rules+skills: paths an apply may change or delete outside chezmoi's managed-file list.
+# 1. ~/.agents/skills/<name>: each canonical skill is an exact_ directory, so apply --force deletes
+#    any file or link in it that the repo lacks (older versions, local edits, dangling links).
+#    Back up the whole directory, not only the managed files.
+# 2. ~/.claude/skills/<name>: entries that run_after_20-skills-links may replace with a link.
+# One line of each kind per canonical skill (home/dot_agents/skills/exact_<name>).
+# scripts/verify.d/20-skills checks both sets.
+.agents/skills/babysit-pr
+.agents/skills/blast-radius
+.agents/skills/correct
+.agents/skills/council
+.agents/skills/create-verification-skill
+.agents/skills/file-pr
+.agents/skills/full-send
+.agents/skills/full-stop
+.agents/skills/herdr
+.agents/skills/how
+.agents/skills/kun
+.agents/skills/leaving-pr-comments
+.agents/skills/maintain-verification-skill
+.agents/skills/modernize
+.agents/skills/pr-workflow
+.agents/skills/principle-boundary-discipline
+.agents/skills/principle-encode-lessons-in-structure
+.agents/skills/principle-fix-root-causes
+.agents/skills/principle-laziness-protocol
+.agents/skills/principle-minimize-reader-load
+.agents/skills/principle-model-the-domain
+.agents/skills/principle-prove-it-works
+.agents/skills/principle-subtract-before-you-add
+.agents/skills/principle-type-system-discipline
+.agents/skills/react-best-practices
+.agents/skills/sol-loop
+.agents/skills/subagent-routing
+.agents/skills/takeover
+.agents/skills/technical-writing
+.agents/skills/typescript-best-practices
+.agents/skills/unslop
+.claude/skills/babysit-pr
+.claude/skills/blast-radius
+.claude/skills/correct
+.claude/skills/council
+.claude/skills/create-verification-skill
+.claude/skills/file-pr
+.claude/skills/full-send
+.claude/skills/full-stop
+.claude/skills/herdr
+.claude/skills/how
+.claude/skills/kun
+.claude/skills/leaving-pr-comments
+.claude/skills/maintain-verification-skill
+.claude/skills/modernize
+.claude/skills/pr-workflow
+.claude/skills/principle-boundary-discipline
+.claude/skills/principle-encode-lessons-in-structure
+.claude/skills/principle-fix-root-causes
+.claude/skills/principle-laziness-protocol
+.claude/skills/principle-minimize-reader-load
+.claude/skills/principle-model-the-domain
+.claude/skills/principle-prove-it-works
+.claude/skills/principle-subtract-before-you-add
+.claude/skills/principle-type-system-discipline
+.claude/skills/react-best-practices
+.claude/skills/sol-loop
+.claude/skills/subagent-routing
+.claude/skills/takeover
+.claude/skills/technical-writing
+.claude/skills/typescript-best-practices
+.claude/skills/unslop

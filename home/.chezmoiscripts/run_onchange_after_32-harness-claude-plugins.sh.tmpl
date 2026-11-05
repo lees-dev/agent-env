@@ -1,0 +1,48 @@
+{{- if and (ne .osFlavour "windows") (has "claude" .harnesses) -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $mo := dig "machines" .machine "claude" dict $cfg -}}
+#!/bin/sh
+# agent-env harness: install the Claude Code plugins that settings.json enables
+# (harness/config.toml claude.plugins) at user scope. Each GitHub marketplace is added
+# first; `claude plugin marketplace add` and `claude plugin install` both succeed when the
+# item is already there. The plugin caches stay Claude Code's (never managed by chezmoi).
+# Prints counts only.
+set -eu
+{{ template "packages/lib.sh" . }}
+# Each run script inherits chezmoi's PATH from before the apply, which may lack ~/.local/bin
+# (where the packages step installs claude) and, on WSL, holds Windows dirs whose claude shim
+# must never run here. Rebuild PATH and call the vendor binary by its absolute path first.
+{{- if eq .osFlavour "wsl" }}
+pk_no_windows_path
+{{- end }}
+pk_path_prepend "$HOME/.local/bin"
+claude="$HOME/.local/bin/claude"
+if [ ! -x "$claude" ]; then
+  claude=$(command -v claude 2>/dev/null || true)
+  if [ -z "$claude" ]; then
+    echo "harness-claude-plugins: claude is not installed (the packages step installs it into ~/.local/bin)" >&2
+    exit 1
+  fi
+fi
+
+markets=0
+for repo in{{ range $name, $m := $cfg.claude.marketplaces }} {{ $m.repo | shellQuote }}{{ end }}; do
+  if ! "$claude" plugin marketplace add "$repo" >/dev/null 2>&1; then
+    echo "harness-claude-plugins: adding marketplace $repo failed" >&2
+    exit 1
+  fi
+  markets=$((markets + 1))
+done
+
+installed=0
+present=0
+for p in{{ range (dig "plugins" $cfg.claude.plugins $mo) }} {{ . | shellQuote }}{{ end }}; do
+  out=$("$claude" plugin install "$p" --scope user --json 2>/dev/null | tail -n 1) || true
+  case "$out" in
+    *'"outcome":"ok"'*'already installed'*) present=$((present + 1)) ;;
+    *'"outcome":"ok"'*) installed=$((installed + 1)) ;;
+    *) echo "harness-claude-plugins: installing $p failed" >&2; exit 1 ;;
+  esac
+done
+echo "harness-claude-plugins: $markets marketplaces, $installed plugins installed, $present already installed"
+{{- end }}

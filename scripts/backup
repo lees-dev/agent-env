@@ -1,0 +1,80 @@
+#!/bin/sh
+# Back up every file `chezmoi apply` may touch, before it touches it. WSL, Linux, macOS.
+# Windows native: scripts/backup.ps1.
+#
+# Usage: scripts/backup [--dry-run]
+#
+# What it copies, into ~/.agent-env-backups/<UTC timestamp>/ (never inside this repo):
+#   1. every file and symlink chezmoi manages on this machine (`chezmoi managed`)
+#   2. every path listed in scripts/backup.d/*.list: files the run_ scripts change outside
+#      chezmoi's view (for example ~/.claude.json, which `claude mcp add` rewrites)
+# Symlinks are recorded (with their target), not followed. A manifest.tsv lists each entry
+# with its kind, size and sha256. The backup holds live credentials, so the root is 0700.
+#
+# Restore one file: cp -p ~/.agent-env-backups/<ts>/<path> ~/<path>
+# Output is counts and paths relative to $HOME only; never file contents.
+set -eu
+
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+. "$REPO/scripts/lib/common.sh"
+. "$REPO/scripts/lib/load-token.sh"
+. "$REPO/scripts/lib/load-cpa-dir.sh"
+ae_load_cpa_dir
+ae_load_token "$(ae_chezmoi_data opMode)"
+
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+ROOT=${AGENT_ENV_BACKUP_ROOT:-$HOME/.agent-env-backups}
+case "$ROOT/" in "$REPO"/*) echo "refusing: backup root $ROOT is inside the repo" >&2; exit 1 ;; esac
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+DEST="$ROOT/$TS"
+
+ae_have chezmoi || { echo "chezmoi not installed: run AGENTS.md step 2 first" >&2; exit 1; }
+chezmoi execute-template '{{ .role }}' >/dev/null 2>&1 || { echo "chezmoi not initialised: run AGENTS.md step 3 first" >&2; exit 1; }
+
+LIST=$(mktemp)
+trap 'rm -f "$LIST" "$LIST.sorted"' EXIT INT TERM
+chezmoi managed --include=files,symlinks --path-style=absolute > "$LIST"
+for l in "$REPO"/scripts/backup.d/*.list; do
+  [ -f "$l" ] || continue
+  sed -e 's/#.*$//' -e 's/[[:space:]]*$//' -e '/^$/d' -e "s|^~/|$HOME/|" -e "s|^\([^/]\)|$HOME/\1|" "$l" >> "$LIST"
+done
+
+copied=0; links=0; missing=0; outside=0
+[ "$DRY" -eq 1 ] || { umask 077; mkdir -p "$DEST"; chmod 700 "$ROOT" "$DEST"; printf 'kind\tpath\tsize\tsha256\n' > "$DEST/manifest.tsv"; }
+
+sort -u "$LIST" > "$LIST.sorted"
+while IFS= read -r abs; do
+  [ -n "$abs" ] || continue
+  case "$abs" in "$HOME"/*) rel=${abs#"$HOME"/} ;; *) outside=$((outside + 1)); echo "  skip (outside home): $abs"; continue ;; esac
+  if [ -L "$abs" ]; then
+    links=$((links + 1))
+    [ "$DRY" -eq 1 ] || printf 'link\t%s\t-\t%s\n' "$rel" "$(readlink "$abs")" >> "$DEST/manifest.tsv"
+  elif [ -f "$abs" ]; then
+    copied=$((copied + 1))
+    if [ "$DRY" -eq 0 ]; then
+      mkdir -p "$DEST/$(dirname "$rel")"
+      cp -p "$abs" "$DEST/$rel"
+      printf 'file\t%s\t%s\t%s\n' "$rel" "$(wc -c < "$abs" | tr -d ' ')" "$(ae_sha256 "$abs")" >> "$DEST/manifest.tsv"
+    fi
+  elif [ -d "$abs" ]; then
+    copied=$((copied + 1))
+    if [ "$DRY" -eq 0 ]; then
+      # Copy the contents into DEST/rel (merging if a managed file there was copied first),
+      # never into a nested DEST/rel/<name>. Symlinks inside are copied as links (-P).
+      mkdir -p "$DEST/$rel"
+      cp -RP "$abs/." "$DEST/$rel/"
+      printf 'dir\t%s\t-\t-\n' "$rel" >> "$DEST/manifest.tsv"
+    fi
+  else
+    missing=$((missing + 1))
+  fi
+done < "$LIST.sorted"
+
+if [ "$DRY" -eq 1 ]; then
+  echo "backup dry run: $copied to copy, $links links to record, $missing not present yet, $outside outside home"
+else
+  echo "backup: $copied copied, $links links recorded, $missing not present yet, $outside outside home"
+  echo "  -> $DEST"
+fi

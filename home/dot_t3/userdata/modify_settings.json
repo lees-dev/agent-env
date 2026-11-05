@@ -1,0 +1,50 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- /*
+  ~/.t3/userdata/settings.json (T3 Code, desktop machines only; .chezmoiignore drops
+  ~/.t3 when headless): merge the provider instances for the Grok and Muse harnesses this
+  machine uses, with this OS's binary path. Every other key is kept, and the file is
+  passed through byte for byte when the managed values are already right.
+  The UI preferences and keybindings are seeded once by create_client-settings.json and
+  create_keybindings.json, then left to T3.
+
+  binaryPath: the first candidate that exists, else the harness found on PATH, else the
+  first candidate (the install location the packages area uses).
+*/ -}}
+{{- $orig := dict -}}
+{{- $s := dict -}}
+{{- if trim .chezmoi.stdin -}}
+{{-   $orig = fromJson .chezmoi.stdin -}}
+{{-   $s = fromJson .chezmoi.stdin -}}
+{{- end -}}
+{{- $win := eq .osFlavour "windows" -}}
+{{- $home := .chezmoi.homeDir | replace "\\" "/" -}}
+{{- $local := env "LOCALAPPDATA" | replace "\\" "/" -}}
+{{- if not $local -}}{{- $local = printf "%s/AppData/Local" $home -}}{{- end -}}
+
+{{- $cands := dict -}}
+{{- if $win -}}
+{{-   $_ := set $cands "grok" (list (printf "%s/.grok/bin/grok.exe" $home)) -}}
+{{-   $_ := set $cands "muse" (list (printf "%s/Programs/muse/muse.cmd" $local)) -}}
+{{- else -}}
+{{-   $_ := set $cands "grok" (list (printf "%s/.grok/bin/grok" $home) (printf "%s/.local/bin/grok" $home)) -}}
+{{-   $_ := set $cands "muse" (list (printf "%s/.local/bin/muse" $home) "/opt/homebrew/bin/muse" "/usr/local/bin/muse") -}}
+{{- end -}}
+
+{{- range $h := list "grok" "muse" -}}
+{{-   if has $h $.harnesses -}}
+{{-     $path := "" -}}
+{{-     range (index $cands $h) -}}{{- if and (not $path) (stat .) -}}{{- $path = . -}}{{- end -}}{{- end -}}
+{{-     if not $path -}}{{- $path = lookPath $h -}}{{- end -}}
+{{-     if not $path -}}{{- $path = first (index $cands $h) -}}{{- end -}}
+{{-     if $win -}}{{- $path = $path | replace "/" "\\" -}}{{- end -}}
+{{-     $s = setValueAtPath (list "providerInstances" $h "driver") $h $s -}}
+{{-     $s = setValueAtPath (list "providerInstances" $h "enabled") true $s -}}
+{{-     $s = setValueAtPath (list "providerInstances" $h "config" "binaryPath") $path $s -}}
+{{-   end -}}
+{{- end -}}
+
+{{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
+{{-   .chezmoi.stdin -}}
+{{- else -}}
+{{-   toPrettyJson $s -}}
+{{- end -}}

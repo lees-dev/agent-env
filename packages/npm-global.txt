@@ -1,0 +1,5 @@
+# Global npm packages, Windows only (run_onchange_before_13-packages-harnesses.ps1.tmpl).
+# WSL, Linux and macOS get the same tools from mise (packages/mise-tools.toml).
+# Columns separated by '|': npm package | versions.toml section | command | harness (or -)
+# The version is the section's `version` after machine overrides.
+@openai/codex | harness.codex | codex | codex

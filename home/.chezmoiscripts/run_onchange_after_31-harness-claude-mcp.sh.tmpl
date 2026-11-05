@@ -1,0 +1,44 @@
+{{- if and (ne .osFlavour "windows") (has "claude" .harnesses) -}}
+#!/bin/sh
+# agent-env harness: register Claude Code's user-scope MCP servers (harness/config.toml
+# [claude.mcp.*]) with `claude mcp add --scope user`. Claude Code keeps them in
+# ~/.claude.json, which agent-env never writes itself (scripts/backup.d/30-harness.list
+# backs it up). A server that already exists is left as it is, including its auth.
+# Sign-in (OAuth) is left to the owner: run /mcp in Claude Code once.
+# Prints names and counts only.
+set -eu
+{{ template "packages/lib.sh" . }}
+# Each run script inherits chezmoi's PATH from before the apply, which may lack ~/.local/bin
+# (where the packages step installs claude) and, on WSL, holds Windows dirs whose claude shim
+# must never run here. Rebuild PATH and call the vendor binary by its absolute path first.
+{{- if eq .osFlavour "wsl" }}
+pk_no_windows_path
+{{- end }}
+pk_path_prepend "$HOME/.local/bin"
+claude="$HOME/.local/bin/claude"
+if [ ! -x "$claude" ]; then
+  claude=$(command -v claude 2>/dev/null || true)
+  if [ -z "$claude" ]; then
+    echo "harness-claude-mcp: claude is not installed (the packages step installs it into ~/.local/bin)" >&2
+    exit 1
+  fi
+fi
+
+added=0
+present=0
+add_http() { # add_http <name> <url>
+  if out=$("$claude" mcp add --transport http --scope user "$1" "$2" 2>&1); then
+    added=$((added + 1))
+  else
+    case "$out" in
+      *"already exists"*) present=$((present + 1)) ;;
+      *) echo "harness-claude-mcp: adding $1 failed" >&2; exit 1 ;;
+    esac
+  fi
+}
+
+{{ range $name, $m := (includeTemplate "harness/config.toml" . | fromToml).claude.mcp -}}
+add_http {{ $name | shellQuote }} {{ $m.url | shellQuote }}
+{{ end -}}
+echo "harness-claude-mcp: $added added, $present already present"
+{{- end }}

@@ -1,0 +1,149 @@
+{{- /*
+  Target paths chezmoi must not manage on this machine. chezmoi renders this file as a
+  template, so OS and role conditions go here. Patterns match target paths relative
+  to the home directory. Each area appends only inside its own block (docs/layout.md).
+*/ -}}
+{{- /* Test mode (AGENT_ENV_NO_SECRETS=1) renders placeholders; refuse it on the real home. */ -}}
+{{- if and .noSecrets (eq (clean .chezmoi.destDir) (clean .chezmoi.homeDir)) -}}
+{{-   fail "noSecrets is for throwaway --destination tests only (docs/testing.md); re-run chezmoi init without AGENT_ENV_NO_SECRETS" -}}
+{{- end }}
+
+# ---- foundation: never managed, on any machine (defence in depth) ------------------
+# Harness-owned state, credentials and caches. Nothing in home/ may target these.
+.claude.json
+.claude.json.*
+.claude/.credentials.json
+.claude/skills/synced
+.claude/skills/synced/**
+.claude/plugins/synced
+.claude/plugins/synced/**
+.claude/plugins/cache
+.claude/plugins/cache/**
+.claude/plugins/marketplaces/**
+.claude/plugins/plugin-directory-bindings.json
+.claude/projects/**
+.claude/todos/**
+.claude/statsig/**
+.codex/auth.json
+.codex/.credentials.json
+.codex/secrets/**
+.codex/skills/.system
+.codex/skills/.system/**
+.codex/sessions/**
+.codex/log/**
+.grok/auth.json
+.config/muse/auth.json
+.config/muse/trust.json
+.config/gh/hosts.yml
+.t3/userdata/secrets/**
+.t3/userdata/clerk/**
+.t3/userdata/logs/**
+.ssh/id_*
+.ssh/known_hosts*
+.ssh/authorized_keys
+.agent-env-backups/**
+
+# ---- foundation: OS-only targets ------------------------------------------------------
+{{- if ne .osFlavour "windows" }}
+AppData
+AppData/**
+.wslconfig
+{{- end }}
+{{- if ne .osFlavour "macos" }}
+Library
+Library/**
+{{- end }}
+{{- if eq .osFlavour "windows" }}
+.config/systemd
+.config/systemd/**
+.bashrc.d/**
+{{- end }}
+
+# ---- foundation: run scripts for the other OS family ----------------------------------
+# Every run_ script exists as a .sh.tmpl / .ps1.tmpl pair (docs/layout.md). The guard at
+# the top of each script is the primary filter; these lines keep `chezmoi managed` clean.
+{{- if eq .osFlavour "windows" }}
+.chezmoiscripts/*.sh
+{{- else }}
+.chezmoiscripts/*.ps1
+{{- end }}
+
+# ---- rules+skills ------------------------------------------------------------------------
+# (rules+skills appends here)
+# Each harness's global rules file deploys only when that harness is selected. The skills and
+# ~/.agents/docs/agents/ deploy everywhere: Codex, Grok and Muse read ~/.agents/skills directly.
+# ~/.claude/skills/ holds links only, made by run_after_20-skills-links (never chezmoi entries).
+.claude/skills
+.claude/skills/**
+{{- if not (has "claude" .harnesses) }}
+.claude/CLAUDE.md
+{{- end }}
+{{- if not (has "codex" .harnesses) }}
+.codex/AGENTS.md
+{{- end }}
+{{- if not (has "grok" .harnesses) }}
+.grok/AGENTS.md
+{{- end }}
+
+# ---- harness ------------------------------------------------------------------------------
+# (harness appends here)
+{{- if .headless }}
+.t3
+.t3/**
+{{- end }}
+# A harness this machine does not use keeps whatever config it has; agent-env leaves it alone.
+{{- if not (has "claude" .harnesses) }}
+.claude/settings.json
+.config/ohmyposh/claude-statusline.omp.json
+.claude
+.config/ohmyposh
+{{- end }}
+{{- /* The whole directory too, so chezmoi does not create an empty ~/.claude, ~/.codex, ~/.grok
+       or ~/.config/muse on a machine without that harness (integration, 2026-11-04). */}}
+{{- if not (has "codex" .harnesses) }}
+.codex/config.toml
+.codex
+{{- end }}
+{{- if not (has "grok" .harnesses) }}
+.grok/config.toml
+.grok
+{{- end }}
+{{- if not (has "muse" .harnesses) }}
+.config/muse/settings.json
+.config/muse
+{{- end }}
+
+# ---- packages ----------------------------------------------------------------------------
+# (packages appends here)
+# mise (and its conf.d pins) is for WSL, Linux and macOS; Windows uses winget. The Git Bash
+# muse forwarder is for Windows only.
+{{- if eq .osFlavour "windows" }}
+.config/mise
+.config/mise/**
+{{- else }}
+.config/agent-env/gitbash-bin
+.config/agent-env/gitbash-bin/**
+{{- end }}
+
+# ---- cpa ------------------------------------------------------------------------------------
+# (cpa appends here; hub-only targets go in the block below)
+{{- if eq .osFlavour "windows" }}
+.config/agent-env/env.d/40-cpa-op.sh
+{{- end }}
+{{- if ne .role "hub" }}
+.cpa-tools
+.cpa-tools/**
+{{- end }}
+# Private tools and runtime files are restored only from the owner's private backup.
+.cpa-tools/soonest_reset.py
+.cpa-tools/codex_reset.py
+# Runtime files can contain account emails: never managed.
+.cpa-tools/*.log
+.cpa-tools/*.state.json
+.cpa-tools/*.tmp
+.cpa-tools/__pycache__/**
+.cpa-tools/research/**
+# The cmd.exe token helper is for Windows only; the sh helper (cpa-token) is deployed everywhere.
+{{- if ne .osFlavour "windows" }}
+.config/agent-env/cpa-token.cmd
+{{- end }}

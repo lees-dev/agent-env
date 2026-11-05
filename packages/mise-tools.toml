@@ -1,0 +1,16 @@
+# Tools that mise installs on WSL, Linux and macOS (never on Windows, which uses winget).
+# Key: the tool's name in the mise registry (https://mise.jdx.dev/registry.html).
+# Value: the versions.toml section that holds its pin, as "<area>.<name>".
+# A "harness.<name>" entry is installed only when that harness is selected on the machine.
+# A machine override of "skip" leaves the tool out on that machine.
+#
+# Read by home/dot_config/mise/conf.d/agent-env.toml.tmpl (deployed as
+# ~/.config/mise/conf.d/agent-env.toml) and by run_onchange_before_12-packages-mise.sh.tmpl.
+# This file is not named mise.toml on purpose: mise would load it as a project config.
+[tools]
+node = "tools.node"
+uv = "tools.uv"
+gh = "tools.gh"
+oh-my-posh = "tools.oh-my-posh"
+# Codex's GitHub release binary (registry backend aqua:openai/codex). Windows uses npm instead.
+codex = "harness.codex"

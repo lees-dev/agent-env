@@ -1,0 +1,122 @@
+{{- if ne .osFlavour "windows" -}}
+{{- $optin := env "AGENT_ENV_SYSTEM_PACKAGES" | trim -}}
+{{- $list := "" -}}
+{{- if eq .pkgManager "apt" }}{{ $list = include (joinPath .repoDir "packages/apt.txt") }}{{ end -}}
+{{- if eq .pkgManager "dnf" }}{{ $list = include (joinPath .repoDir "packages/dnf.txt") }}{{ end -}}
+#!/bin/sh
+# packages 11: system packages (apt, dnf, Homebrew) and Tailscale, on WSL, Linux and macOS.
+#
+# The system package manager runs only when all of these hold:
+#   - the role is client or hub (the server role, server, is user-level only: never sudo);
+#   - the owner opted in for this apply: AGENT_ENV_SYSTEM_PACKAGES=1 chezmoi apply ...
+#     (the opt-in is rendered into this script, so turning it on later re-runs it);
+#   - sudo works without a prompt (run `sudo -v` first), because chezmoi runs with --no-tty.
+# Otherwise it lists what is missing and changes nothing. It installs missing packages only;
+# it never upgrades or removes one.
+# role={{ .role }} os={{ .osFlavour }} distro={{ .distro }} pkg={{ .pkgManager }} optin={{ $optin | quote }}
+# inputs: {{ include (joinPath .repoDir "packages/apt.txt") | sha256sum }} {{ include (joinPath .repoDir "packages/dnf.txt") | sha256sum }} {{ include (joinPath .repoDir "packages/Brewfile") | sha256sum }}
+set -eu
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.sh" . }}
+{{- if eq .osFlavour "wsl" }}
+pk_no_windows_path
+{{- end }}
+
+ROLE={{ .role | quote }}
+OS={{ .osFlavour | quote }}
+PKG={{ .pkgManager | quote }}
+OPTIN={{ $optin | quote }}
+REPO={{ .repoDir | quote }}
+PACKAGES='{{ range splitList "\n" $list }}{{ $l := regexReplaceAll "#.*$" . "" | trim }}{{ if $l }}{{ $l }} {{ end }}{{ end }}'
+
+can_change() { # can_change <what>: may this run use the system package manager?
+  if [ "$ROLE" = server ]; then
+    pk_say "server role: $1 is left to the machine's owner (user-level installs only)"; return 1
+  fi
+  if [ "$OPTIN" != 1 ]; then
+    pk_say "$1 needs the owner's OK: rerun the apply with AGENT_ENV_SYSTEM_PACKAGES=1"; return 1
+  fi
+  if pk_dry; then pk_say "dry-run: would install $1"; return 1; fi
+  return 0
+}
+
+need_sudo() {
+  if [ "$(id -u)" -eq 0 ]; then SUDO=''; return 0; fi
+  if sudo -n true 2>/dev/null; then SUDO='sudo'; return 0; fi
+  pk_fail "sudo" "sudo needs a password and chezmoi has no terminal: run 'sudo -v', then apply again"
+  return 1
+}
+
+missing=''
+case "$PKG" in
+  apt)
+    for p in $PACKAGES; do
+      dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing="$missing $p"
+    done ;;
+  dnf)
+    for p in $PACKAGES; do
+      rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"
+    done ;;
+esac
+missing=${missing# }
+n=$(printf '%s\n' "$missing" | wc -w | tr -d ' ')
+
+case "$PKG" in
+  apt|dnf)
+    if [ "$n" -eq 0 ]; then
+      pk_say "$PKG: all $(printf '%s\n' "$PACKAGES" | wc -w | tr -d ' ') listed packages present"
+    else
+      pk_say "$PKG: $n missing: $missing"
+      if can_change "$n $PKG package(s)" && need_sudo; then
+        if [ "$PKG" = apt ]; then
+          # shellcheck disable=SC2086
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $missing ||
+            pk_fail apt "apt-get install failed"
+        else
+          # shellcheck disable=SC2086
+          $SUDO dnf install -y -q $missing || pk_fail dnf "dnf install failed"
+        fi
+        [ "$PK_FAILED" -gt 0 ] || PK_CHANGED=$((PK_CHANGED + n))
+      fi
+    fi ;;
+  brew)
+    if ! command -v brew >/dev/null 2>&1; then
+      pk_say "Homebrew is not installed: install it from https://brew.sh (it needs your password), then apply again"
+    elif brew bundle check --file "$REPO/packages/Brewfile" >/dev/null 2>&1; then
+      pk_say "brew: Brewfile satisfied"
+    elif can_change "the Brewfile packages"; then
+      HOMEBREW_NO_AUTO_UPDATE=1 brew bundle install --file "$REPO/packages/Brewfile" --no-upgrade ||
+        pk_fail brew "brew bundle install failed"
+      [ "$PK_FAILED" -gt 0 ] || PK_CHANGED=$((PK_CHANGED + 1))
+    fi ;;
+  *)
+    pk_say "no supported system package manager ($PKG): skipped" ;;
+esac
+
+# Tailscale. WSL uses the Windows host's Tailscale; the server role keeps whatever the
+# machine's owner installed (verify warns on drift).
+case "$OS" in
+  wsl) pk_say "tailscale: WSL uses the Windows host's Tailscale" ;;
+  macos)
+    if command -v tailscale >/dev/null 2>&1 || [ -d /Applications/Tailscale.app ]; then
+      pk_say "tailscale: present"
+    elif command -v brew >/dev/null 2>&1 && can_change "Tailscale (brew cask tailscale-app)"; then
+      HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask tailscale-app || pk_fail tailscale "brew install --cask tailscale-app failed"
+      [ "$PK_FAILED" -gt 0 ] || PK_CHANGED=$((PK_CHANGED + 1))
+    fi ;;
+  linux)
+    if command -v tailscale >/dev/null 2>&1; then
+      pk_say "tailscale: present"
+    elif can_change "Tailscale (https://tailscale.com/install.sh)" && need_sudo; then
+      # The official script adds Tailscale's package repo for this distro and installs from it.
+      pk_get_installer tailscale https://tailscale.com/install.sh &&
+        sh "$PK_INSTALLER" || pk_fail tailscale "tailscale install script failed"
+      [ "$PK_FAILED" -gt 0 ] || PK_CHANGED=$((PK_CHANGED + 1))
+      pk_say "tailscale: installed; run 'sudo tailscale up' to log in"
+    fi ;;
+esac
+
+pk_finish 11-packages-system
+{{ end -}}

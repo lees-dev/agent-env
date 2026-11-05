@@ -1,0 +1,12 @@
+#!/bin/sh
+# Prints this machine's CLIProxyAPI client key on stdout, for harness auth helpers:
+# Claude apiKeyHelper, the Codex [model_providers.<id>.auth] command, Grok auth_provider_command.
+# The key file is written by chezmoi from 1Password (docs/cpa.md). Windows: cpa-token.cmd.
+# Prints nothing else, and never prints the key on failure.
+set -eu
+f="$HOME/.config/agent-env/cpa-key"
+if [ ! -s "$f" ]; then
+  echo "cpa-token: $f is missing or empty; run chezmoi apply (agent-env AGENTS.md)" >&2
+  exit 1
+fi
+exec cat "$f"

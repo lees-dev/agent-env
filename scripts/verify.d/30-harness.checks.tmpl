@@ -1,0 +1,254 @@
+{{- /*
+  Harness checks for scripts/verify.d/30-harness.{sh,ps1}. Both pipe this file to
+  `chezmoi execute-template` on stdin (stdin keeps the quotes that Windows PowerShell 5.1
+  strips from arguments) and turn each output line into a check:
+    OK <msg> | WARN <msg> | FAIL <msg> | HINT <msg> | INFO <msg>
+  Read-only. It reads the live configs in memory and prints key names, paths, model names
+  and counts only, never a value that could be a credential. ASCII only.
+  Expected values come from the same places the modify_ templates use:
+  harness/config.toml, harness/cpa-token-path and the chezmoi data.
+*/ -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $home := .chezmoi.homeDir -}}
+{{- $helper := includeTemplate "harness/cpa-token-path" . -}}
+{{- $keyRe := "sk-[A-Za-z0-9_-]{20,}" -}}
+{{- if stat $helper }}
+OK cpa token helper present ({{ base $helper }})
+{{- else }}
+FAIL cpa token helper missing: {{ $helper }}
+HINT the cpa area deploys it; check `chezmoi managed`, then rerun the apply
+{{- end }}
+
+{{- /* ---------------- Claude Code ---------------- */ -}}
+{{- if has "claude" .harnesses }}
+{{-   $p := joinPath $home ".claude" "settings.json" }}
+{{-   if not (stat $p) }}
+FAIL claude: ~/.claude/settings.json is missing
+{{-   else }}
+{{-     $raw := include $p }}
+{{-     $s := fromJson $raw }}
+{{-     if eq (dig "env" "ANTHROPIC_BASE_URL" "" $s) .cpaAnthropicBaseUrl }}
+OK claude: env.ANTHROPIC_BASE_URL is the hub
+{{-     else }}
+FAIL claude: env.ANTHROPIC_BASE_URL is not {{ .cpaAnthropicBaseUrl }}
+{{-     end }}
+{{-     if hasKey (dig "env" dict $s) "ANTHROPIC_AUTH_TOKEN" }}
+FAIL claude: env.ANTHROPIC_AUTH_TOKEN is set (it outranks apiKeyHelper and holds a plaintext key)
+{{-     else if contains $helper (toString (dig "apiKeyHelper" "" $s)) }}
+OK claude: apiKeyHelper runs the cpa token helper
+{{-     else }}
+FAIL claude: apiKeyHelper does not run the cpa token helper
+{{-     end }}
+{{-     if regexMatch $keyRe $raw }}
+FAIL claude: settings.json contains a plaintext sk- key
+{{-     end }}
+{{-     $hook := false }}
+{{-     range (dig "hooks" "PreToolUse" list $s) }}{{ range (dig "hooks" list .) }}{{ if contains "pr-workflow-hook.mjs" (toString (dig "command" "" .)) }}{{ $hook = true }}{{ end }}{{ end }}{{ end }}
+{{-     $hookFile := joinPath $home ".agents" "skills" "pr-workflow" "scripts" "pr-workflow-hook.mjs" }}
+{{-     if and $hook (stat $hookFile) }}
+OK claude: pr-workflow PreToolUse hook set and its script exists
+{{-     else if $hook }}
+WARN claude: pr-workflow hook set, but ~/.agents/skills/pr-workflow/scripts/pr-workflow-hook.mjs is missing
+{{-     else }}
+FAIL claude: pr-workflow PreToolUse hook missing
+{{-     end }}
+{{-     $routingPath := printf "%s/.agents/skills/subagent-routing/scripts/routing-hook.mjs" ($home | replace "\\" "/") }}
+{{-     $routingCommand := printf "node \"%s\"" $routingPath }}
+{{-     $routingHook := false }}
+{{-     range (dig "hooks" "PreToolUse" list $s) }}
+{{-       if eq (dig "matcher" "" .) "^(.*_)?(Agent|Workflow)$" }}
+{{-         range (dig "hooks" list .) }}
+{{-           if eq (dig "command" "" .) $routingCommand }}{{ $routingHook = true }}{{ end }}
+{{-         end }}
+{{-       end }}
+{{-     end }}
+{{-     if and $routingHook (stat $routingPath) }}
+OK claude: subagent-routing PreToolUse hook uses the canonical script
+{{-     else }}
+FAIL claude: subagent-routing PreToolUse hook or canonical script missing
+{{-     end }}
+{{-     if not (lookPath "node") }}
+WARN claude: node is not on PATH, so the pr-workflow hook cannot run
+{{-     end }}
+{{-     $mo := dig "machines" .machine "claude" dict $cfg }}
+{{-     $want := dig "plugins" $cfg.claude.plugins $mo }}
+{{-     $on := 0 }}
+{{-     range $want }}{{ if eq (toString (dig "enabledPlugins" . false $s)) "true" }}{{ $on = add1 $on }}{{ end }}{{ end }}
+{{-     if eq $on (len $want) }}
+OK claude: {{ $on }}/{{ len $want }} managed plugins enabled
+{{-     else }}
+FAIL claude: {{ $on }}/{{ len $want }} managed plugins enabled
+{{-     end }}
+{{-     $installedFile := joinPath $home ".claude" "plugins" "installed_plugins.json" }}
+{{-     if stat $installedFile }}
+{{-       $inst := include $installedFile | fromJson }}
+{{-       $n := 0 }}
+{{-       range $want }}{{ if hasKey (dig "plugins" dict $inst) . }}{{ $n = add1 $n }}{{ end }}{{ end }}
+{{-       if eq $n (len $want) }}
+OK claude: {{ $n }}/{{ len $want }} managed plugins installed
+{{-       else }}
+WARN claude: {{ $n }}/{{ len $want }} managed plugins installed
+HINT rerun the apply; run_onchange_after_32-harness-claude-plugins installs them
+{{-       end }}
+{{-     else }}
+WARN claude: no plugins installed yet
+{{-     end }}
+{{-     $mcpFile := joinPath $home ".claude.json" }}
+{{-     $servers := dict }}
+{{-     if stat $mcpFile }}{{ $servers = dig "mcpServers" dict (include $mcpFile | fromJson) }}{{ end }}
+{{-     range $name, $m := $cfg.claude.mcp }}
+{{-       if hasKey $servers $name }}
+OK claude: user MCP server {{ $name }} registered
+{{-       else }}
+FAIL claude: user MCP server {{ $name }} missing from ~/.claude.json
+{{-       end }}
+{{-     end }}
+{{-     if lookPath "oh-my-posh" }}
+{{-       if contains "oh-my-posh" (toString (dig "statusLine" "command" "" $s)) }}
+OK claude: oh-my-posh status line set
+{{-       else }}
+FAIL claude: oh-my-posh is installed but statusLine does not use it
+HINT run the apply again from a new terminal (oh-my-posh was not on PATH during the last one)
+{{-       end }}
+{{-     else }}
+INFO claude: oh-my-posh not on PATH, so the status line is left as it was
+{{-     end }}
+{{-   end }}
+{{- end }}
+
+{{- /* ---------------- Codex ---------------- */ -}}
+{{- if has "codex" .harnesses }}
+{{-   $p := joinPath $home ".codex" "config.toml" }}
+{{-   if not (stat $p) }}
+FAIL codex: ~/.codex/config.toml is missing
+{{-   else }}
+{{-     $raw := include $p }}
+{{-     $s := fromToml $raw }}
+{{-     $c := $cfg.codex }}
+{{-     $mo := dig "machines" .machine "codex" dict $cfg }}
+{{-     $prov := dig "model_providers" $c.provider dict $s }}
+{{-     if and (eq (toString (dig "model_provider" "" $s)) $c.provider) (eq (toString (dig "base_url" "" $prov)) .cpaOpenAIBaseUrl) }}
+OK codex: model_provider {{ $c.provider }} points at the hub
+{{-     else }}
+FAIL codex: model_provider is not {{ $c.provider }} at {{ .cpaOpenAIBaseUrl }}
+{{-     end }}
+{{-     if eq (toString (dig "auth" "command" "" $prov)) $helper }}
+OK codex: provider auth.command is the cpa token helper
+{{-     else }}
+FAIL codex: provider auth.command is not the cpa token helper
+{{-     end }}
+{{-     if or (hasKey $prov "experimental_bearer_token") (hasKey $prov "env_key") }}
+FAIL codex: provider also sets experimental_bearer_token or env_key
+{{-     end }}
+{{-     range $c.legacy_providers }}{{ if hasKey (dig "model_providers" dict $s) . }}
+FAIL codex: legacy provider {{ . }} is still present
+{{-     end }}{{ end }}
+{{-     if regexMatch $keyRe $raw }}
+FAIL codex: config.toml contains a plaintext sk- key
+{{-     end }}
+{{-     $model := dig "model" $c.model $mo }}
+{{-     $effort := dig "effort" $c.effort $mo }}
+{{-     if and (eq (toString (dig "model" "" $s)) $model) (eq (toString (dig "model_reasoning_effort" "" $s)) $effort) }}
+OK codex: model {{ $model }}, effort {{ $effort }}
+{{-     else }}
+FAIL codex: model or effort is not {{ $model }} / {{ $effort }}
+{{-     end }}
+{{-     range $name, $m := $c.mcp }}
+{{-       if eq (toString (dig "mcp_servers" $name "url" "" $s)) $m.url }}
+OK codex: MCP server {{ $name }} configured
+HINT sign in once with: codex mcp login {{ $name }}
+{{-       else }}
+FAIL codex: MCP server {{ $name }} missing or at another URL
+{{-       end }}
+{{-     end }}
+{{-   end }}
+{{- end }}
+
+{{- /* ---------------- Grok ---------------- */ -}}
+{{- if has "grok" .harnesses }}
+{{-   $p := joinPath $home ".grok" "config.toml" }}
+{{-   if not (stat $p) }}
+FAIL grok: ~/.grok/config.toml is missing
+{{-   else }}
+{{-     $raw := include $p }}
+{{-     $s := fromToml $raw }}
+{{-     if eq (toString (dig "endpoints" "cli_chat_proxy_base_url" "" $s)) .cpaOpenAIBaseUrl }}
+OK grok: endpoints.cli_chat_proxy_base_url is the hub
+{{-     else }}
+FAIL grok: endpoints.cli_chat_proxy_base_url is not {{ .cpaOpenAIBaseUrl }}
+{{-     end }}
+{{-     if eq (toString (dig "auth" "auth_provider_command" "" $s)) $helper }}
+OK grok: auth.auth_provider_command is the cpa token helper
+{{-     else }}
+FAIL grok: auth.auth_provider_command is not the cpa token helper
+{{-     end }}
+{{-     if regexMatch $keyRe $raw }}
+FAIL grok: config.toml contains a plaintext sk- key
+{{-     end }}
+{{-   end }}
+{{-   range list "cpa-key.txt" "cpa-key" }}
+{{-     if stat (joinPath $home ".grok" .) }}
+WARN grok: legacy plaintext key file ~/.grok/{{ . }} still exists
+HINT nothing reads it once the helper is in place; delete it after checking grok works
+{{-     end }}
+{{-   end }}
+{{- end }}
+
+{{- /* ---------------- Muse ---------------- */ -}}
+{{- if has "muse" .harnesses }}
+{{-   $p := joinPath $home ".config" "muse" "settings.json" }}
+{{-   if not (stat $p) }}
+FAIL muse: ~/.config/muse/settings.json is missing
+{{-   else }}
+{{-     $raw := include $p }}
+{{-     $s := fromJson $raw }}
+{{-     if and (eq (toString (dig "endpoint_transport" "base_url" "" $s)) .cpaOpenAIBaseUrl) (eq (toString (dig "endpoint_transport" "auth" "" $s)) $cfg.muse.auth) }}
+OK muse: endpoint_transport is the hub with {{ $cfg.muse.auth }} auth
+{{-     else }}
+FAIL muse: endpoint_transport is not {{ .cpaOpenAIBaseUrl }} with {{ $cfg.muse.auth }} auth
+{{-     end }}
+{{-     $ids := list }}
+{{-     range (dig "model_catalog" list $s) }}{{ $ids = append $ids (toString (dig "model_id" "" .)) }}{{ end }}
+{{-     if has (toString (dig "model" "" $s)) $ids }}
+OK muse: model {{ dig "model" "" $s }} is in the {{ len $ids }}-entry catalog
+{{-     else }}
+FAIL muse: model is not in model_catalog
+{{-     end }}
+{{-     if regexMatch $keyRe $raw }}
+FAIL muse: settings.json contains a plaintext sk- key
+{{-     end }}
+{{-   end }}
+{{-   $a := joinPath $home ".config" "muse" "auth.json" }}
+{{-   $k := joinPath $home ".config" "agent-env" "cpa-key" }}
+{{-   $mk := "" }}
+{{-   if stat $a }}{{ $mk = toString (dig "providers" "meta" "api_key" "" (include $a | fromJson)) }}{{ end }}
+{{-   if not $mk }}
+FAIL muse: no credential stored for provider meta
+HINT rerun the apply, or run home/.chezmoiscripts/run_onchange_after_33-harness-muse-auth by hand
+{{-   else if and (stat $k) (eq (trim $mk) (include $k | trim)) }}
+OK muse: the stored meta credential is this machine's current key
+{{-   else }}
+FAIL muse: the stored meta credential is not ~/.config/agent-env/cpa-key (rotated, or set by hand)
+HINT scripts/backup && chezmoi apply --force --no-tty (run_onchange_after_33 re-runs when the key changes)
+{{-   end }}
+{{- end }}
+
+{{- /* ---------------- T3 Code (desktop only) ---------------- */ -}}
+{{- if not .headless }}
+{{-   $p := joinPath $home ".t3" "userdata" "settings.json" }}
+{{-   if stat $p }}
+{{-     $s := include $p | fromJson }}
+{{-     range $h := list "grok" "muse" }}
+{{-       if has $h $.harnesses }}
+{{-         $bin := toString (dig "providerInstances" $h "config" "binaryPath" "" $s) }}
+{{-         if and $bin (stat $bin) }}
+OK t3: {{ $h }} binaryPath exists
+{{-         else }}
+WARN t3: {{ $h }} binaryPath is missing or does not exist
+{{-         end }}
+{{-       end }}
+{{-     end }}
+{{-   else }}
+INFO t3: T3 Code has no settings yet (not installed or never started)
+{{-   end }}
+{{- end }}

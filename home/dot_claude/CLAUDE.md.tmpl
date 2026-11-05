@@ -1,0 +1,2 @@
+{{- /* Renders ~/.claude/CLAUDE.md from the shared rules (home/.chezmoitemplates/rules/global.md). */ -}}
+{{ includeTemplate "rules/global.md" (merge (dict "harness" "claude") .) | trim }}

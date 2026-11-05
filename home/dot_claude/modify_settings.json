@@ -1,0 +1,103 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- /*
+  ~/.claude/settings.json: merge the keys agent-env manages and keep every other key.
+  Claude Code rewrites this file itself, so it is never overwritten.
+
+  Managed: model, modelSettings.<model>.effortLevel, outputStyle, ultracode, apiKeyHelper,
+  env.ANTHROPIC_BASE_URL, env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY,
+  env.CLAUDE_CODE_API_KEY_HELPER_TTL_MS, env.DISABLE_AUTOUPDATER (when disable_autoupdater), the pr-workflow and subagent-routing PreToolUse hooks, statusLine
+  (only where oh-my-posh is on PATH), enabledPlugins entries, extraKnownMarketplaces entries.
+  Removed: env.ANTHROPIC_AUTH_TOKEN. It holds a plaintext key and outranks apiKeyHelper.
+
+  When the managed values are already right, the file is passed through byte for byte, so
+  `chezmoi verify` stays clean after Claude Code reformats it. Values: harness/config.toml.
+*/ -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $c := $cfg.claude -}}
+{{- $mo := dig "machines" .machine "claude" dict $cfg -}}
+{{- $orig := dict -}}
+{{- $s := dict -}}
+{{- if trim .chezmoi.stdin -}}
+{{-   $orig = fromJson .chezmoi.stdin -}}
+{{-   $s = fromJson .chezmoi.stdin -}}
+{{- end -}}
+{{- $win := eq .osFlavour "windows" -}}
+{{- $home := .chezmoi.homeDir | replace "\\" "/" -}}
+
+{{- /* Model and effort */ -}}
+{{- $s = setValueAtPath (list "model") (dig "model" $c.model $mo) $s -}}
+{{- $s = setValueAtPath (list "modelSettings" (dig "effort_model" $c.effort_model $mo) "effortLevel") (dig "effort" $c.effort $mo) $s -}}
+{{- $s = setValueAtPath (list "outputStyle") (dig "output_style" $c.output_style $mo) $s -}}
+{{- $s = setValueAtPath (list "ultracode") (dig "ultracode" $c.ultracode $mo) $s -}}
+
+{{- /* CPA hub: base URL plus the token helper. */ -}}
+{{- $helper := includeTemplate "harness/cpa-token-path" . -}}
+{{- /* apiKeyHelper is a command line: /bin/sh runs it on macOS/Linux, cmd on Windows. */ -}}
+{{- $helperCmd := $helper | shellQuote -}}
+{{- if $win -}}{{- $helperCmd = printf "\"%s\"" $helper -}}{{- end -}}
+{{- $s = setValueAtPath (list "apiKeyHelper") $helperCmd $s -}}
+{{- $s = setValueAtPath (list "env" "ANTHROPIC_BASE_URL") .cpaAnthropicBaseUrl $s -}}
+{{- $s = setValueAtPath (list "env" "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY") "1" $s -}}
+{{- $s = setValueAtPath (list "env" "CLAUDE_CODE_API_KEY_HELPER_TTL_MS") (dig "api_key_helper_ttl_ms" $c.api_key_helper_ttl_ms $mo) $s -}}
+{{- if dig "disable_autoupdater" $c.disable_autoupdater $mo -}}
+{{-   $s = setValueAtPath (list "env" "DISABLE_AUTOUPDATER") "1" $s -}}
+{{- end -}}
+{{- $s = deleteValueAtPath "env.ANTHROPIC_AUTH_TOKEN" $s -}}
+
+{{- /* Keep other hooks and group metadata; replace all stale or duplicate copies of ours. */ -}}
+{{- $managedHooks := list
+      (dict "path" ".agents/skills/pr-workflow/scripts/pr-workflow-hook.mjs" "file" "pr-workflow-hook.mjs" "matcher" $c.hook_matcher)
+      (dict "path" ".agents/skills/subagent-routing/scripts/routing-hook.mjs" "file" "routing-hook.mjs" "matcher" "^(.*_)?(Agent|Workflow)$") -}}
+{{- range $spec := $managedHooks -}}
+{{-   $hookPath := printf "%s/%s" $home $spec.path -}}
+{{-   $want := dict "matcher" $spec.matcher "hooks" (list (dict "type" "command" "command" (printf "node \"%s\"" $hookPath) "timeout" $c.hook_timeout)) -}}
+{{-   $existing := list -}}
+{{-   if hasKey $s "hooks" -}}{{- $existing = dig "PreToolUse" list $s.hooks -}}{{- end -}}
+{{-   $groups := list -}}
+{{-   range $g := $existing -}}
+{{-     $kept := list -}}
+{{-     $dropped := 0 -}}
+{{-     range $h := (dig "hooks" list $g) -}}
+{{-       if contains $spec.file (toString (dig "command" "" $h)) -}}
+{{-         $dropped = add1 $dropped -}}
+{{-       else -}}
+{{-         $kept = append $kept $h -}}
+{{-       end -}}
+{{-     end -}}
+{{-     if eq $dropped 0 -}}
+{{-       $groups = append $groups $g -}}
+{{-     else if $kept -}}
+{{-       $g2 := fromJson (toJson $g) -}}
+{{-       $_ := set $g2 "hooks" $kept -}}
+{{-       $groups = append $groups $g2 -}}
+{{-     end -}}
+{{-   end -}}
+{{-   $s = setValueAtPath (list "hooks" "PreToolUse") (append $groups $want) $s -}}
+{{- end -}}
+
+{{- /* Status line: only where oh-my-posh is installed; otherwise leave the key alone. */ -}}
+{{- if lookPath "oh-my-posh" -}}
+{{-   $theme := printf "%s/%s" $home $c.statusline_theme -}}
+{{-   if contains " " $theme -}}{{- $theme = printf "\"%s\"" $theme -}}{{- end -}}
+{{-   $s = setValueAtPath (list "statusLine" "type") "command" $s -}}
+{{-   $s = setValueAtPath (list "statusLine" "command") (printf "oh-my-posh claude --config %s" $theme) $s -}}
+{{-   $s = setValueAtPath (list "statusLine" "padding") 0 $s -}}
+{{- end -}}
+
+{{- /* Plugins and marketplaces: set ours, keep any others. */ -}}
+{{- range (dig "plugins" $c.plugins $mo) -}}
+{{-   $s = setValueAtPath (list "enabledPlugins" .) true $s -}}
+{{- end -}}
+{{- range $name, $m := $c.marketplaces -}}
+{{-   $s = setValueAtPath (list "extraKnownMarketplaces" $name "source" "source") "github" $s -}}
+{{-   $s = setValueAtPath (list "extraKnownMarketplaces" $name "source" "repo") $m.repo $s -}}
+{{-   if hasKey $m "auto_update" -}}
+{{-     $s = setValueAtPath (list "extraKnownMarketplaces" $name "autoUpdate") $m.auto_update $s -}}
+{{-   end -}}
+{{- end -}}
+
+{{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
+{{-   .chezmoi.stdin -}}
+{{- else -}}
+{{-   toPrettyJson $s -}}
+{{- end -}}

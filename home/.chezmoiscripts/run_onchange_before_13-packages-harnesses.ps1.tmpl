@@ -1,0 +1,111 @@
+{{- if eq .osFlavour "windows" -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+{{- $optin := env "AGENT_ENV_SYSTEM_PACKAGES" | trim -}}
+# packages 13 (Windows): the harness binaries, each with its vendor's own installer, per user
+# (no elevation). Configuration is the harness area's job.
+#   claude  https://claude.ai/install.ps1 <version>  -> ~\.local\bin\claude.exe (native build)
+#   codex   npm install -g @openai/codex@<version>  -> %APPDATA%\npm (packages/npm-global.txt)
+#   grok    https://x.ai/cli/install.ps1 -Version   -> ~\.grok\bin\grok.exe
+#   muse    https://dev.meta.ai/install.ps1         -> %LOCALAPPDATA%\Programs\muse\muse.cmd
+#           (a channel launcher: it cannot be pinned, so it is installed when missing)
+# Each installer runs in a child Windows PowerShell. Run from a normal terminal, never from
+# inside the Claude desktop app (MSIX redirect).
+# harnesses={{ join "," .harnesses }} role={{ .role }}
+# system-packages={{ $optin }} (rendered: Node is a per-machine winget install, so an opt-in
+# apply that brings Node re-runs this script and installs the npm globals)
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }} {{ include (joinPath .repoDir "packages/npm-global.txt") | sha256sum }}
+$ErrorActionPreference = 'Stop'
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.ps1" . }}
+Pk-AssertNotMsix
+Pk-RefreshPath
+
+# Pk-Native <name> <pin> <exe> <installer url> <installer args...>: install or move to the pin.
+function Pk-Native {
+    param([string]$name, [string]$pin, [string]$exe, [string]$url, [string[]]$instArgs)
+    if ($pin -eq 'skip') { Pk-Say "${name}: skipped on this machine"; return }
+    $have = Pk-Version $exe @('--version')
+    if ($have -eq $pin) { Pk-Say "$name $have"; return }
+    if (Pk-Dry) { Pk-Say ("dry-run: would install {0} {1} (have {2})" -f $name, $pin, $(if ($have) { $have } else { 'none' })); return }
+    try {
+        $path = Pk-GetInstaller $name $url
+        $rc = Pk-RunInstaller $path $instArgs
+    } catch {
+        Pk-Fail $name "$name installer could not be downloaded or started"; return
+    }
+    $have = Pk-Version $exe @('--version')
+    if ($have -eq $pin) { $script:PkChanged++; Pk-Say "$name $have installed" }
+    else { Pk-Fail $name ("{0}: installer exited {1}; now {2}, pin {3}" -f $name, $rc, $(if ($have) { $have } else { 'missing' }), $pin) }
+}
+{{- if has "claude" .harnesses }}
+
+# claude: the bootstrap checks the build against the signed release manifest, then runs
+# `claude install <version>`. A build that auto-updated past the pin is put back on it.
+$pin = {{ (index $pins "harness.claude").version | squote }}
+Pk-Native 'claude' $pin (Join-Path $env:USERPROFILE '.local\bin\claude.exe') 'https://claude.ai/install.ps1' @($pin)
+{{- end }}
+{{- if has "grok" .harnesses }}
+
+$pin = {{ (index $pins "harness.grok").version | squote }}
+$env:GROK_CHANNEL = 'stable'
+Pk-Native 'grok' $pin (Join-Path $env:USERPROFILE '.grok\bin\grok.exe') 'https://x.ai/cli/install.ps1' @('-Version', $pin)
+{{- end }}
+{{- if has "muse" .harnesses }}
+
+# muse: the launcher follows the muse-stable channel by itself; install only when missing.
+$museCmd = Join-Path $env:LOCALAPPDATA 'Programs\muse\muse.cmd'
+if ({{ (index $pins "harness.muse").version | squote }} -eq 'skip') {
+    Pk-Say 'muse: skipped on this machine'
+} elseif (Test-Path -LiteralPath $museCmd) {
+    Pk-Say ("muse present (channel launcher; versions.toml records {0})" -f {{ (index $pins "harness.muse").version | squote }})
+} elseif (Pk-Dry) {
+    Pk-Say 'dry-run: would install muse (muse-stable channel)'
+} else {
+    try {
+        $path = Pk-GetInstaller 'muse' 'https://dev.meta.ai/install.ps1'
+        $rc = Pk-RunInstaller $path @()
+    } catch { $rc = -1 }
+    if (Test-Path -LiteralPath $museCmd) { $script:PkChanged++; Pk-Say 'muse installed (channel launcher)' }
+    else { Pk-Fail 'muse' "muse installer exited $rc and muse.cmd is missing" }
+}
+{{- end }}
+
+# npm globals (codex). npm.cmd, never npm.ps1: the .ps1 shim is blocked by some execution policies.
+$npmItems = @(
+{{- range splitList "\n" (include (joinPath .repoDir "packages/npm-global.txt")) }}
+{{-   $l := regexReplaceAll "#.*$" . "" | trim }}
+{{-   if $l }}
+{{-     $c := splitList "|" $l }}
+{{-     $h := index $c 3 | trim }}
+{{-     if or (eq $h "-") (has $h $.harnesses) }}
+    @{ Package = {{ index $c 0 | trim | squote }}; Pin = {{ (index $pins (index $c 1 | trim)).version | squote }}; Cmd = {{ index $c 2 | trim | squote }} }
+{{-     end }}
+{{-   end }}
+{{- end }}
+)
+foreach ($it in $npmItems) {
+    if ($it.Pin -eq 'skip') { Pk-Say ("{0}: skipped on this machine" -f $it.Cmd); continue }
+    $shim = Join-Path $env:APPDATA ("npm\{0}.cmd" -f $it.Cmd)
+    $have = Pk-Version $shim @('--version')
+    if ($have -eq $it.Pin) { Pk-Say ("{0} {1} (npm)" -f $it.Cmd, $have); continue }
+    if (Pk-Dry) { Pk-Say ("dry-run: would npm install -g {0}@{1} (have {2})" -f $it.Package, $it.Pin, $(if ($have) { $have } else { 'none' })); continue }
+    if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
+{{- if eq $optin "1" }}
+        Pk-Fail $it.Cmd ("{0}: npm is not installed, although 11-packages-winget had the opt-in to install Node" -f $it.Cmd)
+{{- else }}
+        # Node is per-machine (UAC) and needs the owner's opt-in. Without it, report and carry
+        # on, so the rest of the apply still lands; scripts/verify FAILs the missing harness.
+        Pk-Say ("{0}: skipped, it needs Node (per-machine, UAC): rerun the apply with `$env:AGENT_ENV_SYSTEM_PACKAGES = '1'" -f $it.Cmd)
+{{- end }}
+        continue
+    }
+    & npm.cmd install --global --no-fund --no-audit --loglevel=error ("{0}@{1}" -f $it.Package, $it.Pin) | Out-Null
+    $rc = $LASTEXITCODE
+    $have = Pk-Version $shim @('--version')
+    if ($have -eq $it.Pin) { $script:PkChanged++; Pk-Say ("{0} {1} installed (npm)" -f $it.Cmd, $have) }
+    else { Pk-Fail $it.Cmd ("{0}: npm exited {1}; now {2}, pin {3}" -f $it.Cmd, $rc, $(if ($have) { $have } else { 'missing' }), $it.Pin) }
+}
+
+Pk-Finish '13-packages-harnesses'
+{{ end -}}

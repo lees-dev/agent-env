@@ -1,0 +1,39 @@
+{{- /* chezmoi:modify-template */ -}}
+{{- /*
+  ~/.config/muse/settings.json: merge the keys agent-env manages and keep every other key.
+
+  Managed: provider, model, model_reasoning_efforts.<model>, endpoint_transport.base_url
+  (the hub, OpenAI style with /v1), endpoint_transport.auth = "bearer" (Muse sends its
+  stored key to a non-Meta base_url only when settings pin both), and model_catalog,
+  which is replaced as a whole. schema_version is set to 1 only when the file has none.
+
+  The key itself goes into Muse's own credential store through `muse auth set
+  --api-key-stdin` (run_onchange_after_33-harness-muse-auth), never into this file.
+
+  When the managed values are already right, the file is passed through byte for byte.
+  Values: harness/config.toml.
+*/ -}}
+{{- $cfg := includeTemplate "harness/config.toml" . | fromToml -}}
+{{- $c := $cfg.muse -}}
+{{- $mo := dig "machines" .machine "muse" dict $cfg -}}
+{{- $orig := dict -}}
+{{- $s := dict -}}
+{{- if trim .chezmoi.stdin -}}
+{{-   $orig = fromJson .chezmoi.stdin -}}
+{{-   $s = fromJson .chezmoi.stdin -}}
+{{- end -}}
+{{- $model := dig "model" $c.model $mo -}}
+
+{{- if not (hasKey $s "schema_version") -}}{{- $s = setValueAtPath (list "schema_version") 1 $s -}}{{- end -}}
+{{- $s = setValueAtPath (list "provider") $c.provider $s -}}
+{{- $s = setValueAtPath (list "model") $model $s -}}
+{{- $s = setValueAtPath (list "model_reasoning_efforts" $model) (dig "effort" $c.effort $mo) $s -}}
+{{- $s = setValueAtPath (list "endpoint_transport" "base_url") .cpaOpenAIBaseUrl $s -}}
+{{- $s = setValueAtPath (list "endpoint_transport" "auth") $c.auth $s -}}
+{{- $s = setValueAtPath (list "model_catalog") $c.catalog $s -}}
+
+{{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
+{{-   .chezmoi.stdin -}}
+{{- else -}}
+{{-   toPrettyJson $s -}}
+{{- end -}}

@@ -1,0 +1,10 @@
+{{- if ne .osFlavour "windows" -}}
+# shellcheck shell=sh
+{{ include (joinPath .repoDir "scripts/lib/load-cpa-dir.sh") }}
+ae_load_cpa_dir
+# 1Password mode: {{ .opMode }}. Inactive in account mode.
+{{ if eq .opMode "service" -}}
+{{ include (joinPath .repoDir "scripts/lib/load-token.sh") }}
+ae_load_token service
+{{- end }}
+{{- end }}

@@ -1,0 +1,82 @@
+#!/bin/sh
+# Post-apply verification for WSL, Linux and macOS. Windows native: scripts/verify.ps1.
+#
+# Usage: scripts/verify
+#
+# Base checks (this file): chezmoi is the pinned version and initialised, the target state
+# matches the source state (`chezmoi verify`), each selected harness runs at its pin, and
+# a backup exists. Each area adds its own checks as scripts/verify.d/<NN>-<area>.sh, sourced
+# in name order with the same helpers and counters (see docs/layout.md).
+#
+# Read-only. Never prints a secret, an account email or file contents.
+# Exit 0 when nothing FAILed, 1 otherwise.
+set -u
+
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+. "$REPO/scripts/lib/common.sh"
+PATH="$HOME/.local/bin:$PATH"; export PATH
+VERSIONS="$REPO/versions.toml"
+. "$REPO/scripts/lib/load-cpa-dir.sh"
+ae_load_cpa_dir || { ae_fail "persisted CPA path environment file rejected"; exit 1; }
+OS=$(ae_os_flavour)
+
+echo "agent-env verify ($OS)"
+
+ae_section "chezmoi"
+if ! ae_have chezmoi; then
+  ae_fail "chezmoi not installed"; ae_summary verify; exit 1
+fi
+pin=$(ae_toml_get "$VERSIONS" tools.chezmoi version)
+have=$(ae_semver "$(chezmoi --version 2>/dev/null)")
+if [ "$have" = "$pin" ]; then ae_ok "chezmoi $have"; else ae_fail "chezmoi $have, pin $pin"; fi
+
+ROLE=$(ae_chezmoi_data role)
+MACHINE=$(ae_chezmoi_data machine)
+HARNESSES=$(chezmoi execute-template '{{ range .harnesses }}{{ . }} {{ end }}' 2>/dev/null || true)
+if [ -z "$ROLE" ]; then
+  ae_fail "chezmoi is not initialised for this repo"; ae_hint "AGENTS.md step 3"; ae_summary verify; exit 1
+fi
+ae_ok "initialised: role=$ROLE machine=$MACHINE harnesses=$HARNESSES"
+src=$(chezmoi source-path 2>/dev/null || true)
+case "$src" in
+  "$REPO"|"$REPO"/home) ae_ok "source is this checkout" ;;
+  *) ae_fail "chezmoi source is not this checkout"; ae_hint "chezmoi init --source \"$REPO\"" ;;
+esac
+. "$REPO/scripts/lib/load-token.sh"
+ae_load_token "$(ae_chezmoi_data opMode)" || ae_fail "persisted service token file rejected"
+# Scripts are excluded: run_onchange_ scripts are verified by their own areas' checks.
+if chezmoi verify --exclude=scripts >/dev/null 2>&1; then
+  ae_ok "target state matches source state"
+else
+  n=$(chezmoi status --exclude=scripts 2>/dev/null | wc -l | tr -d ' ')
+  ae_fail "target state differs from source state ($n entries)"
+  ae_hint "chezmoi status --exclude=scripts   (then: scripts/backup && chezmoi apply)"
+fi
+
+ae_section "Harnesses"
+# See PATH the way a new login shell does, so a shell started before the apply does not report
+# a freshly installed harness as missing (the packages area deploys env.sh).
+if [ -r "$HOME/.config/agent-env/env.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.config/agent-env/env.sh"
+fi
+for h in $HARNESSES; do
+  pin=$(ae_pin "$VERSIONS" harness "$h" "$MACHINE")
+  srcv=$(ae_toml_get "$VERSIONS" "harness.$h" source)
+  if ! ae_have "$h"; then ae_fail "$h not on PATH (pin $pin)"; continue; fi
+  have=$(ae_semver "$("$h" --version 2>/dev/null | head -n 1)")
+  if [ "$have" = "$pin" ]; then ae_ok "$h $have"
+  elif [ "$srcv" = observed ]; then ae_warn "$h $have, observed pin $pin (no registry to pin from)"
+  else ae_fail "$h $have, pin $pin"
+  fi
+done
+
+ae_section "Backups"
+root=${AGENT_ENV_BACKUP_ROOT:-$HOME/.agent-env-backups}
+last=$(ls -1d "$root"/*/ 2>/dev/null | tail -n 1)
+if [ -n "$last" ]; then ae_ok "latest backup $(basename "$last")"
+else ae_warn "no backup under $root"; ae_hint "scripts/backup runs before every apply"; fi
+
+ae_run_dropins "$REPO/scripts/verify.d" "verify"
+
+ae_summary verify

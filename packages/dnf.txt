@@ -1,0 +1,18 @@
+# Rocky / RHEL / Fedora system packages: run_onchange_before_11-packages-system.sh.tmpl.
+# Installed only when missing, only on the client and hub roles, and only when the owner opted
+# in for this apply with AGENT_ENV_SYSTEM_PACKAGES=1 (it uses sudo). Never on the server role:
+# On the server role this list is checked (verify warns) but never installed.
+# ripgrep is left out: it is in EPEL, not the base repos, and Claude Code bundles its own.
+# One package per line; '#' starts a comment.
+ca-certificates
+curl
+git
+bash
+tar
+gzip
+xz
+unzip
+jq
+# Claude Code's Linux sandbox needs both.
+bubblewrap
+socat

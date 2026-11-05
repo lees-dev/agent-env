@@ -1,0 +1,19 @@
+# Ubuntu / Debian (including WSL) system packages: run_onchange_before_11-packages-system.sh.tmpl.
+# Installed only when missing, only on the client and hub roles, and only when the owner opted
+# in for this apply with AGENT_ENV_SYSTEM_PACKAGES=1 (it uses sudo). Never on the server role.
+# Versions come from the distro. Pinned tools (node, uv, gh, oh-my-posh, codex) come from mise
+# instead, because the distro packages are stale; see packages/mise-tools.toml.
+# One package per line; '#' starts a comment.
+ca-certificates
+curl
+git
+bash
+tar
+gzip
+xz-utils
+unzip
+jq
+ripgrep
+# Claude Code's Linux sandbox needs both.
+bubblewrap
+socat

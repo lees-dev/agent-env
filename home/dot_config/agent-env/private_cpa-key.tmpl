@@ -1,0 +1,3 @@
+{{- /* ~/.config/agent-env/cpa-key (0600): this machine's CPA client key, one line, no newline.
+       Harnesses never read it directly; they run cpa-token / cpa-token.cmd (docs/cpa.md). */ -}}
+{{- template "secrets/cpa-client-key" . -}}

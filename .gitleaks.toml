@@ -1,0 +1,39 @@
+# gitleaks config for this repo (CI: .github/workflows/secret-scan.yml).
+# Starts from gitleaks' built-in rules and adds the shapes this repo handles.
+# Config format: https://github.com/gitleaks/gitleaks/blob/v8.30.1/README.md#configuration
+title = "agent-env"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "cliproxy-client-key"
+description = "CLIProxyAPI client key (sk- prefix, one per machine)"
+regex = '''(?:^|[^A-Za-z0-9])(sk-[A-Za-z0-9_-]{20,})'''
+secretGroup = 1
+keywords = ["sk-"]
+
+[[rules]]
+id = "tailscale-auth-key"
+description = "Tailscale auth key"
+regex = '''(tskey-[a-z]+-[A-Za-z0-9]{8,}[A-Za-z0-9-]*)'''
+secretGroup = 1
+keywords = ["tskey-"]
+
+[[rules]]
+id = "1password-service-account-token"
+description = "1Password service account token"
+regex = '''(ops_[A-Za-z0-9]{40,})'''
+secretGroup = 1
+keywords = ["ops_"]
+
+# harness: T3 Code keybindings (home/dot_t3/userdata/create_keybindings.json) hold chords such as
+# "key": "mod+shift+enter", which the built-in generic-api-key rule reads as API keys. Allow only
+# that rule, only in that file, and only for values shaped like a key chord.
+[[allowlists]]
+description = "T3 Code keybinding chords"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^home/dot_t3/userdata/create_keybindings\.json$''']
+regexTarget = "secret"
+regexes = ['''^(mod|ctrl|alt|shift|meta|cmd)(\+[a-z0-9]+)+$''']

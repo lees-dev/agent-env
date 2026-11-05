@@ -1,0 +1,83 @@
+{{- if and (ne .osFlavour "windows") (has "claude" .harnesses) -}}
+#!/bin/sh
+# agent-env rules+skills: make ~/.claude/skills/<name> a symlink to ~/.agents/skills/<name>
+# for every canonical skill in the repo, so the two can never drift (docs/skills.md).
+#
+# Runs after every apply (run_after_): it is idempotent and prints counts and skill names only.
+#   - a correct symlink is left alone
+#   - a missing entry gets a symlink
+#   - a symlink that points elsewhere, or dangles, is recorded and replaced
+#   - a real directory whose content (LF-normalised) equals the canonical copy is moved to
+#     the backup root, then replaced by a symlink
+#   - a real directory that differs is LEFT IN PLACE and reported; scripts/verify fails on it
+#   - symlinks in ~/.claude/skills that point into ~/.agents/skills and dangle are removed
+# It never touches ~/.claude/skills/synced or any name that is not a canonical skill.
+set -eu
+
+NAMES='{{ range glob (joinPath .chezmoi.sourceDir "dot_agents/skills/exact_*") }}{{ base . | trimPrefix "exact_" }} {{ end }}'
+DEST='{{ .chezmoi.destDir }}'
+AGENTS="$DEST/.agents/skills"
+CLAUDE="$DEST/.claude/skills"
+BACKUP='{{ .backupRoot }}'/$(date -u +%Y%m%dT%H%M%SZ)-skills-links
+
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
+
+# tree_hash <dir>: sha256 over "relpath<TAB>sha256(content without CR)<LF>" lines sorted by relpath.
+tree_hash() {
+  (cd "$1" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do
+    printf '%s\t%s\n' "$f" "$(tr -d '\r' < "$f" | sha)"
+  done) | sha
+}
+
+save_backup() { # save_backup <name> <kind> <detail>
+  if [ ! -d "$BACKUP" ]; then
+    (umask 077; mkdir -p "$BACKUP/claude-skills")
+    printf 'kind\tpath\tdetail\n' > "$BACKUP/manifest.tsv"
+  fi
+  printf '%s\t.claude/skills/%s\t%s\n' "$2" "$1" "$3" >> "$BACKUP/manifest.tsv"
+}
+
+mkdir -p "$CLAUDE"
+ok=0; created=0; replaced=0; relinked=0; pruned=0; total=0; kept=''; missing=''
+for n in $NAMES; do
+  total=$((total + 1))
+  src="$AGENTS/$n"; dst="$CLAUDE/$n"
+  if [ ! -f "$src/SKILL.md" ]; then missing="$missing $n"; continue; fi
+  if [ -L "$dst" ]; then
+    t=$(readlink "$dst")
+    if [ "$t" = "$src" ] && [ -e "$dst" ]; then ok=$((ok + 1)); continue; fi
+    save_backup "$n" link "$t"
+    rm -f "$dst"; ln -s "$src" "$dst"; relinked=$((relinked + 1))
+  elif [ -d "$dst" ]; then
+    if [ "$(tree_hash "$dst")" = "$(tree_hash "$src")" ]; then
+      save_backup "$n" dir "identical to canonical; moved here"
+      mv "$dst" "$BACKUP/claude-skills/$n"
+      ln -s "$src" "$dst"; replaced=$((replaced + 1))
+    else
+      kept="$kept $n"
+    fi
+  elif [ -e "$dst" ]; then
+    kept="$kept $n"
+  else
+    ln -s "$src" "$dst"; created=$((created + 1))
+  fi
+done
+
+for l in "$CLAUDE"/*; do
+  [ -L "$l" ] || continue
+  [ "${l##*/}" = synced ] && continue
+  t=$(readlink "$l")
+  case "$t" in
+    "$AGENTS"/*) if [ ! -e "$l" ]; then save_backup "${l##*/}" link "$t"; rm -f "$l"; pruned=$((pruned + 1)); fi ;;
+  esac
+done
+
+nk=$(echo $kept | wc -w | tr -d ' '); nm=$(echo $missing | wc -w | tr -d ' ')
+echo "skills links: $total canonical; $ok ok, $created created, $replaced replaced (backed up), $relinked relinked, $pruned pruned, $nk kept (differ), $nm canonical missing"
+[ -z "$kept" ] || echo "  kept, differ from the canonical copy:$kept"
+[ ! -d "$BACKUP" ] || echo "  backup: $BACKUP"
+if [ -n "$missing" ]; then
+  echo "  canonical copy missing in ~/.agents/skills:$missing"
+  exit 1
+fi
+{{- end }}

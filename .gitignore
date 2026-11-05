@@ -1,0 +1,53 @@
+# Local tool downloads used to test templates (never committed).
+/.tools/
+
+# Backups belong in ~/.agent-env-backups, never here. These catch an accidental copy.
+.agent-env-backups/
+*.bak
+*.bak-*
+*.orig
+
+# Credentials and secret material: never in git, whatever the file is called.
+auth.json
+auth.json.*
+.credentials.json
+credentials
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.age
+id_rsa*
+id_ed25519*
+id_ecdsa*
+hosts.yml
+.env
+.env.*
+*.env
+mcp_oauth*
+cpa-key
+cpa-key.txt
+client-api-key*.txt
+oauth/
+
+# Logs and runtime state carry account emails and conversation text.
+*.log
+logs/
+state.json
+*.sqlite
+*.db
+
+# OS and editor noise.
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Language noise.
+node_modules/
+__pycache__/
+*.pyc
+.venv/

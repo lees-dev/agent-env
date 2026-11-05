@@ -1,0 +1,42 @@
+{{- if ne .osFlavour "windows" -}}
+#!/bin/sh
+# packages 10: hook ~/.config/agent-env/env.sh into the shell startup files (WSL, Linux, macOS).
+#
+# env.sh (deployed by chezmoi after this script) sources ~/.config/agent-env/env.d/*.sh, which
+# put the user-level install dirs first on PATH: mise shims, ~/.local/bin, ~/.grok/bin.
+# This script only adds one marked block to each startup file, once. It never edits anything
+# else in them. scripts/backup.d/10-packages.list backs these files up before every apply.
+#
+# Startup files: ~/.bashrc (if present or bash is the login shell), ~/.zshrc (same for zsh),
+# and the first of ~/.bash_profile, ~/.bash_login, ~/.profile that exists (else ~/.profile),
+# so login shells and `bash -lc` get the PATH too.
+# role={{ .role }} os={{ .osFlavour }}
+set -eu
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
+# records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
+{{ template "packages/lib.sh" . }}
+
+begin='# >>> agent-env >>>'
+end='# <<< agent-env <<<'
+line='[ -r "$HOME/.config/agent-env/env.sh" ] && . "$HOME/.config/agent-env/env.sh"'
+login_shell=$(basename "${SHELL:-sh}")
+
+hook() { # hook <file>
+  if [ -f "$1" ] && grep -qF "$begin" "$1"; then return 0; fi
+  if pk_dry; then pk_say "dry-run: would add the agent-env block to ~/${1#"$HOME"/}"; return 0; fi
+  # Appending follows a symlinked dotfile to its target, which is what a dotfile repo wants.
+  printf '\n%s\n%s\n%s\n' "$begin" "$line" "$end" >> "$1"
+  PK_CHANGED=$((PK_CHANGED + 1))
+  pk_say "added the agent-env block to ~/${1#"$HOME"/}"
+}
+
+if [ -f "$HOME/.bashrc" ] || [ "$login_shell" = bash ]; then hook "$HOME/.bashrc"; fi
+if [ -f "$HOME/.zshrc" ] || [ "$login_shell" = zsh ]; then hook "$HOME/.zshrc"; fi
+login_file="$HOME/.profile"
+for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -f "$f" ]; then login_file=$f; break; fi
+done
+hook "$login_file"
+
+pk_finish 10-packages-path
+{{ end -}}

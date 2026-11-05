@@ -1,0 +1,10 @@
+# cpa: files the cpa run scripts change outside chezmoi's view (paths relative to ~).
+#
+# None today. run_onchange_after_40-cpa-rebalancer-task.ps1 changes a scheduled task, not a
+# file, and exports the old task definition to the backup root itself before it replaces it.
+# Only the public client-key tools and managed CPA environment/helper targets are copied
+# by scripts/backup. The private rebalancer source and runtime files, token file and local
+# path environment file are unmanaged: restore private tools from the owner's private backup.
+#
+# Never list the CPA install directory, its OAuth files or any plaintext key file here:
+# a backup copy of a secret is one more place to leak it from.

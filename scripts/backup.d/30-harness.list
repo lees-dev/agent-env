@@ -1,0 +1,16 @@
+# harness: files the harness run scripts change outside chezmoi's view (paths relative to ~).
+# The modify_ targets (~/.claude/settings.json, ~/.codex/config.toml, ~/.grok/config.toml,
+# ~/.config/muse/settings.json, ~/.t3/userdata/settings.json) are managed, so scripts/backup
+# already copies them.
+#
+# run_onchange_after_31-harness-claude-mcp: `claude mcp add --scope user` rewrites this.
+.claude.json
+# run_onchange_after_32-harness-claude-plugins: `claude plugin install` and
+# `claude plugin marketplace add` rewrite these (the plugin caches are not copied).
+.claude/plugins/installed_plugins.json
+.claude/plugins/known_marketplaces.json
+# run_onchange_after_33-harness-muse-auth: `muse auth set --provider meta` rewrites this. On a
+# machine set up before agent-env it may hold a credential that is not in 1Password (a native
+# Meta login, another provider), so it is backed up like ~/.claude.json: the backup root is
+# 0700 and already holds live credentials. Never copy it anywhere else.
+.config/muse/auth.json

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://raw.githubusercontent.com/JanDeDobbeleer/oh-my-posh/main/themes/schema.json",
+  "version": 4,
+  "blocks": [
+    {
+      "type": "prompt",
+      "alignment": "left",
+      "segments": [
+        {
+          "type": "claude",
+          "style": "diamond",
+          "leading_diamond": "",
+          "trailing_diamond": "<transparent,#FEF5ED></>",
+          "foreground": "#011627",
+          "background": "#FEF5ED",
+          "template": " 󰯉 {{ .Model.DisplayName }}{{ if .Effort }}{{ if .Effort.Level }} · {{ .Effort.Level }}{{ end }}{{ end }} "
+        },
+        {
+          "type": "path",
+          "style": "diamond",
+          "leading_diamond": "",
+          "trailing_diamond": "<transparent,#FEF5ED></>",
+          "foreground": "#011627",
+          "background": "#FEF5ED",
+          "options": { "style": "folder" },
+          "template": "  {{ .Path }} "
+        },
+        {
+          "type": "claude",
+          "style": "diamond",
+          "leading_diamond": "",
+          "trailing_diamond": "<transparent,#516BEB></>",
+          "foreground": "#ffffff",
+          "background": "#516BEB",
+          "options": { "gauge_marked_char": "■", "gauge_unmarked_char": "·" },
+          "template": "  CTX: {{ .TokenUsagePercent }}% {{ .TokenGaugeUsed }} | {{ .FormattedTokens }} "
+        },
+        {
+          "type": "claude",
+          "style": "diamond",
+          "leading_diamond": "",
+          "trailing_diamond": "",
+          "foreground": "#d6deeb",
+          "background": "#575656",
+          "template": "  {{ .FormattedDuration }} "
+        },
+        {
+          "type": "git",
+          "style": "diamond",
+          "leading_diamond": " ",
+          "trailing_diamond": "",
+          "foreground": "#011627",
+          "background": "#17D7A0",
+          "options": { "branch_icon": " ", "fetch_status": true },
+          "template": " {{ .UpstreamIcon }}{{ .HEAD }}{{ if .BranchStatus }} {{ .BranchStatus }}{{ end }}{{ if .Working.Changed }}  {{ .Working.String }}{{ end }}{{ if .Staging.Changed }}  {{ .Staging.String }}{{ end }} "
+        }
+      ]
+    }
+  ]
+}
