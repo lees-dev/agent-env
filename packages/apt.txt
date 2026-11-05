@@ -13,7 +13,6 @@ gzip
 xz-utils
 unzip
 jq
-ripgrep
 # Claude Code's Linux sandbox needs both.
 bubblewrap
 socat

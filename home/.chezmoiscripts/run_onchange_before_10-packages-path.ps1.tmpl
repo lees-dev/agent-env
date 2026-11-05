@@ -16,15 +16,16 @@ $ErrorActionPreference = 'Stop'
 Pk-AssertNotMsix
 
 $backupRoot = {{ .backupRoot | replace "/" "\\" | squote }}
-$want = @("$env:USERPROFILE\.local\bin")
+$want = @("$env:USERPROFILE\.local\bin", "$env:APPDATA\npm")
+{{- if not .headless }}
+$want += "$env:LOCALAPPDATA\Programs\t3code"
+$want += "$env:LOCALAPPDATA\JetBrains\Toolbox\bin"
+{{- end }}
 {{- if has "grok" .harnesses }}
 $want += "$env:USERPROFILE\.grok\bin"
 {{- end }}
 {{- if has "muse" .harnesses }}
 $want += "$env:LOCALAPPDATA\Programs\muse"
-{{- end }}
-{{- if has "codex" .harnesses }}
-$want += "$env:APPDATA\npm"
 {{- end }}
 
 # 1. User PATH, read and written raw (REG_EXPAND_SZ) so %USERPROFILE%-style entries survive.
@@ -43,12 +44,18 @@ if ($add.Count -eq 0) {
 } elseif (Pk-Dry) {
     Pk-Say ("dry-run: would add {0} user PATH entries: {1}" -f $add.Count, ($add -join ', '))
 } else {
-    # Save the old value into this session's backup (scripts/backup ran just before the apply).
+    # The tools stage can run before scripts/backup. Keep earlier snapshots intact.
     $last = $null
     if (Test-Path -LiteralPath $backupRoot) { $last = Get-ChildItem -LiteralPath $backupRoot -Directory | Where-Object { $_.Name -match '^\d{8}T\d{6}Z$' } | Sort-Object Name | Select-Object -Last 1 }
     if (-not $last) { $last = New-Item -ItemType Directory -Force -Path (Join-Path $backupRoot ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'))) }
     $bdir = $last.FullName
-    [IO.File]::WriteAllText((Join-Path $bdir 'user-path-before-packages.txt'), $raw, (New-Object Text.UTF8Encoding($false)))
+    $snapshot = Join-Path $bdir 'user-path-before-packages.txt'
+    if (Test-Path -LiteralPath $snapshot) { $snapshot = Join-Path $bdir ('user-path-before-packages-' + [Guid]::NewGuid().ToString('N') + '.txt') }
+    $stream = [IO.File]::Open($snapshot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($raw)
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally { $stream.Dispose() }
     $new = (@($raw.TrimEnd(';')) + $add | Where-Object { $_ }) -join ';'
     $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
     # Tell Explorer and new terminals that the environment changed (WM_SETTINGCHANGE).

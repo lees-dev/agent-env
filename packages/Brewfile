@@ -7,5 +7,4 @@
 # brew cannot adopt an App Store or standalone-pkg install.
 brew "git"
 brew "jq"
-brew "ripgrep"
 cask "1password-cli"

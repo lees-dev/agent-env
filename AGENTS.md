@@ -31,8 +31,24 @@ Ask the owner these questions in one message. Offer the detected value or the de
 3. **Machine remark.** Lowercase `a-z 0-9 -`; the default is `<hostname>-wsl` on WSL and the hostname elsewhere. It names this machine's CPA client key and its 1Password item `cpa-client-<remark>`. Each machine has its own key, so never reuse another machine's remark.
 4. **1Password access.** Default to `service` on every device: client-key vault `agent-env` on the hub, `agent-env-<remark>` on every other device. Before preflight, follow `docs/cpa.md` "Provision a device without recurring prompts". Choose the remark first, create its vault and mint its key on BEAST, then restart EasyCLIProxyAPI. In their own BEAST terminal, the owner approves creation of the read-only device service account and stores its token in a temporary owner-only 1Password item via stdin. On the device, they copy it from the app into the no-echo prompt in their own terminal and persist it (Windows User environment or Unix user-owned mode-0600 token file). They archive the transfer item afterwards. The agent then continues without restarting; preflight, apply, and verify load the saved token when their process environment is empty. `account` is opt-in with vault `agent-env`.
 5. **Harnesses.** Any of `claude, codex, grok, muse`. The default is all four.
-6. **System packages.** May this apply use the system package manager (winget per-machine installers with UAC, apt, dnf, brew)? The default is no: the run scripts then list what is missing and carry on, and skip what depends on it (on Windows, codex needs the per-machine Node), which verify then FAILs until an apply with the opt-in. A yes sets `AGENT_ENV_SYSTEM_PACKAGES=1` for step 5 only. The `server` role never uses it (`docs/packages.md`).
+6. **System packages.** May setup use winget per-machine installers with UAC, apt, dnf, or brew? When invoked through `setup.md`, default to **yes**: the owner is present to approve UAC or run sudo in their TTY. Set `AGENT_ENV_SYSTEM_PACKAGES=1` for the tools stage and step 5. Outside setup, ask before enabling it. Without approval, missing system dependencies remain and verify can fail, including Codex when Windows Node is absent. The `server` role never uses system packages (`docs/packages.md`).
 7. **Hub URL.** The default is `https://beast-1.tail7f661e.ts.net`. The one exception is WSL on the hub host (Beast), which reaches CPA at `http://127.0.0.1:8317` through mirrored networking, under its own remark `beast-1-wsl` (`docs/cpa.md`).
+
+### 0a. Install tools before provisioning
+
+After cloning and confirming role, OS, remark, and system-package approval, run the secret-free stage before question 4's provisioning work:
+
+```sh
+AGENT_ENV_SYSTEM_PACKAGES=1 sh scripts/install-tools --role <role> --machine <remark>
+```
+```powershell
+$env:AGENT_ENV_SYSTEM_PACKAGES = '1'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-tools.ps1 -Role <role> -Machine <remark>
+```
+
+On Unix with system packages, the owner runs this in their own TTY after `sudo -v`. On `server`, omit sudo and the opt-in. The stage installs all four harnesses, the development tools, and desktop apps on client/hub roles (WSL uses the Windows apps). It bootstraps chezmoi and uses only the package allowlist; no 1Password, Tailscale connection, or hub is needed. Do not wait for provisioning to run it. See `docs/packages.md` for prerequisites, dry runs, and untested platforms.
+
+Then complete question 4's provisioning before step 1. The normal apply keeps the same lists and pins consistent.
 
 ### 1. Install the pinned 1Password CLI, then preflight
 
@@ -169,7 +185,7 @@ chezmoi apply --force --no-tty                                          # Window
 
 On Linux, WSL, and macOS, sudo needs a TTY. With system packages opted in, the owner runs the apply in their own terminal using the full loader block above, or installs the packages from `packages/apt.txt`, `packages/dnf.txt`, or `packages/Brewfile` first. An agent's non-TTY shell cannot supply sudo credentials. The `server` role stays user-level only.
 
-The run scripts go in this order: `10`-`13` packages (the PATH hook, system packages, mise, the harness binaries at their pins), then the files, then `20` the skill links, `31`-`33` harness (Claude MCP servers, Claude plugins, Muse auth from the token helper) and, on the hub only, `40` the rebalancer task.
+The run scripts go in this order: `10`-`14` packages (the PATH hook, system packages, development tools, harness binaries, and desktop apps at their pins), then the files, then `20` the skill links, `31`-`33` harness (Claude MCP servers, Claude plugins, Muse auth from the token helper) and, on the hub only, `40` the rebalancer task.
 
 - `--force` is safe only because step 4 just ran. Never pass it without a backup from this session.
 - On Windows, run this from a normal terminal, not from inside the Claude desktop app. That app is an MSIX package, which silently redirects `%APPDATA%` and `%LOCALAPPDATA%` writes into the package. Preflight warns when you are inside it.
@@ -195,6 +211,7 @@ Give the owner the counts only: checks ok/warn/fail, files backed up, files appl
 
 - `tailscale up` on a new machine. The tailnet policy in `tailscale/policy-snippet.hujson` needs the owner's review before anyone applies it (`docs/cpa.md`).
 - Minting this machine's key on the hub (`~/.cpa-tools/mint_client_key.py`, `docs/cpa.md`), when preflight found no `cpa-client-<remark>` item.
+- Without the hub, sign into each harness separately. Complete T3 Code first launch, Docker Desktop first launch, and JetBrains Toolbox sign-in and IDE installation on desktop roles.
 - `codex mcp login linear`, once per machine. Codex MCP servers are set in `config.toml`, not with `codex mcp add`, which starts a blocking OAuth flow.
 - In Muse, `/rules import` once (pick the Codex file), and again after the rules change (`docs/skills.md`).
 
@@ -203,7 +220,10 @@ Give the owner the counts only: checks ok/warn/fail, files backed up, files appl
 Edit the source in this repo, never the deployed file. Then:
 
 1. Run `sh scripts/check.sh` and commit (see "Working in this repo").
-2. On each machine: `git pull`, then steps 1, 4, 5, and 6 above, including both persisted-environment loaders for apply.
+2. On each machine, run `git pull`. If `home/.chezmoi.toml.tmpl` changed, repeat step 3 (`chezmoi init --source` with that machine's existing answers and persisted-environment loaders).
+3. Then run steps 1, 4, 5, and 6 above, including both persisted-environment loaders for apply.
+
+Config template changes take effect only after init. Existing Linux client/hub machines must reinitialize to replace the old `headless = true` value before desktop installation and T3 configuration can run.
 
 `chezmoi apply` re-runs a `run_onchange_` script only when its rendered contents change. Each one embeds the hash of the file it acts on, so editing `versions.toml` or a package list re-runs the matching install.
 
@@ -278,6 +298,7 @@ These apply in every repository and to every agent harness: Claude Code, Codex, 
 
 ### What the standards mean in this repo
 
-- This repo has no review bot yet. "Lint, typecheck and tests" means `sh scripts/check.sh`. The cross-family model review still applies to every PR.
+- CodeRabbit is enabled at the organization level (CHILL profile, Advanced plan); there is no `.coderabbit.yaml`. Its `CHANGES_REQUESTED` review blocks merging, including actionable Minor findings.
+- Before opening or pushing a PR, run `sh scripts/check.sh` and `sh scripts/render-test.sh` in Git Bash and WSL. Then run `coderabbit review --agent --deep --gate major --committed --base-commit "$(git merge-base origin/main HEAD)"` on the committed head on a Linux host (WSL on Windows), with `origin/main` fetched from GitHub. Require two independent clean runs on the final head. Fix all Critical/Major and actionable Minor findings, for at most three fix rounds. The cross-family model review still applies to every PR.
 - A PR touches one area (`docs/layout.md`). The foundation files (`scripts/lib/`, `.chezmoi.toml.tmpl`, the CI workflow) change in their own PR.
 - After a merge, also delete any `.tools/` downloads and scratch chezmoi configs you made for testing.

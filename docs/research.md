@@ -339,3 +339,81 @@ All against throwaway state: chezmoi 2.74.0 from `.tools/`, a fake home, fake `C
 - The CI `render` job (Ubuntu, `osFlavour = linux`) has not run on GitHub, because the repo is not pushed. No `linux-*.paths` or `macos-*.paths` are recorded yet.
 - macOS and Rocky (server) renders. Docker was not running, so a Rocky container was not tried.
 - No run script except the skill links was executed by the integration test; their behaviour on a real apply is covered only by each area's own tests.
+
+## packages: tools stage (2026-11-05)
+
+### Pins resolved from primary registries today
+
+The owner requested BEAST's versions where available, rather than an unrelated major upgrade. Existing pins remain unchanged. Each row below was queried on 2026-11-05.
+
+| Tool | Pin | Registry or release source |
+|---|---|---|
+| pnpm | 12.9.1 (BEAST); latest is 12.16.1 | https://registry.npmjs.org/pnpm/12.9.1 |
+| Bun | 1.4.4 | https://registry.npmjs.org/bun/1.4.4 |
+| Temurin JDK | 25.0.4.1+1 (BEAST); mise `temurin-25.0.4+101.0.LTS`; winget `25.0.4.101` | https://api.github.com/repos/adoptium/temurin25-binaries/releases/tags/jdk-25.0.4.1%2B1 and https://github.com/microsoft/winget-pkgs/tree/master/manifests/e/EclipseAdoptium/Temurin/25/JDK/25.0.4.101 |
+| Maven | 3.10.0 | https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/maven-metadata.xml |
+| ripgrep | 15.2.0 | https://api.github.com/repos/BurntSushi/ripgrep/releases/latest |
+| Vercel | 65.10.0 (BEAST); latest is 65.11.0 | https://registry.npmjs.org/vercel/65.10.0 |
+| Higgsfield CLI | existing `[skills.higgsfield] cli_version` 1.2.2, now installed | https://registry.npmjs.org/@higgsfield/cli/latest |
+| T3 Code | 0.1.7 | https://api.github.com/repos/pingdotgg/t3code/releases/latest and https://github.com/microsoft/winget-pkgs/tree/master/manifests/t/T3Tools/T3Code/0.1.7 |
+| JetBrains Toolbox | 3.9.1, build 3.9.1.89198; winget 3.9.1.0 | https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release and https://github.com/microsoft/winget-pkgs/tree/master/manifests/j/JetBrains/Toolbox/3.9.1.0 |
+| Docker Desktop | 4.98.0, build 245422 | https://desktop.docker.com/win/main/amd64/appcast.xml and https://formulae.brew.sh/api/cask/docker-desktop.json |
+
+Existing development pins were rechecked without changing them: Node 24.22.2 appears in https://nodejs.org/dist/index.json; Git 2.56.0 at https://api.github.com/repos/git/git/git/ref/tags/v2.56.0; gh 2.103.3 at https://api.github.com/repos/cli/cli/releases/tags/v2.103.3; uv 0.13.7 at https://api.github.com/repos/astral-sh/uv/releases/tags/0.13.7; Python 3.13.18 at https://www.python.org/downloads/release/python-31318/. Their existing Windows registry versions and Python minor-version policy are preserved. The CodeRabbit installer still binds signed version 0.9.2 and documents `CODERABBIT_VERSION`, `CODERABBIT_INSTALL_DIR`, and `CR_CLI_SKIP_LOGIN`: https://cli.coderabbit.ai/install.sh.
+
+### Install methods and evidence
+
+- T3 official GUI release assets are `T3-Code-0.1.7-{x64,arm64}.dmg` and `T3-Code-0.1.7-{x86_64,arm64}.AppImage`. The separate lowercase `t3-...tar.gz` assets are CLI distributions, so the GUI installer uses the uppercase assets. Their GitHub API SHA-256 digests are recorded in `versions.toml`. Windows uses winget's checksum-verified per-user installer. https://github.com/pingdotgg/t3code/releases/tag/v0.1.7.
+- The upstream product name is `T3 Code (Beta)`, including the app/executable name: https://github.com/pingdotgg/t3code/blob/v0.1.7/apps/desktop/package.json. BEAST's existing install confirms `Programs/t3code/T3 Code (Beta).exe`. File metadata is read without starting the GUI. Linux uses AppImage extraction mode to avoid a FUSE prerequisite: https://docs.appimage.org/user-guide/run-appimages.html#extract-and-run-type-2-appimages.
+- Toolbox's product API returns platform-specific DMG/tarball URLs and checksum links. The Linux x64 checksum was fetched from https://download.jetbrains.com/toolbox/jetbrains-toolbox-3.9.1.89198.tar.gz.sha256; the macOS x64 checksum from https://download.jetbrains.com/toolbox/jetbrains-toolbox-3.9.1.89198.dmg.sha256. Download, verify, and extract without launching. https://www.jetbrains.com/help/toolbox-app/toolbox-app-installation.html.
+- Docker macOS stable build and architecture come from the official feed/cask above. Its checksum endpoint is `.../<build>/checksums.txt`, confirmed at https://desktop.docker.com/mac/main/arm64/245422/checksums.txt. A `Docker.dmg.sha256` request returned HTTP 403, so the implementation uses `checksums.txt`. Installation and first launch: https://docs.docker.com/desktop/setup/install/mac-install/. Linux stays manual: https://docs.docker.com/desktop/setup/install/linux/.
+- Apache.Maven has no winget manifest directory (GitHub API returned 404). Windows uses Maven Central's official zip and SHA-512: https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.10.0/apache-maven-3.10.0-bin.zip.sha512. Unix uses mise `maven`. https://maven.apache.org/install.html.
+- Temurin's MSI manifest uses `ADDLOCAL=ALL`, which includes the JDK environment features. The Windows script imports the MSI's `JAVA_HOME` through its environment refresh; Unix exports the pinned mise Java directory. mise's Java vendor format is confirmed in https://github.com/jdx/mise/blob/main/src/plugins/core/java.rs. No JRE is substituted for the JDK.
+- npm package metadata confirms `pnpm`, `bun`, `higgsfield`, and `vercel` command names. The shared npm list reads the existing Higgsfield CLI pin, not its skill-pack version. Metadata probes read installed package.json directly to avoid npm cache writes and CLI login flows. On Unix they never invoke `mise exec` during a dry probe, because it could auto-install a missing Node.
+- Isolated source/config/state/cache flags and package script rendering: https://www.chezmoi.io/reference/command-line-flags/global/ and https://www.chezmoi.io/reference/commands/execute-template/. The production tools stage copies an explicit allowlist; it never turns on the test-only `noSecrets` mode.
+
+### [UNVERIFIED]
+
+No installer or package manager changed BEAST's installed software. Actual winget installs/upgrades/UAC, Maven extraction and execution after installation, npm global installs, mise downloads for the added tools, native harness downloads, and CodeRabbit installation remain untested. macOS DMG attachment/copying and Linux AppImage/Toolbox runtime behavior remain untested. Desktop first launch, sign-in, Docker engine integration, and Toolbox IDE installation require the owner. Linux graphical runtime libraries depend on the distribution. macOS and Linux desktop branches are covered by synthetic rendering and shell syntax/lint checks only. Windows MSIX rejection and environment broadcasts retain their existing implementation and were not triggered in this change.
+
+### Validation for this change
+
+- `sh scripts/check.sh` passes on Git Bash and WSL. Git Bash includes Windows PowerShell 5.1 parsing/ASCII checks. Both runs include shellcheck, config rendering, fake-op tests, and the new tools-stage tests.
+- `sh scripts/render-test.sh` passes on Git Bash (2 scenarios, 33 OK checks, 0 FAIL) and WSL (3 scenarios, 53 OK checks, 0 FAIL). Both suites confirm `op` was never called and that a second apply into the throwaway destination changes nothing.
+- Focused tools tests run 2 native dry stages per OS and 6 desktop role/platform renders per OS. They confirm all four harness defaults, an unusable normal config cannot interfere, and no package files are deployed in a dry run. Active Linux/macOS desktop scripts pass `sh -n` and shellcheck. The Windows Maven fixture uses a fake archive binary, proves the stable launcher runs it, and confirms a second script run reports zero changes. It never downloads or installs Maven.
+- All scratch homes/configs are under `.tools/` or render-test's temporary destinations. No normal apply, package installation, login, or push ran on BEAST.
+
+
+## Packages review corrections (2026-11-05)
+
+Primary sources rechecked for these fixes:
+
+- mise's Java metadata lists vendor `temurin`, version `25.0.4+101.0.LTS`, runtime `25.0.4.1+1-LTS`, and JDK images for Linux x64/arm64 and macOS x64/arm64. Exact URLs: https://mise-java.jdx.dev/jvm/ga/linux/x86_64.json, https://mise-java.jdx.dev/jvm/ga/linux/aarch64.json, https://mise-java.jdx.dev/jvm/ga/macosx/x86_64.json, and https://mise-java.jdx.dev/jvm/ga/macosx/aarch64.json. The macOS platform key is `macosx`. Windows HTTP requests to bare URLs returned 403; a cache-busting query succeeded. WSL has no mise binary, so `mise ls-remote java` was unavailable. `tools-test.py` now checks exact metadata IDs and runtime versions when the endpoints answer, and prints a skip when offline.
+- The Temurin winget manifest confirms `PackageVersion: 25.0.4.101`: https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/e/EclipseAdoptium/Temurin/25/JDK/25.0.4.101/EclipseAdoptium.Temurin.25.JDK.yaml. Runtime, winget, and mise override keys are distinct.
+- T3 v0.1.7 assets and SHA-256 digests were re-resolved from https://api.github.com/repos/pingdotgg/t3code/releases/tags/v0.1.7. The Debian assets are `T3-Code-0.1.7-amd64.deb` (`e1373f8047ba582f2e40aff4b34b57d9a355513d4fb47c34d49d11b5c870f9fe`) and `T3-Code-0.1.7-arm64.deb` (`94e0c9b3b5e9735f8570df6da1feb6f89dc9c0e1c842e8dfbd020e957345e0ca`). Reading the amd64 package's control archive confirms package name `t3code` and version `0.1.7`. Existing DMG/AppImage digests still match the release API. No package was installed.
+- Electron Builder embeds `X-AppImage-Version` in the AppImage desktop entry, and its updater overwrites a versionless AppImage filename: https://github.com/electron-userland/electron-builder/blob/master/packages/app-builder-lib/src/targets/linux/appimage/AppImageTarget.ts and https://github.com/electron-userland/electron-builder/blob/master/packages/electron-updater/src/AppImageUpdater.ts. The metadata probe invokes only AppImage extraction, never AppRun or Electron. Ubuntu's unprivileged-user-namespace restriction is documented at https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces. The apt branch uses the Debian sandbox setup; other AppImage desktops retain their administrator's sandbox policy.
+- Toolbox's API still resolves version `3.9.1`, build `3.9.1.89198`, and architecture-specific checksum links: https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release. Streaming the arm64 tarball confirms top-level `jetbrains-toolbox-3.9.1.89198-arm64/` and `bin/build.txt` containing `3.9.1.89198`: https://download.jetbrains.com/toolbox/jetbrains-toolbox-3.9.1.89198-arm64.tar.gz. No GUI was started.
+- Docker's macOS feed still resolves `4.98.0` build `245422`: https://desktop.docker.com/mac/main/arm64/appcast.xml. Writable `/Applications` copies keep the user's ownership; protected destinations use a current sudo ticket and a staged bundle replacement.
+- CI inspection confirms `guard` installs shellcheck only and `render` installs chezmoi. `check.sh` now gates template and tools-stage checks using the same executable lookup, including `AGENT_ENV_CHEZMOI`. No workflow file changed.
+
+### [UNVERIFIED] real installers
+
+Actual UAC/winget, sudo ticket expiry on macOS, DMG mounting, apt installation, Electron sandbox startup, and Toolbox self-update behavior have not been run on real desktops. Regression fixtures exercise the rendered scripts and metadata/version decisions in throwaway homes. No host software, real home, authentication, or production data was changed.
+
+
+### Validation of the review corrections
+
+- Git Bash: `sh scripts/check.sh` passes all 6 check groups, including shellcheck 0.11.0, 22 POSIX shell files, Windows PowerShell 5.1 parsing of 16 ASCII-only files, and 17 tools-test result groups. WSL passes 5 check groups and 15 tools-test result groups; the Windows-only parser group is skipped there.
+- `sh scripts/render-test.sh`: Git Bash passes 33 checks across 2 scenarios; WSL passes 53 checks across 3 scenarios. There are zero failures. WSL uses a native temporary checkout; Windows renders from a disposable copy so all test destinations remain under `.tools/`.
+- CI guard simulation: `sh scripts/check.sh --no-guard` passes with both chezmoi and `AGENT_ENV_CHEZMOI` absent. Template and tools-stage groups explicitly skip. Git Bash runs 3 groups and skips 2; WSL runs 2 and skips 3, including its unavailable Windows parser. Shellcheck remains available in both simulations.
+- Fixtures exercise failed/empty/successful/skipped Java lookup; separate Java runtime and winget overrides; all desktop newer-version no-download paths; Unix and Windows missing/older/newer verify decisions; Docker skip; replacement of stale bundle contents without sudo; Windows desktop script ordering and Docker file metadata preflight; real arm64 Toolbox extraction from a fake checksum-verified vendor archive; and checksum rejection before the mocked Debian apt install.
+- The real Unix entry point is exercised with fake sudo/chezmoi/mise, including the bootstrap downloader path. Its keepalive and sleep process stop on exit. No real package manager runs. Chezmoi bootstrap is isolated in a subshell so its downloader trap cannot replace the stage cleanup trap.
+- Live metadata confirms the Java ID on all four platforms. Substituting the original invalid ID makes the guard fail. A checksum-verified T3 0.1.7 x64 AppImage was run in WSL only with `--appimage-extract '*.desktop'`; the real desktop entry reports version `0.1.7`. Electron/AppRun was never launched. The Debian control archive and post-install script were read: the package supplies `/usr/bin/t3code`, configures `chrome-sandbox`, and installs its supported Ubuntu AppArmor profile.
+- The suites delete their fake homes and runtime scratch state. No software was installed on the test host and no real-home apply ran.
+
+## Package installer review fixes (2026-11-05)
+
+- Rechecked all six T3 v0.1.7 DMG, AppImage, and Debian SHA-256 digests against https://api.github.com/repos/pingdotgg/t3code/releases/tags/v0.1.7. They match `versions.toml`. A different version override now requires six matching digest overrides from the same block; missing or malformed values fail before installation.
+- The pinned chezmoi WinGet manifest uses ZIP archives with `NestedInstallerType: portable` on x86, x64, and arm64: https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests/t/twpayne/chezmoi/2.74.0/twpayne.chezmoi.installer.yaml. Bootstrap explicitly requests `--scope user` on every role. Scope and portable installation behavior: https://learn.microsoft.com/en-us/windows/package-manager/winget/install and https://learn.microsoft.com/en-us/windows/package-manager/winget/portable.
+- WinGet chooses upgrade from its installed-package inventory, using https://learn.microsoft.com/en-us/windows/package-manager/winget/list. A command found on PATH alone does not establish WinGet ownership. Temurin's MSI remains responsible for `JAVA_HOME`; the script no longer derives a persistent value from an arbitrary `javac.exe`.
+- Regression fixtures run the Unix npm loop, Windows inventory and npm completion decisions, repeated PATH snapshots, T3 override validation and precedence, and the Windows bootstrap entry point with fake commands. All homes and writes are disposable. Actual WinGet/UAC, MSI environment writes, npm downloads, and desktop installation remain [UNVERIFIED].

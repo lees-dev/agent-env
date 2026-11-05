@@ -15,9 +15,7 @@ _ae_path_first() { # _ae_path_first <dir>: move or add dir to the front of PATH,
 {{- if eq .osFlavour "windows" }}
 # Git Bash: ~/.grok/bin holds grok.exe; muse is a .cmd that bash cannot run by name, so
 # ~/.config/agent-env/gitbash-bin/muse forwards to it; %APPDATA%/npm holds codex.
-{{-   if has "codex" .harnesses }}
 [ -n "${APPDATA:-}" ] && _ae_path_first "$(cygpath -u "$APPDATA" 2>/dev/null)/npm"
-{{-   end }}
 {{-   if has "muse" .harnesses }}
 _ae_path_first "$HOME/.config/agent-env/gitbash-bin"
 {{-   end }}
@@ -34,6 +32,22 @@ _ae_path_first "$HOME/.grok/bin"
 {{-   end }}
 _ae_path_first "$HOME/.local/bin"
 _ae_path_first "${XDG_DATA_HOME:-$HOME/.local/share}/mise/shims"
+{{- end }}
+{{- if ne .osFlavour "windows" }}
+# JAVA_HOME follows the same Temurin pin as mise, for Maven and JetBrains.
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson }}
+{{- $java := index $pins "tools.java" }}
+{{- if ne $java.version "skip" }}
+if [ -x "$HOME/.local/bin/mise" ]; then
+  if _ae_jh=$(cd / && "$HOME/.local/bin/mise" where {{ printf "java@%s" (get $java "mise" | default $java.version) | quote }} 2>/dev/null) && [ -n "$_ae_jh" ]; then
+    JAVA_HOME=$_ae_jh; export JAVA_HOME
+  fi
+  unset _ae_jh
+fi
+{{- end }}
+{{- else }}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson }}
+_ae_path_first "$HOME/.local/share/maven/apache-maven-{{ (index $pins "tools.maven").version }}/bin"
 {{- end }}
 export PATH
 unset _ae_p _ae_d _ae_ifs

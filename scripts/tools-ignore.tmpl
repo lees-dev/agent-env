@@ -1,0 +1,7 @@
+{{ if eq .osFlavour "windows" -}}
+.config/mise
+.config/mise/**
+{{ else -}}
+.config/agent-env/gitbash-bin
+.config/agent-env/gitbash-bin/**
+{{ end -}}

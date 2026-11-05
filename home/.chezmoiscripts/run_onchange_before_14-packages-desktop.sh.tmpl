@@ -1,0 +1,196 @@
+{{- if and (not .headless) (ne .osFlavour "windows") -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+#!/bin/sh
+# Desktop apps from official, pinned assets. No app is launched by this script.
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }} {{ include (joinPath .repoDir "packages/desktop.txt") | sha256sum }}
+set -eu
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }}
+{{ template "packages/lib.sh" . }}
+{{ template "packages/desktop.sh" . }}
+OS={{ .osFlavour | quote }}
+OPTIN={{ env "AGENT_ENV_SYSTEM_PACKAGES" | trim | quote }}
+PM={{ .pkgManager | quote }}
+case "$(uname -m)" in x86_64|amd64) ARCH=x64 ;; arm64|aarch64) ARCH=arm64 ;; *) pk_fail desktop "unsupported architecture"; pk_finish desktop ;; esac
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+# Copy a DMG app without launching it. Always detach, including on a failed copy.
+install_dmg() {
+  mkdir -p "$PK_TMP/mount" "$2"
+  hdiutil attach -quiet -nobrowse -mountpoint "$PK_TMP/mount" "$1" || return 1
+  _rc=0
+  # Stage beside the destination so the final move stays on the same filesystem.
+  # Copy as the user whenever possible, so the app's updater can replace its files.
+  # Use sudo when the folder is not writable, or when an existing bundle is not ours
+  # (a root-owned copy from an MDM, a pkg or the vendor's CLI installer).
+  _sudo=''
+  if [ ! -w "$2" ] || { [ -e "$2/$3" ] && [ -n "$(find "$2/$3" ! -user "$(id -u)" -print 2>/dev/null | head -n 1)" ]; }; then
+    if ! sudo -n true; then
+      pk_say 'run sudo -v and rerun in your terminal'
+      hdiutil detach -quiet "$PK_TMP/mount" || true
+      return 1
+    fi
+    _sudo='sudo -n'
+  fi
+  _stage=$($_sudo mktemp -d "$2/.agent-env-app.XXXXXX") || _rc=1
+  if [ "$_rc" = 0 ]; then
+    $_sudo ditto "$PK_TMP/mount/$3" "$_stage/$3" &&
+      $_sudo rm -rf "$2/$3" && $_sudo mv "$_stage/$3" "$2/$3" || _rc=1
+    $_sudo rm -rf "$_stage" || _rc=1
+  fi
+  hdiutil detach -quiet "$PK_TMP/mount" || _rc=1
+  return "$_rc"
+}
+app_version() { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1/Contents/Info.plist" 2>/dev/null || true; }
+{{- range splitList "\n" (include (joinPath .repoDir "packages/desktop.txt")) }}
+{{- $l := regexReplaceAll "#.*$" . "" | trim }}
+{{- if $l }}
+{{- $c := splitList "|" $l }}
+{{- $name := index $c 0 | trim }}
+{{- if has $.osFlavour (splitList "," (index $c 1 | trim)) }}
+{{- $p := index $pins (printf "tools.%s" $name) }}
+install_{{ $name | replace "-" "_" }}() {
+  pin={{ $p.version | quote }}
+  if [ "$pin" = skip ]; then pk_say "{{ $name }}: skipped"; return; fi
+{{- if eq $name "t3code" }}
+  base={{ $p.release_base | quote }}
+  if [ "$OS" = macos ]; then
+    target="$HOME/Applications/{{ $p.app_name }}.app"
+    have=$(app_version "$target")
+    asset="T3-Code-$pin-$ARCH.dmg"
+  else
+    target="$HOME/.local/share/t3code/$pin/T3-Code.AppImage"
+    # Follow the managed launcher's current image, even after another pin was installed.
+    if [ -r "$HOME/.local/bin/t3code" ]; then
+      current=$(sed -n 's/^APPIMAGE_EXTRACT_AND_RUN=1 exec "\([^"]*\)".*$/\1/p' "$HOME/.local/bin/t3code")
+      [ ! -x "$current" ] || target=$current
+    fi
+    have=$(pk_semver "$(pk_appimage_version "$target")")
+    deb_have=$(dpkg-query -W -f='${Status} ${Version}' {{ $p.deb_package | quote }} 2>/dev/null || true)
+    case "$deb_have" in 'install ok installed '*) deb_have=$(pk_semver "$deb_have") ;; *) deb_have='' ;; esac
+    use_deb=0
+    if [ "$PM" = apt ] && [ "$OPTIN" = 1 ]; then use_deb=1; fi
+    if [ -n "$deb_have" ] && { [ -z "$have" ] || [ "$(pk_cmp "$deb_have" "$have")" != lt ]; }; then
+      have=$deb_have; use_deb=1
+    elif [ "$(pk_cmp "$have" "$pin")" = gt ]; then
+      use_deb=0
+    elif [ "$use_deb" = 1 ]; then
+      have=$deb_have
+    fi
+    asset_arch=$ARCH; [ "$ARCH" != x64 ] || asset_arch=x86_64
+    asset="T3-Code-$pin-$asset_arch.AppImage"
+    if [ "$use_deb" = 1 ]; then
+      asset_arch=$ARCH; [ "$ARCH" != x64 ] || asset_arch=amd64
+      asset="T3-Code-$pin-$asset_arch.deb"
+    fi
+  fi
+  case "$OS:$ARCH" in
+    macos:arm64) sum={{ $p.sha256_macos_arm64 | quote }} ;;
+    macos:x64) sum={{ $p.sha256_macos_x64 | quote }} ;;
+    linux:arm64) sum={{ $p.sha256_linux_arm64 | quote }} ;;
+    linux:x64) sum={{ $p.sha256_linux_x64 | quote }} ;;
+  esac
+  if [ "$OS" = linux ] && [ "$use_deb" = 1 ]; then
+    case "$ARCH" in arm64) sum={{ $p.sha256_deb_arm64 | quote }} ;; x64) sum={{ $p.sha256_deb_x64 | quote }} ;; esac
+  elif [ "$OS" = linux ] && [ "$(pk_cmp "$have" "$pin")" = eq ] && [ "$(sha256 "$target")" != "$sum" ]; then
+    have=''
+  fi
+  if [ "$(pk_cmp "$have" "$pin")" = lt ]; then
+    if [ "$OS" = linux ] && [ "$use_deb" = 1 ] && [ "$OPTIN" != 1 ]; then pk_say 'T3 Code deb: needs AGENT_ENV_SYSTEM_PACKAGES=1'; return; fi
+    if pk_dry; then pk_say "dry-run: would install T3 Code $pin ($asset)"; return; fi
+    [ -n "${PK_TMP:-}" ] || pk_tmpdir
+    pk_fetch "$base/v$pin/$asset" "$PK_TMP/$asset" || { pk_fail t3code download; return; }
+    [ "$(sha256 "$PK_TMP/$asset")" = "$sum" ] || { pk_fail t3code checksum; return; }
+    if [ "$OS" = macos ]; then
+      install_dmg "$PK_TMP/$asset" "$HOME/Applications" '{{ $p.app_name }}.app' || { pk_fail t3code dmg; return; }
+    elif [ "$use_deb" = 1 ]; then
+      sudo -n apt-get install -y "$PK_TMP/$asset" || { pk_fail t3code 'deb install failed; run sudo -v and rerun'; return; }
+    else
+      mkdir -p "$(dirname "$target")"
+      install -m 755 "$PK_TMP/$asset" "$target" || { pk_fail t3code copy; return; }
+    fi
+    PK_CHANGED=$((PK_CHANGED + 1))
+  fi
+  if ! pk_dry; then
+    mkdir -p "$HOME/.local/bin"
+    if [ "$OS" = macos ]; then ln -sf "$target/Contents/MacOS/{{ $p.app_name }}" "$HOME/.local/bin/t3code"
+    elif [ "$use_deb" = 1 ]; then
+      # The Debian package supplies /usr/bin/t3code and the menu entry.
+      # Remove only the AppImage launcher written by this repo during migration.
+      if [ -r "$HOME/.local/bin/t3code" ] && grep -q '^APPIMAGE_EXTRACT_AND_RUN=1 exec ' "$HOME/.local/bin/t3code"; then
+        rm -f "$HOME/.local/bin/t3code" "$HOME/.local/share/applications/t3code.desktop"
+      fi
+    else
+      # Extraction mode avoids a FUSE dependency on modern desktop distributions.
+      printf '#!/bin/sh\nAPPIMAGE_EXTRACT_AND_RUN=1 exec "%s" "$@"\n' "$target" > "$HOME/.local/bin/t3code"
+      chmod 755 "$HOME/.local/bin/t3code"
+      mkdir -p "$HOME/.local/share/applications"
+      printf '[Desktop Entry]\nType=Application\nName=T3 Code\nExec="%s"\nTerminal=false\nCategories=Development;\n' "$HOME/.local/bin/t3code" > "$HOME/.local/share/applications/t3code.desktop"
+    fi
+  fi
+{{- else if eq $name "toolbox" }}
+  build={{ $p.build | quote }}
+  base={{ $p.download_base | quote }}
+  if [ "$OS" = macos ]; then
+    target="$HOME/Applications/JetBrains Toolbox.app"
+    have=$(app_version "$target")
+    suffix='.dmg'; [ "$ARCH" != arm64 ] || suffix='-arm64.dmg'
+  else
+    dir="jetbrains-toolbox-$build"; [ "$ARCH" != arm64 ] || dir="$dir-arm64"
+    target="$HOME/.local/share/jetbrains-toolbox/$dir"
+    pk_toolbox_latest
+    have=$PK_TOOLBOX_VERSION
+    [ -z "$PK_TOOLBOX_TARGET" ] || target=$PK_TOOLBOX_TARGET
+    suffix='.tar.gz'; [ "$ARCH" != arm64 ] || suffix='-arm64.tar.gz'
+  fi
+  if [ "$(pk_cmp "$(pk_semver "$have")" "$pin")" = lt ]; then
+    if [ "$OS" = linux ]; then target="$HOME/.local/share/jetbrains-toolbox/$dir"; fi
+    if [ "$OPTIN" != 1 ]; then pk_say "toolbox: needs AGENT_ENV_SYSTEM_PACKAGES=1"; return; fi
+    if pk_dry; then pk_say "dry-run: would install JetBrains Toolbox $build"; return; fi
+    [ -n "${PK_TMP:-}" ] || pk_tmpdir
+    asset="jetbrains-toolbox-$build$suffix"
+    pk_fetch "$base/$asset" "$PK_TMP/$asset" && pk_fetch "$base/$asset.sha256" "$PK_TMP/toolbox.sha256" || { pk_fail toolbox download; return; }
+    sum=$(awk '{print $1;exit}' "$PK_TMP/toolbox.sha256")
+    [ "$(sha256 "$PK_TMP/$asset")" = "$sum" ] || { pk_fail toolbox checksum; return; }
+    if [ "$OS" = macos ]; then
+      install_dmg "$PK_TMP/$asset" "$HOME/Applications" 'JetBrains Toolbox.app' || { pk_fail toolbox dmg; return; }
+    else
+      mkdir -p "$HOME/.local/share/jetbrains-toolbox"
+      tar -xzf "$PK_TMP/$asset" -C "$HOME/.local/share/jetbrains-toolbox" || { pk_fail toolbox extract; return; }
+      [ -x "$target/bin/jetbrains-toolbox" ] || { pk_fail toolbox binary; return; }
+    fi
+    PK_CHANGED=$((PK_CHANGED + 1))
+  fi
+  if ! pk_dry; then
+    mkdir -p "$HOME/.local/bin"
+    if [ "$OS" = macos ]; then ln -sf "$target/Contents/MacOS/jetbrains-toolbox" "$HOME/.local/bin/jetbrains-toolbox"
+    else
+      ln -sf "$target/bin/jetbrains-toolbox" "$HOME/.local/bin/jetbrains-toolbox"
+      mkdir -p "$HOME/.local/share/applications"
+      printf '[Desktop Entry]\nType=Application\nName=JetBrains Toolbox\nExec="%s/bin/jetbrains-toolbox"\nTerminal=false\nCategories=Development;\n' "$target" > "$HOME/.local/share/applications/jetbrains-toolbox.desktop"
+    fi
+  fi
+{{- else if eq $name "docker-desktop" }}
+  target=/Applications/Docker.app
+  have=$(app_version "$target")
+  if [ "$(pk_cmp "$(pk_semver "$have")" "$pin")" = lt ]; then
+    if [ "$OPTIN" != 1 ]; then pk_say "Docker Desktop: needs AGENT_ENV_SYSTEM_PACKAGES=1"; return; fi
+    if pk_dry; then pk_say "dry-run: would install Docker Desktop $pin"; return; fi
+    [ -n "${PK_TMP:-}" ] || pk_tmpdir
+    docker_arch=$ARCH; [ "$ARCH" != x64 ] || docker_arch=amd64
+    url={{ $p.download_base | quote }}/$docker_arch/{{ $p.build }}/Docker.dmg
+    pk_fetch "$url" "$PK_TMP/Docker.dmg" && pk_fetch "${url%/*}/checksums.txt" "$PK_TMP/docker.sha256" || { pk_fail docker-desktop download; return; }
+    sum=$(awk '{print $1;exit}' "$PK_TMP/docker.sha256")
+    [ "$(sha256 "$PK_TMP/Docker.dmg")" = "$sum" ] || { pk_fail docker-desktop checksum; return; }
+    install_dmg "$PK_TMP/Docker.dmg" /Applications Docker.app || { pk_fail docker-desktop dmg; return; }
+    PK_CHANGED=$((PK_CHANGED + 1))
+  fi
+  if ! pk_dry; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$target/Contents/Resources/bin/docker" "$HOME/.local/bin/docker"
+  fi
+{{- end }}
+  pk_say "{{ $name }} $pin present"
+}
+install_{{ $name | replace "-" "_" }}
+{{- end }}{{- end }}{{- end }}
+pk_finish 14-packages-desktop
+{{ end -}}

@@ -62,7 +62,14 @@ else
 fi
 
 step "chezmoi templates"
-if command -v chezmoi >/dev/null 2>&1; then
+cz=${AGENT_ENV_CHEZMOI:-chezmoi}
+if [ -z "${AGENT_ENV_CHEZMOI:-}" ] && ! command -v "$cz" >/dev/null 2>&1; then
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) cz=$(cygpath -m "$REPO/.tools/chezmoi.exe") ;;
+    *) cz="$REPO/.tools/linux/chezmoi" ;;
+  esac
+fi
+if command -v "$cz" >/dev/null 2>&1; then
   tmp=$(mktemp -d)
   for role in client hub server; do
     for mode in account service default; do
@@ -70,7 +77,7 @@ if command -v chezmoi >/dev/null 2>&1; then
       [ "$mode" != default ] || op_mode=''
       if AGENT_ENV_ROLE=$role AGENT_ENV_MACHINE=check AGENT_ENV_CPA_URL=https://hub.example.com \
          AGENT_ENV_OP_VAULT='' AGENT_ENV_OP_MODE=$op_mode OP_SERVICE_ACCOUNT_TOKEN='' AGENT_ENV_HARNESSES=claude,codex,grok,muse \
-         chezmoi --source "$REPO" --config "$tmp/in.toml" --persistent-state "$tmp/s.boltdb" --no-tty \
+         "$cz" --source "$REPO" --config "$tmp/in.toml" --persistent-state "$tmp/s.boltdb" --no-tty \
            execute-template --init --file home/.chezmoi.toml.tmpl > "$tmp/c.toml"; then
         want_mode=$mode; [ "$mode" != default ] || want_mode=service
         want_vault=agent-env
@@ -78,7 +85,7 @@ if command -v chezmoi >/dev/null 2>&1; then
         grep -q "opMode = \"$want_mode\"" "$tmp/c.toml" || bad "opMode default for role=$role mode=$mode"
         grep -q "opVault = \"$want_vault\"" "$tmp/c.toml" || bad "opVault default for role=$role mode=$mode"
         echo "  config renders for role=$role mode=$mode"
-        chezmoi --source "$REPO" --config "$tmp/c.toml" --persistent-state "$tmp/s.boltdb" \
+        "$cz" --source "$REPO" --config "$tmp/c.toml" --persistent-state "$tmp/s.boltdb" \
           execute-template --file home/.chezmoiignore > /dev/null || bad ".chezmoiignore does not render for role=$role mode=$mode"
       else
         bad "config template fails for role=$role mode=$mode"
@@ -88,7 +95,7 @@ if command -v chezmoi >/dev/null 2>&1; then
   # No configured remark: the default must differ between Windows and WSL on any PC.
   if AGENT_ENV_ROLE=client AGENT_ENV_MACHINE='' AGENT_ENV_CPA_URL=https://hub.example.com \
      AGENT_ENV_OP_VAULT='' AGENT_ENV_OP_MODE=service AGENT_ENV_HARNESSES=codex \
-     AGENT_ENV_NO_SECRETS=1 chezmoi init --source "$REPO" --config "$tmp/default.toml" \
+     AGENT_ENV_NO_SECRETS=1 "$cz" init --source "$REPO" --config "$tmp/default.toml" \
        --persistent-state "$tmp/default.boltdb" --cache "$tmp/cache" --destination "$tmp/home" \
        --no-tty --promptDefaults >/dev/null; then
     want_machine=$(hostname | cut -d. -f1 | tr 'A-Z' 'a-z')
@@ -108,6 +115,11 @@ for p in python3 python py; do
 done
 if [ -n "$py" ]; then "$py" -I scripts/op-test.py || bad "fake-op tests"
 else bad "Python 3.11+ is required for fake-op tests"; fi
+
+step "tools stage (dry runs only)"
+if ! command -v "$cz" >/dev/null 2>&1; then echo "  chezmoi not installed: skipped"
+elif [ -n "$py" ]; then AGENT_ENV_CHEZMOI="$cz" "$py" -I scripts/tools-test.py || bad "tools-stage tests"
+else bad "Python 3.11+ is required for tools-stage tests"; fi
 
 printf '\n'
 if [ "$rc" -eq 0 ]; then echo "check: all passed"; else echo "check: failures above"; fi

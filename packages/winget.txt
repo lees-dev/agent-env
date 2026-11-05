@@ -1,4 +1,4 @@
-# Windows packages installed with winget by run_onchange_before_11-packages-winget.ps1.tmpl.
+# Windows packages installed by scripts 11 (tools) and 14 (desktop) with winget.
 # One package per line, columns separated by '|':
 #   winget id | versions.toml tools.<name> | probe command | scope | match
 #
@@ -22,3 +22,11 @@ Python.Python.3.13      | python     | py -3.13 --version   | user    | minor
 twpayne.chezmoi         | chezmoi    | chezmoi --version    | any     | exact
 AgileBits.1Password.CLI | op         | op --version         | any     | exact
 JanDeDobbeleer.OhMyPosh | oh-my-posh | oh-my-posh version   | any     | exact
+
+EclipseAdoptium.Temurin.25.JDK | java | java --version | machine | exact
+BurntSushi.ripgrep.MSVC | ripgrep | rg --version | any | exact
+# Optional sixth column selects script 14, desktop roles and self-update-aware verify.
+# GUI probes read file metadata.
+T3Tools.T3Code | t3code | @t3code | user | exact | desktop
+Docker.DockerDesktop | docker-desktop | @docker-desktop | machine | exact | desktop
+JetBrains.Toolbox | toolbox | @toolbox | user-optin | exact | desktop

@@ -8,8 +8,10 @@
        (a machine-local file this repo never manages; see docs/packages.md)
     2. versions.toml [overrides.<machine>] <name> = "x.y.z"
     3. the section's own `version`
-  An override also replaces `winget` (so Windows installs the same version) and sets
-  `overridden = true`. The value "skip" means: do not install or upgrade it on this machine.
+  An override also replaces `winget` and `mise`, except Java, whose vendor IDs differ.
+  `<name>_winget` and `<name>_mise` in the same overrides block set those two
+  separately (needed for Java, and for tools like Toolbox whose winget version has
+  an extra segment). It sets `overridden = true`. The value "skip" means: do not install or upgrade it on this machine.
 */ -}}
 {{- $v := include (joinPath .repoDir "versions.toml") | fromToml -}}
 {{- $mo := dict -}}
@@ -23,18 +25,39 @@
 {{-   if hasKey $lt "overrides" -}}{{- $lo = $lt.overrides -}}{{- end -}}
 {{- end -}}
 {{- $out := dict -}}
-{{- range $area := list "tools" "harness" -}}
+{{- range $area := list "tools" "harness" "skills" -}}
 {{-   if hasKey $v $area -}}
 {{-     range $name, $sec := index $v $area -}}
 {{-       $p := deepCopy $sec -}}
+{{-       if hasKey $p "cli_version" -}}{{- $p = set $p "version" $p.cli_version -}}{{- end -}}
 {{-       $ov := "" -}}
-{{-       if hasKey $mo $name -}}{{- $ov = index $mo $name | toString -}}{{- end -}}
-{{-       if hasKey $lo $name -}}{{- $ov = index $lo $name | toString -}}{{- end -}}
+{{-       $override := dict -}}
+{{-       if hasKey $mo $name -}}{{- $override = $mo -}}{{- $ov = index $mo $name | toString -}}{{- end -}}
+{{-       if hasKey $lo $name -}}{{- $override = $lo -}}{{- $ov = index $lo $name | toString -}}{{- end -}}
+{{-       if and (eq $name "t3code") (ne $ov "") (ne $ov "skip") (ne $ov $sec.version) -}}
+{{-         range $key := list "sha256_macos_arm64" "sha256_macos_x64" "sha256_linux_arm64" "sha256_linux_x64" "sha256_deb_arm64" "sha256_deb_x64" -}}
+{{-           $ok := printf "t3code_%s" $key -}}
+{{-           $sum := index $override $ok | default "" | toString -}}
+{{-           if not (regexMatch "^[a-fA-F0-9]{64}$" $sum) -}}
+{{-             fail (printf "t3code version override requires %s (64 hex characters) in the same overrides block; use checksums from that version's official release" $ok) -}}
+{{-           end -}}
+{{-           $p = set $p $key (lower $sum) -}}
+{{-         end -}}
+{{-       end -}}
 {{-       if ne $ov "" -}}
 {{-         $p = set $p "version" $ov -}}
-{{-         $p = set $p "winget" $ov -}}
+{{-         if ne $name "java" -}}
+{{-           $p = set $p "winget" $ov -}}
+{{-           $p = set $p "mise" $ov -}}
+{{-         end -}}
 {{-         $p = set $p "overridden" true -}}
 {{-       end -}}
+{{-       range $key := list "winget" "mise" -}}
+{{-         $ok := printf "%s_%s" $name $key -}}
+{{-         if hasKey $mo $ok -}}{{- $p = set $p $key (index $mo $ok | toString) -}}{{- end -}}
+{{-         if hasKey $lo $ok -}}{{- $p = set $p $key (index $lo $ok | toString) -}}{{- end -}}
+{{-       end -}}
+{{-       if eq $p.version "skip" -}}{{- $p = set $p "winget" "skip" -}}{{- $p = set $p "mise" "skip" -}}{{- end -}}
 {{-       $out = set $out (printf "%s.%s" $area $name) $p -}}
 {{-     end -}}
 {{-   end -}}

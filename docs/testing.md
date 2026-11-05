@@ -62,3 +62,9 @@ In WSL, a binary on `/mnt/c` is copied into the scratch directory before it runs
 - Run scripts are rendered and parsed, never executed, except the skill-link script. Package installs, `claude mcp add`, plugin installs, Muse auth and the rebalancer task need a real machine (AGENTS.md runbook, with a backup).
 - Templates that read the live home (`lookPath "oh-my-posh"`, `versions.local.toml`) see the machine running the test.
 - macOS and Rocky (server) have not been run locally. CI covers Ubuntu (`osFlavour = linux`, `distroFamily = debian`).
+
+## Check the tools stage without installing software
+
+`sh scripts/check.sh` also runs `python -I scripts/tools-test.py` using an existing chezmoi binary. It tests two native dry stages with fake homes, no credentials, and an unusable normal config. It confirms all four harnesses are selected and no package files are deployed. It also renders six Unix desktop platform/role combinations and parses/lints active branches. Windows PowerShell's own startup-cache file is excluded from the destination comparison; no package manager runs an install.
+
+The tests use the same chezmoi lookup as render-test: `AGENT_ENV_CHEZMOI`, PATH, or `.tools/chezmoi.exe` / `.tools/linux/chezmoi`. Supply the pinned binary as documented above. A standalone dry run is `AGENT_ENV_DRY_RUN=1 sh scripts/install-tools --role client` on Unix, or set `$env:AGENT_ENV_DRY_RUN='1'` before `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-tools.ps1` on Windows. Never run the live tools stage on BEAST to test a change.

@@ -1,0 +1,57 @@
+{{- /* Packages-only config; no op, hub, credentials or normal config lookup. */ -}}
+{{- /* ---- OS flavour: windows | wsl | linux | macos ---- */ -}}
+{{- $osFlavour := "linux" -}}
+{{- if eq .chezmoi.os "windows" -}}
+{{-   $osFlavour = "windows" -}}
+{{- else if eq .chezmoi.os "darwin" -}}
+{{-   $osFlavour = "macos" -}}
+{{- else if eq .chezmoi.os "linux" -}}
+{{-   if (.chezmoi.kernel.osrelease | lower | contains "microsoft") -}}
+{{-     $osFlavour = "wsl" -}}
+{{-   end -}}
+{{- end -}}
+
+{{- /* ---- Distro and package manager ---- */ -}}
+{{- $distro := .chezmoi.os -}}
+{{- if eq .chezmoi.os "darwin" -}}{{- $distro = "macos" -}}{{- end -}}
+{{- if eq .chezmoi.os "linux" -}}
+{{-   $distro = dig "osRelease" "id" "linux" .chezmoi -}}
+{{- end -}}
+{{- $distroFamily := $distro -}}
+{{- if has $distro (list "ubuntu" "debian" "pop" "linuxmint") -}}
+{{-   $distroFamily = "debian" -}}
+{{- else if has $distro (list "rocky" "rhel" "almalinux" "centos" "fedora" "ol") -}}
+{{-   $distroFamily = "rhel" -}}
+{{- end -}}
+{{- $pkgManager := "none" -}}
+{{- if eq $osFlavour "windows" -}}{{- $pkgManager = "winget" -}}
+{{- else if eq $osFlavour "macos" -}}{{- $pkgManager = "brew" -}}
+{{- else if eq $distroFamily "debian" -}}{{- $pkgManager = "apt" -}}
+{{- else if eq $distroFamily "rhel" -}}{{- $pkgManager = "dnf" -}}
+{{- end -}}
+
+
+{{- $role := env "AGENT_ENV_ROLE" | default "client" -}}
+{{- if not (has $role (list "client" "hub" "server")) -}}{{ fail "invalid tools role" }}{{- end -}}
+{{- $machine := env "AGENT_ENV_MACHINE" | default (.chezmoi.hostname | lower) -}}
+{{- if and (eq $osFlavour "wsl") (eq (env "AGENT_ENV_MACHINE") "") -}}{{ $machine = printf "%s-wsl" $machine }}{{- end -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9-]{0,62}$" $machine) -}}{{ fail "invalid machine remark" }}{{- end -}}
+[data]
+role = {{ $role | quote }}
+machine = {{ $machine | quote }}
+osFlavour = {{ $osFlavour | quote }}
+distro = {{ $distro | quote }}
+distroFamily = {{ $distroFamily | quote }}
+pkgManager = {{ $pkgManager | quote }}
+headless = {{ or (eq $role "server") (eq $osFlavour "wsl") }}
+harnesses = ["claude", "codex", "grok", "muse"]
+repoDir = {{ env "AGENT_ENV_TOOLS_REPO" | quote }}
+backupRoot = {{ joinPath .chezmoi.homeDir ".agent-env-backups" | quote }}
+[git]
+autoCommit = false
+autoPush = false
+{{ if eq $osFlavour "windows" -}}
+[interpreters.ps1]
+command = "powershell"
+args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+{{ end -}}

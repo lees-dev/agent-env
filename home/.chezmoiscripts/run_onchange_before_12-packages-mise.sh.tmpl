@@ -27,7 +27,7 @@ set -eu
 pk_no_windows_path
 {{- end }}
 pk_path_prepend "$HOME/.local/bin"
-mkdir -p "$HOME/.local/bin"
+pk_dry || mkdir -p "$HOME/.local/bin"
 # Run from / so mise never picks up (or asks to trust) a project config from the cwd.
 cd /
 
@@ -38,7 +38,7 @@ TOOLS='
 {{- range $tool, $ref := $list.tools }}
 {{-   $parts := splitList "." $ref }}
 {{-   $p := index $pins $ref }}
-{{-   if and (or (ne (index $parts 0) "harness") (has (index $parts 1) $.harnesses)) (ne $p.version "skip") }} {{ $tool }}@{{ $p.version }}{{ end }}
+{{-   if and (or (ne (index $parts 0) "harness") (has (index $parts 1) $.harnesses)) (ne $p.version "skip") }} {{ $tool }}@{{ get $p "mise" | default $p.version }}{{ end }}
 {{- end }}'
 UV_PIN={{ (index $pins "tools.uv").version | quote }}
 PY313={{ $py313.minor | quote }}
@@ -77,7 +77,9 @@ if [ -x "$MISE" ]; then
     fi
   done
   pk_dry || "$MISE" reshim >/dev/null 2>&1 || true
-elif ! pk_dry; then
+elif pk_dry; then
+  for tv in $TOOLS; do pk_say "dry-run: would mise install $tv"; done
+else
   pk_fail mise-tools "mise is not available, so node, uv, gh, oh-my-posh and codex were not installed"
 fi
 

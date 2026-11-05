@@ -4,14 +4,17 @@
 # It rebuilds $env:Path from the registry first, so the checks see PATH the way a new
 # terminal will, even when the agent's own shell started before the apply.
 
+. (Join-Path $Repo 'home\.chezmoitemplates\packages\lib.ps1')
 $pkLocal = Join-Path $HOME '.config\agent-env\versions.local.toml'
 function Pk-PinOf {
     param([string]$area, [string]$name, [string]$key)
+    $overrideName = $name
+    if ($name -eq 'java' -and $key -eq 'winget') { $overrideName = 'java_winget' }
     if (Test-Path -LiteralPath $pkLocal) {
-        $v = Ae-TomlGet $pkLocal 'overrides' $name
+        $v = Ae-TomlGet $pkLocal 'overrides' $overrideName
         if ($v) { return $v }
     }
-    $o = Ae-TomlGet $Versions "overrides.$Machine" $name
+    $o = Ae-TomlGet $Versions "overrides.$Machine" $overrideName
     if ($o) { return $o }
     if ($key) { $w = Ae-TomlGet $Versions "$area.$name" $key; if ($w) { return $w } }
     return (Ae-TomlGet $Versions "$area.$name" 'version')
@@ -20,6 +23,7 @@ function Pk-PinOf {
 $pkParts = @()
 foreach ($s in 'Machine', 'User') { $v = [Environment]::GetEnvironmentVariable('Path', $s); if ($v) { $pkParts += $v.Split(';') } }
 $env:Path = (($pkParts + $env:Path.Split(';')) | Where-Object { $_ } | Select-Object -Unique) -join ';'
+Pk-RefreshPath
 
 # winget.txt tools at their pins.
 foreach ($l in [IO.File]::ReadAllLines((Join-Path $Repo 'packages\winget.txt'))) {
@@ -27,20 +31,25 @@ foreach ($l in [IO.File]::ReadAllLines((Join-Path $Repo 'packages\winget.txt')))
     if (-not $t) { continue }
     $c = @($t.Split('|') | ForEach-Object { $_.Trim() })
     $name = $c[1]; $probe = $c[2].Split(' '); $scope = $c[3]; $match = $c[4]
+    if ($c.Count -ge 6 -and $Role -eq 'server') { continue }
+    if ((Pk-PinOf 'tools' $name '') -eq 'skip') { Ae-Info "$name skipped on this machine"; continue }
+    $desktop = $c.Count -ge 6 -and $c[5] -eq 'desktop'
     $pin = Pk-PinOf 'tools' $name 'winget'
     if ($pin -eq 'skip') { Ae-Info "$name skipped on this machine"; continue }
     $n = 3; if ($match -eq 'minor') { $n = 2 }
+    # Java reports runtime 25.0.4.1, not WinGet's MSI ID 25.0.4.101.
+    # Pk-Version preserves its fourth component; 25.0.4 is a different runtime.
+    if ($name -eq 'java') { $n = 4; $pin = Pk-PinOf 'tools' 'java' '' }
     $want = (($pin.Split('.') | Select-Object -First $n) -join '.')
-    $have = ''
-    if (Get-Command $probe[0] -ErrorAction SilentlyContinue) {
-        $rest = @(); if ($probe.Count -gt 1) { $rest = $probe[1..($probe.Count - 1)] }
-        $have = Ae-Semver (($null | & $probe[0] @rest 2>$null | Select-Object -First 5) -join ' ')
-    }
+    $rest = @(); if ($probe.Count -gt 1) { $rest = $probe[1..($probe.Count - 1)] }
+    $have = Pk-Version $probe[0] $rest
     $haveN = ''
     if ($have) { $haveN = (($have.Split('.') | Select-Object -First $n) -join '.') }
     if ($haveN -eq $want) { Ae-Ok "$name $have" }
     elseif (-not $have -and $scope -eq 'machine') { Ae-Fail "$name not installed (per-machine: needs AGENT_ENV_SYSTEM_PACKAGES=1 and UAC)" }
     elseif (-not $have) { Ae-Fail "$name not installed (pin $pin)" }
+    elseif ($desktop -and (Pk-Cmp $haveN $want) -gt 0) { Ae-Warn "$name $have, pin $pin (self-updated)" }
+    elseif ($desktop) { Ae-Fail "$name $have is older than pin $pin" }
     elseif ($scope -eq 'machine') { Ae-Warn "$name $have, pin $pin (per-machine; the opt-in apply upgrades it)" }
     else { Ae-Fail "$name $have, pin $pin" }
 }
@@ -74,5 +83,31 @@ if ($Harnesses -contains 'muse') {
     if (Test-Path -LiteralPath (Join-Path $HOME '.config\agent-env\gitbash-bin\muse')) { Ae-Ok 'Git Bash muse forwarder present' }
     else { Ae-Fail 'Git Bash muse forwarder missing (~/.config/agent-env/gitbash-bin/muse)' }
 }
-Remove-Variable pkLocal, pkParts, pkPy, pkExe, pkWhere, pkRc -ErrorAction SilentlyContinue
+
+# Maven, Java environment, and shared npm globals.
+$pkMaven = Pk-PinOf 'tools' 'maven' ''
+$pkHave = Pk-Version 'mvn.cmd' @('--version')
+if ($pkMaven -eq 'skip') { Ae-Info 'maven skipped' }
+elseif ($pkHave -eq $pkMaven) { Ae-Ok "maven $pkHave" }
+else { Ae-Fail 'maven missing or off pin' }
+$pkJavaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME', 'User')
+if (-not $pkJavaHome) { $pkJavaHome = [Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine') }
+if ((Pk-PinOf 'tools' 'java' '') -eq 'skip') { Ae-Info 'JAVA_HOME check skipped' }
+elseif ($pkJavaHome -and (Test-Path -LiteralPath (Join-Path $pkJavaHome 'bin\javac.exe'))) { Ae-Ok 'JAVA_HOME points to a JDK' }
+else { Ae-Fail 'JAVA_HOME missing or not a JDK' }
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $Repo 'packages\npm-global.txt'))) {
+    $text = ($line -replace '#.*$', '').Trim(); if (-not $text) { continue }
+    $c = @($text.Split('|') | ForEach-Object { $_.Trim() })
+    if ($c[3] -ne '-' -and $Harnesses -notcontains $c[3]) { continue }
+    $ref = $c[1].Split('.')
+    $key = 'version'; if ($ref[0] -eq 'skills') { $key = 'cli_version' }
+    $pin = Pk-PinOf $ref[0] $ref[1] $key
+    if ($pin -eq 'skip') { Ae-Info ($c[2] + ' skipped'); continue }
+    $have = ''
+    $manifest = Join-Path (Join-Path $env:APPDATA 'npm\node_modules') ($c[0] + '\package.json')
+    try { $have = ([IO.File]::ReadAllText($manifest) | ConvertFrom-Json).version } catch { }
+    if ($have -eq $pin -and (Get-Command ($c[2] + '.cmd') -ErrorAction SilentlyContinue)) { Ae-Ok ($c[2] + ' ' + $have) }
+    else { Ae-Fail ($c[2] + ' missing, off pin or not on PATH') }
+}
 Remove-Item Function:\Pk-PinOf -ErrorAction SilentlyContinue
+Remove-Variable pkLocal, pkParts, pkPy, pkExe, pkWhere, pkRc -ErrorAction SilentlyContinue

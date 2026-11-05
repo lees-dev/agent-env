@@ -1,0 +1,21 @@
+# Explicit allowlist of secret-free source paths, relative to home/.
+# Entry points copy these files only, never directories or the main config/ignore.
+.chezmoitemplates/packages/lib.sh
+.chezmoitemplates/packages/desktop.sh
+.chezmoitemplates/packages/lib.ps1
+.chezmoitemplates/packages/winget-run.ps1
+.chezmoitemplates/packages/pins.json
+.chezmoiscripts/run_onchange_before_10-packages-path.sh.tmpl
+.chezmoiscripts/run_onchange_before_10-packages-path.ps1.tmpl
+.chezmoiscripts/run_onchange_before_11-packages-system.sh.tmpl
+.chezmoiscripts/run_onchange_before_11-packages-winget.ps1.tmpl
+.chezmoiscripts/run_onchange_before_12-packages-mise.sh.tmpl
+.chezmoiscripts/run_onchange_before_12-packages-development.ps1.tmpl
+.chezmoiscripts/run_onchange_before_13-packages-harnesses.sh.tmpl
+.chezmoiscripts/run_onchange_before_13-packages-harnesses.ps1.tmpl
+.chezmoiscripts/run_onchange_before_14-packages-desktop.sh.tmpl
+.chezmoiscripts/run_onchange_before_14-packages-desktop.ps1.tmpl
+dot_config/agent-env/env.sh
+dot_config/agent-env/env.d/10-packages.sh.tmpl
+dot_config/agent-env/gitbash-bin/executable_muse
+dot_config/mise/conf.d/agent-env.toml.tmpl

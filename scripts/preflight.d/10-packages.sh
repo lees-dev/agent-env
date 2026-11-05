@@ -97,3 +97,16 @@ if ae_have curl; then
   else ae_warn "unreachable:$_pk_bad"; fi
 fi
 unset _pk_harn _pk_optin _pk_t _pk_n _pk_p _pk_list _pk_miss _pk_pin _pk_have _pk_o _pk_bad _pk_u _pk_c
+
+# Tools stage is independent of op and the hub; missing tools here are warnings.
+for _pk_t in pnpm bun rg mvn java javac higgsfield vercel coderabbit; do
+  if ae_have "$_pk_t"; then ae_ok "$_pk_t present"
+  else ae_warn "$_pk_t missing: run sh scripts/install-tools before provisioning"; fi
+done
+if [ "$ROLE" != server ] && [ "$OS" != wsl ]; then
+  for _pk_t in t3code jetbrains-toolbox; do
+    if ae_have "$_pk_t"; then ae_ok "$_pk_t installed"
+    elif [ "$_pk_t" = jetbrains-toolbox ]; then ae_warn "$_pk_t missing: the tools stage needs AGENT_ENV_SYSTEM_PACKAGES=1 to install it"
+    else ae_warn "$_pk_t missing: the tools stage installs it"; fi
+  done
+fi

@@ -14,3 +14,7 @@ gh = "tools.gh"
 oh-my-posh = "tools.oh-my-posh"
 # Codex's GitHub release binary (registry backend aqua:openai/codex). Windows uses npm instead.
 codex = "harness.codex"
+
+java = "tools.java"
+maven = "tools.maven"
+ripgrep = "tools.ripgrep"

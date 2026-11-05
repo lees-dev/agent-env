@@ -164,7 +164,7 @@ Set in `home/.chezmoi.toml.tmpl`. The answers come from an `AGENT_ENV_*` environ
 | `distro` | string | `windows`, `macos` or the os-release `id` (`ubuntu`, `rocky`, ...) |
 | `distroFamily` | string | `debian` \| `rhel` \| `windows` \| `macos` \| the raw id |
 | `pkgManager` | string | `winget` \| `brew` \| `apt` \| `dnf` \| `none` |
-| `headless` | bool | `true` for the `server` role and for `wsl`/`linux`; desktop-only targets (T3) are skipped when it is true |
+| `headless` | bool | `true` for the `server` role and for `wsl`; desktop-only targets (T3) are skipped when it is true |
 | `linkMode` | string | `junction` on Windows, `symlink` elsewhere |
 | `cpaAnthropicBaseUrl` | string | `cpaUrl`, for Claude-style clients |
 | `cpaOpenAIBaseUrl` | string | `cpaUrl + "/v1"`, for OpenAI-style clients |
@@ -174,4 +174,8 @@ Set in `home/.chezmoi.toml.tmpl`. The answers come from an `AGENT_ENV_*` environ
 
 Run scripts also get these environment variables (`scriptEnv`): `AGENT_ENV_REPO`, `AGENT_ENV_ROLE`, `AGENT_ENV_OS`, `AGENT_ENV_MACHINE`, `AGENT_ENV_HARNESSES`, `AGENT_ENV_BACKUP_ROOT`, `AGENT_ENV_NO_SECRETS` (`1` or `0`). The packages scripts also read `AGENT_ENV_SYSTEM_PACKAGES` from the apply's own environment (`docs/packages.md`).
 
-To add a key, add it to the template and to this table in the same commit, then re-run `chezmoi init` on each machine. The `Once` prompts keep the existing answers.
+When the config template changes, update this table as needed and re-run `chezmoi init --source <checkout>` on each machine before applying. Use the existing machine answers and persisted-environment loaders from AGENTS.md step 3. The `Once` prompts keep the existing answers. This includes derived-key changes: existing Linux client/hub configs keep the old `headless = true` until init renders the new value. Follow AGENTS.md "Updating a machine later".
+
+## Packages-only bootstrap
+
+`scripts/install-tools` and `scripts/install-tools.ps1` belong to packages. They copy only the files listed in `packages/tools-stage.txt` into an isolated source under `.tools/`, with their own `scripts/tools-config.toml.tmpl` and `scripts/tools-ignore.tmpl`. That config supplies the package scripts' existing data keys and reads no credentials. `AGENT_ENV_TOOLS_REPO` supplies the original checkout path only inside the stage. It is not a normal template data key or a persistent setting. The stage never copies the main config, secret partials, harness configuration, or the rest of the source tree. Shared entry points and changes to `headless` are included in this owner-authorized tools-stage task.

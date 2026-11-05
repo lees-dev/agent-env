@@ -86,8 +86,13 @@ $npmItems = @(
 )
 foreach ($it in $npmItems) {
     if ($it.Pin -eq 'skip') { Pk-Say ("{0}: skipped on this machine" -f $it.Cmd); continue }
-    $shim = Join-Path $env:APPDATA ("npm\{0}.cmd" -f $it.Cmd)
-    $have = Pk-Version $shim @('--version')
+    $manifest = Join-Path (Join-Path $env:APPDATA 'npm\node_modules') ($it.Package + '\package.json')
+    $have = ''
+    if (Test-Path -LiteralPath $manifest) {
+        try { $have = ([IO.File]::ReadAllText($manifest) | ConvertFrom-Json).version } catch { }
+    }
+    $shim = Join-Path (Join-Path $env:APPDATA 'npm') ($it.Cmd + '.cmd')
+    if (-not (Test-Path -LiteralPath $shim)) { $have = '' }
     if ($have -eq $it.Pin) { Pk-Say ("{0} {1} (npm)" -f $it.Cmd, $have); continue }
     if (Pk-Dry) { Pk-Say ("dry-run: would npm install -g {0}@{1} (have {2})" -f $it.Package, $it.Pin, $(if ($have) { $have } else { 'none' })); continue }
     if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
@@ -100,10 +105,10 @@ foreach ($it in $npmItems) {
 {{- end }}
         continue
     }
-    & npm.cmd install --global --no-fund --no-audit --loglevel=error ("{0}@{1}" -f $it.Package, $it.Pin) | Out-Null
+    & npm.cmd install --global --prefix (Join-Path $env:APPDATA 'npm') --no-fund --no-audit --loglevel=error ("{0}@{1}" -f $it.Package, $it.Pin) | Out-Null
     $rc = $LASTEXITCODE
-    $have = Pk-Version $shim @('--version')
-    if ($have -eq $it.Pin) { $script:PkChanged++; Pk-Say ("{0} {1} installed (npm)" -f $it.Cmd, $have) }
+    try { $have = ([IO.File]::ReadAllText($manifest) | ConvertFrom-Json).version } catch { $have = '' }
+    if ($rc -eq 0 -and $have -eq $it.Pin -and (Test-Path -LiteralPath $shim)) { $script:PkChanged++; Pk-Say ("{0} {1} installed (npm)" -f $it.Cmd, $have) }
     else { Pk-Fail $it.Cmd ("{0}: npm exited {1}; now {2}, pin {3}" -f $it.Cmd, $rc, $(if ($have) { $have } else { 'missing' }), $it.Pin) }
 }
 

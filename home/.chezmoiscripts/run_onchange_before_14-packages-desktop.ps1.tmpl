@@ -1,0 +1,43 @@
+{{- if and (eq .osFlavour "windows") (not .headless) -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+{{- $optin := env "AGENT_ENV_SYSTEM_PACKAGES" | trim -}}
+# Desktop winget installs run after Maven and every harness, including on failure.
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }} {{ include (joinPath .repoDir "packages/winget.txt") | sha256sum }}
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }}
+$ErrorActionPreference = 'Stop'
+{{ template "packages/lib.ps1" . }}
+Pk-AssertNotMsix
+Pk-RefreshPath
+$optin = {{ $optin | squote }}
+$packageRole = {{ .role | squote }}
+$items = @(
+{{- range splitList "\n" (include (joinPath .repoDir "packages/winget.txt")) }}
+{{-   $l := regexReplaceAll "#.*$" . "" | trim }}
+{{-   if $l }}
+{{-     $c := splitList "|" $l }}
+{{-     if ge (len $c) 6 }}
+{{-     $p := index $pins (printf "tools.%s" (index $c 1 | trim)) }}
+{{-     $pin := $p.version }}
+{{-     if hasKey $p "winget" }}{{ $pin = $p.winget }}{{ end }}
+{{-     $probe := splitList " " (index $c 2 | trim) }}
+    @{ Id = {{ index $c 0 | trim | squote }}; Name = {{ index $c 1 | trim | squote }}; Pin = {{ $pin | squote }}; ProbePin = {{ $p.version | squote }}; Exe = {{ first $probe | squote }}; Args = @({{ range $i, $a := rest $probe }}{{ if $i }}, {{ end }}{{ $a | squote }}{{ end }}); Scope = {{ index $c 3 | trim | squote }}; Match = {{ index $c 4 | trim | squote }} }
+{{-     end }}
+{{-   end }}
+{{- end }}
+)
+{{ template "packages/winget-run.ps1" . }}
+if (-not (Pk-Dry)) {
+{{- if not .headless }}
+    $t3 = Join-Path $env:LOCALAPPDATA 'Programs\t3code\T3 Code (Beta).exe'
+    if (Test-Path -LiteralPath $t3) {
+        $shim = Join-Path $env:USERPROFILE '.local\bin\t3code.cmd'
+        $body = "@echo off`r`n" + '"%LOCALAPPDATA%\Programs\t3code\T3 Code (Beta).exe" %*' + "`r`n"
+        if (-not (Test-Path -LiteralPath $shim) -or [IO.File]::ReadAllText($shim) -ne $body) {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $shim) -Force | Out-Null
+            [IO.File]::WriteAllText($shim, $body, [Text.Encoding]::ASCII)
+        }
+    }
+{{- end }}
+}
+Pk-Finish '14-packages-desktop'
+{{ end -}}

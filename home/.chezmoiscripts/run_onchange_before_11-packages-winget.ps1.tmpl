@@ -20,55 +20,24 @@ Pk-AssertNotMsix
 Pk-RefreshPath
 
 $optin = {{ $optin | squote }}
+$packageRole = {{ .role | squote }}
 $items = @(
 {{- range splitList "\n" (include (joinPath .repoDir "packages/winget.txt")) }}
 {{-   $l := regexReplaceAll "#.*$" . "" | trim }}
 {{-   if $l }}
 {{-     $c := splitList "|" $l }}
+{{-     if lt (len $c) 6 }}
 {{-     $p := index $pins (printf "tools.%s" (index $c 1 | trim)) }}
 {{-     $pin := $p.version }}
 {{-     if hasKey $p "winget" }}{{ $pin = $p.winget }}{{ end }}
 {{-     $probe := splitList " " (index $c 2 | trim) }}
-    @{ Id = {{ index $c 0 | trim | squote }}; Name = {{ index $c 1 | trim | squote }}; Pin = {{ $pin | squote }}; Exe = {{ first $probe | squote }}; Args = @({{ range $i, $a := rest $probe }}{{ if $i }}, {{ end }}{{ $a | squote }}{{ end }}); Scope = {{ index $c 3 | trim | squote }}; Match = {{ index $c 4 | trim | squote }} }
+    @{ Id = {{ index $c 0 | trim | squote }}; Name = {{ index $c 1 | trim | squote }}; Pin = {{ $pin | squote }}; ProbePin = {{ $p.version | squote }}; Exe = {{ first $probe | squote }}; Args = @({{ range $i, $a := rest $probe }}{{ if $i }}, {{ end }}{{ $a | squote }}{{ end }}); Scope = {{ index $c 3 | trim | squote }}; Match = {{ index $c 4 | trim | squote }} }
+{{-     end }}
 {{-   end }}
 {{- end }}
 )
 
-$common = @('--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
-$needOptin = @()
-foreach ($it in $items) {
-    if ($it.Pin -eq 'skip') { Pk-Say ("{0}: skipped on this machine" -f $it.Name); continue }
-    $parts = 3
-    if ($it.Match -eq 'minor') { $parts = 2 }
-    $want = Pk-Prefix $it.Pin $parts
-    $have = Pk-Version $it.Exe $it.Args
-    $haveCmp = ''
-    if ($have) { $haveCmp = Pk-Prefix $have $parts }
-    $cmp = Pk-Cmp $haveCmp $want
-    if ($have -and $cmp -eq 0) { Pk-Say ("{0} {1}" -f $it.Name, $have); continue }
-    if ($have -and $cmp -gt 0) { Pk-Say ("{0} {1} is newer than the pin {2}: left as is" -f $it.Name, $have, $it.Pin); continue }
-    $verb = 'install'
-    if ($have) { $verb = 'upgrade' }
-    if ($it.Scope -eq 'machine' -and $optin -ne '1') { $needOptin += ('{0} {1}->{2}' -f $it.Name, $(if ($have) { $have } else { 'none' }), $it.Pin); continue }
-    if (Pk-Dry) { Pk-Say ("dry-run: would winget {0} {1} {2} (have {3})" -f $verb, $it.Id, $it.Pin, $(if ($have) { $have } else { 'none' })); continue }
-    $argv = @($verb, '--id', $it.Id, '--version', $it.Pin) + $common
-    if ($it.Scope -eq 'user') { $argv += @('--scope', 'user') }
-    Pk-Say ("winget {0} {1} {2}" -f $verb, $it.Id, $it.Pin)
-    & winget @argv | Out-Null
-    $rc = $LASTEXITCODE
-    Pk-RefreshPath
-    $have = Pk-Version $it.Exe $it.Args
-    if ($have -and (Pk-Cmp (Pk-Prefix $have $parts) $want) -eq 0) {
-        $script:PkChanged++
-        Pk-Say ("{0} {1} installed" -f $it.Name, $have)
-    } else {
-        Pk-Fail $it.Name ("{0}: winget {1} exited {2}; now {3}, pin {4}" -f $it.Name, $verb, $rc, $(if ($have) { $have } else { 'missing' }), $it.Pin)
-    }
-}
-if ($needOptin.Count -gt 0) {
-    Pk-Say ("{0} per-machine package(s) need the owner's OK (UAC): {1}" -f $needOptin.Count, ($needOptin -join ', '))
-    Pk-Say "rerun the apply with `$env:AGENT_ENV_SYSTEM_PACKAGES = '1' from a normal terminal"
-}
+{{ template "packages/winget-run.ps1" . }}
 
 # Python 3.12 through uv (python.org has no Windows installer for 3.12 security releases).
 $py312 = {{ (index $pins "tools.python312").minor | squote }}
@@ -87,5 +56,7 @@ if ($py312 -ne 'skip') {
     }
 }
 
+# Temurin's ADDLOCAL=ALL sets JAVA_HOME. Refresh it for subsequent scripts.
+Pk-RefreshPath
 Pk-Finish '11-packages-winget'
 {{ end -}}

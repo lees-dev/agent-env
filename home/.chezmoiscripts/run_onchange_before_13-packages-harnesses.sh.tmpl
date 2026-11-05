@@ -11,7 +11,7 @@
 # Installers that edit shell startup files are told not to (SHELL unset for grok,
 # MUSE_NO_MODIFY_PATH=1): env.d/10-packages.sh owns PATH.
 # harnesses={{ join "," .harnesses }} role={{ .role }} os={{ .osFlavour }}
-# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }}
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }} {{ include (joinPath .repoDir "packages/npm-global.txt") | sha256sum }}
 set -eu
 # dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }} (rendered so that a dry run and a real run differ: chezmoi
 # records each run_onchange_ script it ran, and a dry run must not stand in for the real one)
@@ -21,7 +21,7 @@ pk_no_windows_path
 {{- end }}
 pk_path_prepend "$HOME/.local/bin"
 pk_path_prepend "$HOME/.grok/bin"
-mkdir -p "$HOME/.local/bin"
+pk_dry || mkdir -p "$HOME/.local/bin"
 cd /
 
 need_bash() {
@@ -86,6 +86,42 @@ fi
 
 pk_say "codex: installed by mise (12-packages-mise)"
 {{- end }}
+
+# Shared npm globals. Use the pinned Node, even before mise's config is deployed.
+# Prefix keeps global commands in ~/.local/bin instead of inside a versioned Node directory.
+MISE="$HOME/.local/bin/mise"
+NODE_PIN={{ (index $pins "tools.node").version | quote }}
+export NPM_CONFIG_PREFIX="$HOME/.local"
+GLOBALS='
+{{- range splitList "\n" (include (joinPath .repoDir "packages/npm-global.txt")) }}
+{{- $l := regexReplaceAll "#.*$" . "" | trim }}
+{{- if $l }}
+{{- $c := splitList "|" $l }}
+{{- if eq (index $c 3 | trim) "-" }}
+{{ index $c 0 | trim }}|{{ (index $pins (index $c 1 | trim)).version }}|{{ index $c 2 | trim }}
+{{- end }}{{- end }}{{- end }}'
+while IFS='|' read -r package pin cmd; do
+  [ -n "$package" ] || continue
+  [ "$pin" != skip ] || continue
+  have=''
+  if [ -x "$HOME/.local/bin/$cmd" ] && [ -x "$MISE" ] && [ -f "$HOME/.local/lib/node_modules/$package/package.json" ]; then
+    # `mise where` never downloads; `mise exec` could auto-install even during a dry run.
+    node_dir=$("$MISE" where "node@$NODE_PIN" 2>/dev/null || true)
+    if [ -n "$node_dir" ] && [ -x "$node_dir/bin/node" ]; then
+      have=$("$node_dir/bin/node" -p 'require(process.argv[1]).version' "$HOME/.local/lib/node_modules/$package/package.json" 2>/dev/null || true)
+    fi
+  fi
+  if [ "$have" = "$pin" ]; then pk_say "$package $pin (npm)"
+  elif pk_dry; then pk_say "dry-run: would npm install -g $package@$pin"
+  elif "$MISE" exec "node@$NODE_PIN" -- npm install --global --no-fund --no-audit --loglevel=error "$package@$pin" >/dev/null; then
+    PK_CHANGED=$((PK_CHANGED + 1))
+    pk_say "$package $pin installed (npm)"
+  else
+    pk_fail "$package" "npm install failed"
+  fi
+done <<EOF
+$GLOBALS
+EOF
 
 pk_finish 13-packages-harnesses
 {{ end -}}

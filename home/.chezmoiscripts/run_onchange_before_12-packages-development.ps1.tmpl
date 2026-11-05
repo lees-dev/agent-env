@@ -1,0 +1,48 @@
+{{- if eq .osFlavour "windows" -}}
+{{- $pins := includeTemplate "packages/pins.json" . | fromJson -}}
+# Windows Maven archive: no Apache.Maven package exists in winget.
+# inputs: {{ include (joinPath .repoDir "versions.toml") | sha256sum }}
+$ErrorActionPreference = 'Stop'
+# dry-run={{ env "AGENT_ENV_DRY_RUN" | trim }}
+{{ template "packages/lib.ps1" . }}
+Pk-AssertNotMsix
+Pk-RefreshPath
+$pin = {{ (index $pins "tools.maven").version | squote }}
+$base = {{ (index $pins "tools.maven").archive_base | squote }}
+$root = Join-Path $env:USERPROFILE '.local\share\maven'
+$target = Join-Path $root "apache-maven-$pin"
+if ($pin -eq 'skip') { Pk-Say 'maven: skipped' }
+elseif (Test-Path -LiteralPath (Join-Path $target 'bin\mvn.cmd')) { Pk-Say "maven $pin present" }
+elseif (Pk-Dry) { Pk-Say "dry-run: would install Maven $pin (SHA-512 verified archive)" }
+else {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('agent-env-maven-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $url = "$base/$pin/apache-maven-$pin-bin.zip"
+        $zip = Join-Path $tmp 'maven.zip'
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+        $sum = (Invoke-WebRequest -UseBasicParsing -Uri "$url.sha512").Content.Trim().Split(' ')[0]
+        if ((Get-FileHash -LiteralPath $zip -Algorithm SHA512).Hash -ne $sum) { throw 'Maven checksum mismatch' }
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Expand-Archive -LiteralPath $zip -DestinationPath $root -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $target 'bin\mvn.cmd'))) { throw 'Maven binary missing' }
+        $script:PkChanged++
+    } catch { Pk-Fail 'maven' 'Maven archive install failed' }
+    finally { Remove-Item -LiteralPath $tmp -Recurse -Force }
+}
+# Keep a stable command on PATH so a pin bump cannot leave an older Maven first.
+if ($pin -ne 'skip' -and ((Pk-Dry) -or (Test-Path -LiteralPath (Join-Path $target 'bin\mvn.cmd')))) {
+    $shim = Join-Path $env:USERPROFILE '.local\bin\mvn.cmd'
+    $body = "@echo off`r`ncall " + '"%USERPROFILE%\.local\share\maven\apache-maven-' + $pin + '\bin\mvn.cmd" %*' + "`r`n"
+    if (-not (Test-Path -LiteralPath $shim) -or [IO.File]::ReadAllText($shim) -ne $body) {
+        if (Pk-Dry) { Pk-Say 'dry-run: would update the stable Maven launcher' }
+        else {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $shim) -Force | Out-Null
+            [IO.File]::WriteAllText($shim, $body, [Text.Encoding]::ASCII)
+            $script:PkChanged++
+        }
+    }
+}
+Pk-Finish '12-packages-development'
+{{ end -}}

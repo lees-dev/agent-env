@@ -7,3 +7,11 @@
 .bash_login
 .profile
 .zshrc
+# Stable package launchers changed by scripts 12/14. Absent OS-specific paths are skipped.
+.local/bin/mvn.cmd
+.local/bin/t3code.cmd
+.local/bin/t3code
+.local/bin/jetbrains-toolbox
+.local/bin/docker
+.local/share/applications/t3code.desktop
+.local/share/applications/jetbrains-toolbox.desktop

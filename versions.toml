@@ -1,6 +1,6 @@
 # Pinned versions for every harness and tool this repo installs or checks.
 #
-# Resolved 2026-11-04 from each registry or release page (sources and docs: docs/research.md).
+# Existing pins resolved 2026-11-04; tools-stage additions resolved 2026-11-05 (docs/research.md).
 # Re-resolve from the registry before you bump a pin; never bump from memory.
 #
 # Format contract (scripts/preflight, scripts/verify and run_onchange_ scripts parse this file
@@ -196,3 +196,61 @@ source = "https://github.com/actions/checkout/releases/tag/v7.0.1"
 
 # None committed. Put a machine's intentional pins in its untracked
 # ~/.config/agent-env/versions.local.toml [overrides] (docs/packages.md).
+
+# ---- Tools stage additions (packages, resolved 2026-11-05) -----------------------
+
+[tools.pnpm]
+version = "12.9.1"
+source = "https://registry.npmjs.org/pnpm/12.9.1"
+
+[tools.bun]
+version = "1.4.4"
+source = "https://registry.npmjs.org/bun/1.4.4"
+
+[tools.java]
+version = "25.0.4.1"
+mise = "temurin-25.0.4+101.0.LTS"
+mise_source = "https://mise-java.jdx.dev/jvm/ga/linux/x86_64.json"
+winget = "25.0.4.101"
+source = "https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.4.1%2B1"
+winget_source = "https://github.com/microsoft/winget-pkgs/tree/master/manifests/e/EclipseAdoptium/Temurin/25/JDK/25.0.4.101"
+
+[tools.maven]
+version = "3.10.0"
+source = "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/maven-metadata.xml"
+archive_base = "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven"
+
+[tools.ripgrep]
+version = "15.2.0"
+source = "https://github.com/BurntSushi/ripgrep/releases/tag/15.2.0"
+
+[tools.vercel]
+version = "65.10.0"
+source = "https://registry.npmjs.org/vercel/65.10.0"
+
+[tools.t3code]
+version = "0.1.7"
+app_name = "T3 Code (Beta)"
+source = "https://github.com/pingdotgg/t3code/releases/tag/v0.1.7"
+release_base = "https://github.com/pingdotgg/t3code/releases/download"
+sha256_macos_arm64 = "c51804b56d055f3517f619da0426eaf2fb63feb8b8b40e70482918f9c6474f56"
+sha256_macos_x64 = "0388d101bde2b7f1301c875ffc3919ce25568337ab84ca7471c579eca91831d1"
+sha256_linux_arm64 = "4445beffacf96da3be2c81c280222020e3b2623579e3364b10f44e84bfd1e3c2"
+sha256_linux_x64 = "faaee4094dca1276057840a1a45a6b2d00d7418afbf5735f75a7503b774e63d1"
+deb_package = "t3code"
+sha256_deb_arm64 = "94e0c9b3b5e9735f8570df6da1feb6f89dc9c0e1c842e8dfbd020e957345e0ca"
+sha256_deb_x64 = "e1373f8047ba582f2e40aff4b34b57d9a355513d4fb47c34d49d11b5c870f9fe"
+checksum_source = "https://api.github.com/repos/pingdotgg/t3code/releases/tags/v0.1.7"
+
+[tools.toolbox]
+version = "3.9.1"
+build = "3.9.1.89198"
+winget = "3.9.1.0"
+source = "https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release"
+download_base = "https://download.jetbrains.com/toolbox"
+
+[tools.docker-desktop]
+version = "4.98.0"
+build = "245422"
+source = "https://desktop.docker.com/win/main/amd64/appcast.xml"
+download_base = "https://desktop.docker.com/mac/main"

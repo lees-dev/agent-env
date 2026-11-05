@@ -2,6 +2,7 @@
 # Uses $Repo $Versions $Role $Machine and the Ae-* helpers. Windows PowerShell 5.1, ASCII only.
 
 # winget (App Installer) drives every tool install on Windows.
+. (Join-Path $Repo 'home\.chezmoitemplates\packages\lib.ps1')
 $pkWinget = Get-Command winget -ErrorAction SilentlyContinue
 $pkPin = Ae-TomlGet $Versions 'tools.winget' 'version'
 if ($pkWinget) {
@@ -20,16 +21,21 @@ if ($pkWinget) {
 
 # Per-machine packages need UAC, so they run only with the owner's opt-in for that apply.
 $pkMachine = @()
+$pkMachineNames = @()
 foreach ($l in [IO.File]::ReadAllLines((Join-Path $Repo 'packages\winget.txt'))) {
     $t = ($l -replace '#.*$', '').Trim()
     if (-not $t) { continue }
     $c = $t.Split('|') | ForEach-Object { $_.Trim() }
+    if ($c.Count -ge 6 -and $Role -eq 'server') { continue }
     if ($c[3] -eq 'machine') {
+        $pkMachineNames += $c[1]
         $probe = $c[2].Split(' ')
-        if (-not (Get-Command $probe[0] -ErrorAction SilentlyContinue)) { $pkMachine += $c[1] }
+        if ($probe[0].StartsWith('@')) {
+            if (-not (Pk-Version $probe[0] @())) { $pkMachine += $c[1] }
+        } elseif (-not (Get-Command $probe[0] -ErrorAction SilentlyContinue)) { $pkMachine += $c[1] }
     }
 }
-if ($pkMachine.Count -eq 0) { Ae-Ok 'per-machine packages (Git, GitHub CLI, Node, Tailscale) present' }
+if ($pkMachine.Count -eq 0) { Ae-Ok ("per-machine packages ({0}) present" -f ($pkMachineNames -join ', ')) }
 elseif ($env:AGENT_ENV_SYSTEM_PACKAGES -eq '1') { Ae-Warn ("missing per-machine packages: {0}; the apply installs them with UAC prompts" -f ($pkMachine -join ', ')) }
 else {
     Ae-Warn ("missing per-machine packages: {0}" -f ($pkMachine -join ', '))
@@ -67,4 +73,18 @@ else { Ae-Warn ("unreachable: {0}" -f ($pkBad -join ', ')) }
 if (Test-Path -LiteralPath (Join-Path $HOME '.config\agent-env\versions.local.toml')) {
     Ae-Info 'machine-local overrides in ~/.config/agent-env/versions.local.toml are in effect'
 }
-Remove-Variable pkWinget, pkPin, pkHave, pkOlder, pkA, pkB, pkMachine, pkBash, pkRaw, pkHaveP, pkMissing, pkBad -ErrorAction SilentlyContinue
+Remove-Variable pkWinget, pkPin, pkHave, pkOlder, pkA, pkB, pkMachine, pkMachineNames, pkBash, pkRaw, pkHaveP, pkMissing, pkBad -ErrorAction SilentlyContinue
+
+# Tools-stage additions: warn before apply, never launch a desktop app to probe it.
+foreach ($tool in @('pnpm','bun','rg','mvn.cmd','javac','higgsfield.cmd','vercel.cmd')) {
+    if (Get-Command $tool -ErrorAction SilentlyContinue) { Ae-Ok "$tool present" }
+    else { Ae-Warn "$tool missing: run scripts/install-tools.ps1 before provisioning" }
+}
+if ($Role -ne 'server') {
+    foreach ($app in @('t3code','toolbox','docker-desktop')) {
+        $have = Pk-Version ('@' + $app) @()
+        if ($have) { Ae-Ok "$app $have" }
+        elseif ($app -eq 't3code') { Ae-Warn "$app missing: the tools stage installs it" }
+        else { Ae-Warn "$app missing: the tools stage needs AGENT_ENV_SYSTEM_PACKAGES=1 to install it" }
+    }
+}

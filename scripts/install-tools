@@ -1,0 +1,83 @@
+#!/bin/sh
+# Install binaries before provisioning; no secrets or normal chezmoi config are loaded.
+# Usage: AGENT_ENV_SYSTEM_PACKAGES=1 sh scripts/install-tools [--role client|hub|server] [--machine remark]
+# AGENT_ENV_DRY_RUN=1 runs dry package scripts and writes no destination files.
+# AGENT_ENV_CHEZMOI selects an existing test binary (required for a dry bootstrap).
+set -eu
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+ROLE=${AGENT_ENV_ROLE:-client}
+MACHINE=${AGENT_ENV_MACHINE:-}
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --role) ROLE=$2; shift 2 ;;
+    --machine) MACHINE=$2; shift 2 ;;
+    *) echo 'usage: sh scripts/install-tools [--role client|hub|server] [--machine remark]' >&2; exit 2 ;;
+  esac
+done
+case "$ROLE" in client|hub|server) ;; *) echo 'invalid role' >&2; exit 2 ;; esac
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) echo 'Use powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-tools.ps1 on Windows' >&2; exit 2 ;; esac
+# shellcheck source=../home/.chezmoitemplates/packages/lib.sh
+. "$REPO/home/.chezmoitemplates/packages/lib.sh"
+if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then pk_no_windows_path; fi
+pk_path_prepend "$HOME/.local/bin"
+[ "$ROLE" != server ] || AGENT_ENV_SYSTEM_PACKAGES=0
+export AGENT_ENV_SYSTEM_PACKAGES=${AGENT_ENV_SYSTEM_PACKAGES:-0}
+export AGENT_ENV_ROLE=$ROLE AGENT_ENV_MACHINE=$MACHINE AGENT_ENV_TOOLS_REPO=$REPO
+STAGE=''; SUDO_KEEPALIVE=''
+cleanup() {
+  if [ -n "$SUDO_KEEPALIVE" ]; then kill "$SUDO_KEEPALIVE" 2>/dev/null || true; wait "$SUDO_KEEPALIVE" 2>/dev/null || true; fi
+  [ -z "$STAGE" ] || rm -rf "$STAGE"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+if [ "$AGENT_ENV_SYSTEM_PACKAGES" = 1 ] && ! pk_dry; then
+  sudo -v || { echo 'System packages need sudo: run sudo -v and rerun in your terminal' >&2; exit 1; }
+  (
+    sudo_sleep=''
+    trap '[ -z "$sudo_sleep" ] || { kill "$sudo_sleep" 2>/dev/null || true; wait "$sudo_sleep" 2>/dev/null || true; }; exit 0' TERM
+    while sudo -n true; do
+      sleep 50 & sudo_sleep=$!
+      wait "$sudo_sleep" || break
+      sudo_sleep=''
+    done
+  ) &
+  SUDO_KEEPALIVE=$!
+fi
+CZ=${AGENT_ENV_CHEZMOI:-chezmoi}
+if ! command -v "$CZ" >/dev/null 2>&1; then
+  if pk_dry; then echo 'dry-run needs chezmoi (or AGENT_ENV_CHEZMOI)' >&2; exit 1; fi
+  pin=$(awk '/^\[tools.chezmoi\]/{s=1;next} /^\[/{s=0} s&&/^version/{gsub(/.*= *"|".*/,"");print;exit}' "$REPO/versions.toml")
+  # The downloader owns its own traps; keep them inside a subshell so bootstrap
+  # cannot replace the stage's sudo/staging cleanup trap.
+  (
+    pk_get_installer chezmoi https://get.chezmoi.io
+    sh "$PK_INSTALLER" -b "$HOME/.local/bin" -t "v$pin"
+  )
+  CZ="$HOME/.local/bin/chezmoi"
+fi
+mkdir -p "$REPO/.tools"
+STAGE=$(mktemp -d "$REPO/.tools/tools-stage.XXXXXX")
+mkdir -p "$STAGE/source" "$STAGE/destination"
+while IFS= read -r path; do
+  case "$path" in ''|'#'*) continue ;; esac
+  case "$path" in *..*|/*) echo 'invalid tools allowlist path' >&2; exit 1 ;; esac
+  mkdir -p "$STAGE/source/$(dirname "$path")"
+  cp "$REPO/home/$path" "$STAGE/source/$path"
+done < "$REPO/packages/tools-stage.txt"
+cp "$REPO/scripts/tools-config.toml.tmpl" "$STAGE/source/.chezmoi.toml.tmpl"
+cp "$REPO/scripts/tools-ignore.tmpl" "$STAGE/source/.chezmoiignore"
+# Explicit config/state/cache/source bypass the real config and all secret templates.
+DEST=$HOME
+pk_dry && DEST="$STAGE/destination"
+set -- --source "$STAGE/source" --config "$STAGE/config.toml" --persistent-state "$STAGE/state.boltdb" --cache "$STAGE/cache" --destination "$DEST" --no-tty
+"$CZ" init "$@"
+if pk_dry; then
+  for script in "$STAGE/source/.chezmoiscripts/"*.sh.tmpl; do
+    "$CZ" execute-template "$@" --file "$script" > "$STAGE/run.sh"
+    sh "$STAGE/run.sh"
+  done
+else
+  "$CZ" apply "$@"
+  "$HOME/.local/bin/mise" reshim
+fi
+printf 'tools: complete (all four harnesses; desktop apps excluded on server/WSL)\n'

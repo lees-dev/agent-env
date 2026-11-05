@@ -1,0 +1,5 @@
+# Unix desktop installs: pin name | OS list | policy (user or system opt-in)
+# Windows uses packages/winget.txt. WSL and server roles skip this list entirely.
+t3code | macos,linux | user
+toolbox | macos,linux | system
+docker-desktop | macos | system

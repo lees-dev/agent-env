@@ -14,6 +14,6 @@
 {{-   $name := index $parts 1 }}
 {{-   $p := index $pins $ref }}
 {{-   if and (or (ne $area "harness") (has $name $.harnesses)) (ne $p.version "skip") }}
-{{ $tool | quote }} = {{ $p.version | quote }}
+{{ $tool | quote }} = {{ get $p "mise" | default $p.version | quote }}
 {{-   end }}
 {{- end }}

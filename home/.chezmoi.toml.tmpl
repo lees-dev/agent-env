@@ -112,7 +112,7 @@
 {{- $noSecrets := has (env "AGENT_ENV_NO_SECRETS" | lower | trim) (list "1" "true" "yes") -}}
 
 {{- /* ---- Derived ---- */ -}}
-{{- $headless := or (eq $role "server") (and (ne $osFlavour "windows") (ne $osFlavour "macos")) -}}
+{{- $headless := or (eq $role "server") (eq $osFlavour "wsl") -}}
 {{- $linkMode := "symlink" -}}
 {{- if eq $osFlavour "windows" -}}{{- $linkMode = "junction" -}}{{- end -}}
 {{- /* The repo root: the source dir minus the .chezmoiroot directory. Not .chezmoi.workingTree,

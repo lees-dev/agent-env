@@ -59,6 +59,10 @@ function Pk-RefreshPath {
         $out += $p
     }
     $env:Path = $out -join ';'
+    foreach ($scope in 'Machine', 'User') {
+        $j = [Environment]::GetEnvironmentVariable('JAVA_HOME', $scope)
+        if ($j) { $env:JAVA_HOME = $j }
+    }
 }
 
 function Pk-Semver {
@@ -71,10 +75,25 @@ function Pk-Semver {
 # First x.y.z printed by a command line ('' when the command is missing or fails).
 function Pk-Version {
     param([string]$exe, [string[]]$argv)
+    if ($exe.StartsWith('@')) {
+        $file = switch ($exe) {
+            '@t3code' { Join-Path $env:LOCALAPPDATA 'Programs\t3code\T3 Code (Beta).exe' }
+            '@toolbox' { Join-Path $env:LOCALAPPDATA 'JetBrains\Toolbox\bin\jetbrains-toolbox.exe' }
+            '@docker-desktop' { Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe' }
+        }
+        if ($file -and (Test-Path -LiteralPath $file)) {
+            return (Pk-Semver ([Diagnostics.FileVersionInfo]::GetVersionInfo($file).ProductVersion))
+        }
+        return ''
+    }
     if (-not (Test-Path -LiteralPath $exe) -and -not (Get-Command $exe -ErrorAction SilentlyContinue)) { return '' }
     try {
         $out = ($null | & $exe @argv 2>$null | Select-Object -First 5) -join "`n"
     } catch { return '' }
+    if ((Split-Path -Leaf $exe) -match '^(java|javac)(\.exe)?$') {
+        $m = [regex]::Match($out, '(\d+\.\d+\.\d+(?:\.\d+)?)')
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
     return (Pk-Semver $out)
 }
 

@@ -1,5 +1,8 @@
-# Global npm packages, Windows only (run_onchange_before_13-packages-harnesses.ps1.tmpl).
-# WSL, Linux and macOS get the same tools from mise (packages/mise-tools.toml).
-# Columns separated by '|': npm package | versions.toml section | command | harness (or -)
-# The version is the section's `version` after machine overrides.
+# Shared npm globals: package | pin section | command | harness (or -)
+# Codex uses mise on Unix; every other row installs on all OSes through the pinned Node.
+# skills.higgsfield resolves cli_version from its existing section, not the skill-pack version.
 @openai/codex | harness.codex | codex | codex
+pnpm | tools.pnpm | pnpm | -
+bun | tools.bun | bun | -
+@higgsfield/cli | skills.higgsfield | higgsfield | -
+vercel | tools.vercel | vercel | -
