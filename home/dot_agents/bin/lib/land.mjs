@@ -884,6 +884,25 @@ export function named(key, cmds) {
   return (Array.isArray(cmds) ? cmds : cmds ? [cmds] : []).map((cmd, i) => ({ name: `${key}[${i}]`, cmd }));
 }
 
+// The wide sweep's commands that do something: null, [], '' or blank entries leave none, and
+// then there is no wide sweep (nothing can show the base is green).
+export function sweepCommands(cfg) {
+  return named('wideSweep', cfg.wideSweep).filter((e) => typeof e.cmd === 'string' && e.cmd.trim());
+}
+
+// Split every command a landing will run before anything is changed: one that cannot be run
+// (shell syntax, an unbalanced quote) is a config error up front, not after a rebase or a push.
+// gate: setup and affectedGate (the lander); merge: mergeCmd and ghWrapper. The wide sweep is
+// left to the sweep, which reports its own failures.
+export function validateLandingCommands(cfg, { gate = true, merge = true } = {}) {
+  const lists = [];
+  if (gate) lists.push(...named('setup', cfg.setup), ...named('affectedGate', cfg.affectedGate));
+  if (merge) lists.push(...named('mergeCmd', cfg.mergeCmd), ...named('ghWrapper', cfg.ghWrapper));
+  for (const { name, cmd } of lists) {
+    try { procSplitArgv(cmd); } catch (e) { throw new LandError(`.agents/repo.json ${name} cannot be run: ${e.message}`, 2); }
+  }
+}
+
 // ---------------------------------------------------------------- wide sweep
 
 export function sweepState(repo) {
@@ -891,7 +910,7 @@ export function sweepState(repo) {
 }
 
 export function sweepDue(repo, cfg) {
-  return Boolean(cfg.wideSweep) && (sweepState(repo).sinceSweep || 0) >= cfg.sweepEveryMerges;
+  return sweepCommands(cfg).length > 0 && (sweepState(repo).sinceSweep || 0) >= cfg.sweepEveryMerges;
 }
 
 // Run the repo's wide sweep on its base in the lander checkout. The caller holds the landing
@@ -900,7 +919,7 @@ export async function runSweep({ cfg, mainRoot, lock }) {
   const dir = landerCheckout(mainRoot, cfg.base);
   fetchBranch(dir, cfg.base);
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
-  const r = await runCommands([...named('setup', cfg.setup), ...named('wideSweep', cfg.wideSweep)], dir, lock, cfg);
+  const r = await runCommands([...named('setup', cfg.setup), ...sweepCommands(cfg)], dir, lock, cfg);
   // A command that could not be stopped may still use the checkout: leave it as it is.
   if (r.stuck) return r;
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);

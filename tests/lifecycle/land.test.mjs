@@ -4,7 +4,7 @@
 // Windows, a sh shim elsewhere, so commands go through lib/proc.mjs as real ones do), backed by
 // the same bare repo. Every temp path contains spaces, to cover Windows paths with spaces.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -342,19 +342,67 @@ describe('land-pr', () => {
     assert.equal(again.out, `MERGED ${p.mergeCommit}`);
   });
 
-  test('busy lock: queues with labels and a Landing section', () => {
+  test('a lock that stays busy: nothing is written (no stale body), REFUSED to retry; someone else\'s lock is left alone', () => {
     const t = setup();
     const head = makePr(t, 1);
     setLock(t, 1);
+    const lock = lockSha(t);
+    t.env.AGENT_LAND_LOCK_WAIT_MS = '50';
+    const before = state(t).calls.length;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED the landing lock stayed busy/);
+    assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit'), false);
+    assert.doesNotMatch(prOf(t, 1).body, /## Landing/);
+    assert.equal(lockSha(t), lock);
+  });
+
+  test('queueing writes the body only under the landing lock, from a fresh read', () => {
+    const t = setup();
+    queuePr(t, 2);
+    const head = makePr(t, 1);
+    const before = state(t).calls.length;
     const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
     assert.equal(r.status, 0, r.err);
-    assert.equal(r.out, 'QUEUED 1');
-    const p = prOf(t, 1);
-    assert.equal(p.state, 'OPEN');
-    assert.deepEqual(p.labels, ['queued']);
-    assert.match(p.body, new RegExp(`## Landing\\n\\n- Gate: pass @ ${head}\\n- Queued: `));
-    assert.deepEqual(state(t).labels.sort(), ['landing', 'queue-blocked', 'queue-hold', 'queue-next', 'queue-waiting', 'queued']);
-    assert.equal(lockExists(t), true, 'someone else\'s lock is left alone');
+    assert.equal(r.out, 'QUEUED 2');
+    const calls = state(t).calls.slice(before);
+    const take = calls.findIndex((c) => c.cmd === 'api' && c.method === 'POST' && c.route === 'refs');
+    const edit = calls.findIndex((c) => c.cmd === 'pr edit');
+    assert.ok(take >= 0 && edit > take, 'the lock is taken before the edit');
+    assert.match(prOf(t, 1).body, new RegExp(`## Landing\\n\\n- Gate: pass @ ${head}\\n- Queued: `));
+    assert.equal(lockExists(t), false, 'released');
+  });
+
+  test('--release-hold edits only under the landing lock (busy: refused, hold kept)', () => {
+    const t = setup();
+    const head = heldPr(t);
+    setLock(t, 1);
+    t.env.AGENT_LAND_LOCK_WAIT_MS = '50';
+    const body = prOf(t, 1).body;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED the landing lock stayed busy/);
+    assert.equal(prOf(t, 1).body, body);
+    assert.deepEqual(prOf(t, 1).labels, ['queued', 'queue-hold']);
+  });
+
+  test('a mergeCmd or affectedGate that cannot be run is a config error before any change', () => {
+    const t = setup({ mergeCmd: 'gh pr merge {pr} | tee x' });
+    const head = makePr(t, 1);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.err, /mergeCmd\[0\] cannot be run/);
+    assert.equal(lockExists(t), false);
+    const t2 = setup({ affectedGate: ['node scripts/gate.mjs | tee x'] });
+    queuePr(t2, 1);
+    advanceMain(t2, 'other.txt', 'x\n');
+    const before = state(t2).calls.length;
+    const q = tool(t2, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(q.status, 1);
+    assert.match(JSON.parse(q.out).error, /affectedGate\[0\] cannot be run/);
+    assert.equal(state(t2).calls.slice(before).some((c) => c.cmd === 'pr edit'), false, 'no landing label, no pending line');
+    assert.deepEqual(prOf(t2, 1).labels, ['queued']);
+    assert.equal(lockExists(t2), false);
   });
 
   test('head behind the base: queues even with a free lock; position counts the queue', () => {
@@ -1230,7 +1278,6 @@ describe('land-queue', () => {
     runQueue(t); // creates the lander checkout
     const dir = `${t.work}-lander`;
     // Not started by any gate: it only runs in the checkout (its cwd, and an argument inside it).
-    const { spawn } = process.getBuiltinModule('node:child_process');
     const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)', path.join(dir, 'marker')], { cwd: dir, stdio: 'ignore', detached: true });
     other.unref();
     try {
@@ -1574,6 +1621,17 @@ describe('land-queue', () => {
       assert.equal(state(t).mutateAfter.seen >= 1, true);
       check(t, rep, mainBefore);
       assert.equal(lockExists(t), false);
+    });
+  }
+
+  for (const wideSweep of [null, [], '   ', ['']]) {
+    test(`unpause keeps the pause for wideSweep ${JSON.stringify(wideSweep)} (no command that checks anything)`, () => {
+      const t = setup({ wideSweep });
+      const s = state(t); s.variables = { AGENT_LANDING_PAUSED: '1' }; saveState(t, s);
+      const r = tool(t, LAND_QUEUE, 'unpause', '--repo', 'o/r', '--json');
+      assert.equal(r.status, 1, r.err);
+      assert.equal(JSON.parse(r.out).paused, true);
+      assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
     });
   }
 

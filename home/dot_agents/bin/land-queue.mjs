@@ -42,7 +42,8 @@ import {
   appendLanding, baseTreeOf, clearQueueLabels, confirmPending, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
-  named, retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
+  named, retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepCommands, sweepDue, unmetDeps,
+  validateLandingCommands, waitForPr,
 } from './lib/land.mjs';
 
 const USAGE = 'usage: node land-queue.mjs <run|status|unpause> [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]';
@@ -342,6 +343,8 @@ async function sweepAfter(ctx, report) {
 async function runRepo(t, opts) {
   const ctx = context(t);
   const { gh } = ctx;
+  // A gate or merge command that cannot be run is a config error before any PR is touched.
+  validateLandingCommands(ctx.cfg);
   const report = {
     repo: t.repo, merged: [], bounced: [], admitted: [], aborted: [], reset: [], queued: 0, held: [], waiting: [], queueWaiting: [],
     stale: [], busy: false, paused: false, alerts: [], sweep: null,
@@ -422,7 +425,7 @@ async function unpauseRepo(t) {
   const { gh, cfg } = ctx;
   if (!gh.isPaused()) return { repo: t.repo, paused: false, sweep: null, note: 'not paused' };
   // Nothing can show the base is green without a sweep: the pause stays for the owner to clear.
-  if (!cfg.wideSweep) return { repo: t.repo, paused: true, sweep: null, note: 'no wideSweep is configured, so nothing can show the base is green; the owner clears the pause' };
+  if (!sweepCommands(cfg).length) return { repo: t.repo, paused: true, sweep: null, note: 'no wideSweep is configured, so nothing can show the base is green; the owner clears the pause' };
   let sweep = null;
   {
     // The sweep runs in the lander checkout: only while holding the landing lock.

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SKILL = path.resolve(HERE, '../../home/dot_agents/skills/exact_repo-defaults');
@@ -559,6 +559,59 @@ describe('repo-defaults apply.mjs', () => {
       if (saved === undefined) delete process.env.GIT_INDEX_FILE; else process.env.GIT_INDEX_FILE = saved;
     }
     assert.ok(fs.readFileSync(index).equals(before), 'the outer index is byte-identical');
+  });
+
+  test('inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE (an outer repo) never redirect apply; --repo is used', () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'outer repo '));
+    temps.push(outer);
+    const oe = env(outer);
+    git(outer, oe, 'init', '--quiet', outer);
+    fs.writeFileSync(path.join(outer, 'staged.txt'), 'staged\n');
+    git(outer, oe, 'add', 'staged.txt');
+    const index = path.join(outer, '.git', 'index');
+    const before = fs.readFileSync(index);
+    const r = repo();
+    const e = { ...r.e, GIT_DIR: path.join(outer, '.git'), GIT_WORK_TREE: outer, GIT_INDEX_FILE: index };
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--apply', '--offline', '--json'], { env: e, encoding: 'utf8', shell: false });
+    assert.equal(p.status, 0, p.stdout + p.stderr);
+    assert.equal(JSON.parse(p.stdout).root, fs.realpathSync(r.work));
+    assert.ok(fs.readFileSync(path.join(r.work, 'AGENTS.md'), 'utf8').startsWith(BLOCK), 'the --repo target was changed');
+    assert.equal(fs.existsSync(path.join(outer, 'AGENTS.md')), false, 'the outer repo was not');
+    assert.ok(fs.readFileSync(index).equals(before), 'the outer index is byte-identical');
+  });
+
+  test('the temp file is created exclusively: a file or link already at its path is left alone', async (t) => {
+    const { replaceVia } = await import(pathToFileURL(APPLY).href);
+    assert.equal(typeof replaceVia, 'function');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'temp guard '));
+    temps.push(dir);
+    const target = path.join(dir, 'AGENTS.md');
+    const outside = path.join(dir, 'outside.txt');
+    fs.writeFileSync(target, 'target\n');
+    fs.writeFileSync(outside, 'outside\n');
+    const planted = path.join(dir, 'AGENTS.md.planted.tmp');
+    fs.writeFileSync(planted, 'planted\n');
+    assert.throws(() => replaceVia(planted, target, 'new\n', undefined, false), /EEXIST/);
+    assert.equal(fs.readFileSync(planted, 'utf8'), 'planted\n', 'a planted file is not overwritten or removed');
+    assert.equal(fs.readFileSync(target, 'utf8'), 'target\n');
+    let link = path.join(dir, 'AGENTS.md.link.tmp');
+    try { fs.symlinkSync(outside, link, 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.diagnostic('symlink case needs Developer Mode on Windows'); link = null; } else throw e;
+    }
+    if (link) {
+      assert.throws(() => replaceVia(link, target, 'new\n', undefined, false), /EEXIST/);
+      assert.equal(fs.readFileSync(outside, 'utf8'), 'outside\n', 'nothing written through the link');
+      assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the planted link is left in place');
+    }
+  });
+
+  test('a .github/workflows that cannot be listed is reported; the apply actions still are', () => {
+    const r = repo({ '.github/workflows': 'a file, not a folder\n' });
+    const a = run(r, '--apply', '--json');
+    assert.ok(a.json, a.err);
+    assert.ok(a.json.actions.length > 0, 'actions reported');
+    assert.match(a.json.gatingWorkflowsError, /could not be listed/);
+    assert.match(run(r, '--inspect').out, /WARN {2}\.github\/workflows could not be listed/);
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

@@ -15,6 +15,7 @@
 // Processes start through the lifecycle libs deployed next to the skills (~/.agents/bin/lib, the
 // same relative path in this repo's source): shell: false, Windows .cmd shims resolved, and no
 // child ever gets OP_SERVICE_ACCOUNT_TOKEN.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,8 +27,18 @@ const BLOCK_RE = /<!-- BEGIN agent-standard v(\d+)[^>]*-->[\s\S]*?<!-- END agent
 const GITIGNORE_LINES = ['.env.local', '.env.local.pre-op'];
 const TODO = 'TODO(repo-defaults)';
 
+// The variables that point git at a particular repository (git rev-parse --local-env-vars,
+// less the config ones). Inherited from an outer git (a hook), they would make every git call
+// here act on that repository instead of --repo; other git settings are kept.
+const GIT_REPO_VARS = new Set([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR', 'GIT_IMPLICIT_WORK_TREE', 'GIT_GRAFT_FILE', 'GIT_NO_REPLACE_OBJECTS', 'GIT_REPLACE_REF_BASE',
+  'GIT_PREFIX', 'GIT_INTERNAL_SUPER_PREFIX', 'GIT_SHALLOW_FILE', 'GIT_NAMESPACE',
+]);
+
 function child(cmd, args, cwd, opts = {}) {
-  return run(cmd, args, { cwd, env: stripToken(process.env), ...opts });
+  const env = Object.fromEntries(Object.entries(stripToken(process.env)).filter(([k]) => !GIT_REPO_VARS.has(k.toUpperCase())));
+  return run(cmd, args, { cwd, env, ...opts });
 }
 
 function git(args, cwd) {
@@ -94,15 +105,22 @@ function writeFile(p, text) {
   let st = null;
   try { st = fs.statSync(target); } catch { st = null; }
   const mode = st ? st.mode & 0o777 : undefined;
-  const tmp = `${target}.repo-defaults-${process.pid}.tmp`;
+  const tmp = `${target}.repo-defaults-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`;
+  replaceVia(tmp, target, text, mode, Boolean(st && st.nlink > 1));
+}
+
+// Write `text` to the new file `tmp` (created exclusively: an existing path there, such as a
+// link a repo planted, makes this fail and is left alone), then move it over `target`: rename,
+// or (several hard links) copy over it in place, which is the one non-atomic case. Only a temp
+// file this call created is ever removed. Exported for tests.
+export function replaceVia(tmp, target, text, mode, inPlace) {
+  let created = false;
   try {
-    fs.writeFileSync(tmp, text, mode === undefined ? undefined : { mode });
-    // A file with several hard links (CLAUDE.md as a hard link to AGENTS.md) must keep its
-    // inode, so every name sees the new text: copy the finished temp file over it in place.
-    // That one case is not atomic; every other write is a rename.
-    if (st && st.nlink > 1) { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); } else fs.renameSync(tmp, target);
+    fs.writeFileSync(tmp, text, { flag: 'wx', ...(mode === undefined ? {} : { mode }) });
+    created = true;
+    if (inPlace) { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); } else fs.renameSync(tmp, target);
   } catch (e) {
-    try { fs.unlinkSync(tmp); } catch { /* never created */ }
+    if (created) { try { fs.unlinkSync(tmp); } catch { /* already moved or gone */ } }
     throw e;
   }
 }
@@ -121,9 +139,10 @@ function jsonObject(text) {
 function sameFile(a, b) {
   try {
     if (fs.realpathSync.native(a) === fs.realpathSync.native(b)) return true;
-    const sa = fs.statSync(a);
-    const sb = fs.statSync(b);
-    return sa.ino !== 0 && sa.ino === sb.ino && sa.dev === sb.dev;
+    // bigint ids: Windows file ids can exceed 2^53 and would round as numbers.
+    const sa = fs.statSync(a, { bigint: true });
+    const sb = fs.statSync(b, { bigint: true });
+    return sa.ino !== 0n && sa.ino === sb.ino && sa.dev === sb.dev;
   } catch {
     return false;
   }
@@ -418,11 +437,15 @@ function envFiles(root) {
 }
 
 // Workflows that run on pull requests or the merge queue gate PRs; release/deploy ones do not.
+// A folder that cannot be listed (a file, no permission) is reported as { error }, so it never
+// stops the report or loses the actions already applied.
 function gatingWorkflows(root) {
   const dir = path.join(root, '.github', 'workflows');
   if (!fs.existsSync(dir)) return [];
+  let names;
+  try { names = fs.readdirSync(dir); } catch (e) { return { error: `.github/workflows could not be listed (${e.code || e.message})` }; }
   const out = [];
-  for (const f of fs.readdirSync(dir).filter((x) => /\.ya?ml$/.test(x)).sort()) {
+  for (const f of names.filter((x) => /\.ya?ml$/.test(x)).sort()) {
     const text = readText(path.join(dir, f), root) || '';
     // The `on:` block runs to the next top-level key (or the end of the file).
     const on = text.match(/^(on|"on"|'on'):[^\n]*\n?(?:[ \t#][^\n]*\n?|\r?\n)*/m);
@@ -503,7 +526,8 @@ function main() {
     mode, root, standard: `agent-standard v${BLOCK_VERSION}`, actions, failed,
     items: ev.items.map(({ name, status, detail }) => ({ name, status, detail })),
     drift: drift.length, todo: ev.todo?.detail || null,
-    detection: ev.detection, env: ev.env, gatingWorkflows: ev.workflows, rulesets: ev.rulesets,
+    detection: ev.detection, env: ev.env, gatingWorkflows: Array.isArray(ev.workflows) ? ev.workflows : [],
+    gatingWorkflowsError: Array.isArray(ev.workflows) ? null : ev.workflows.error, rulesets: ev.rulesets,
   };
   if (flags.has('--json')) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   else {
@@ -521,7 +545,8 @@ function main() {
         else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);
       }
       if (ev.env.envOp?.foreignVaultRefs) L.push(`WARN  .env.op: ${ev.env.envOp.foreignVaultRefs} reference(s) outside op://agent-repos/`);
-      for (const w of ev.workflows) L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
+      for (const w of result.gatingWorkflows) L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
+      if (result.gatingWorkflowsError) L.push(`WARN  ${result.gatingWorkflowsError}: PR-gating workflows not checked`);
       for (const r of ev.rulesets.list || []) L.push(`INFO  ruleset ${r.name} (${r.enforcement}): drop required checks and merge queue in the separate PR`);
       if (ev.rulesets.skipped) L.push(`INFO  rulesets not listed: ${ev.rulesets.skipped}`);
     }
