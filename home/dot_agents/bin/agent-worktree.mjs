@@ -101,16 +101,35 @@ function ghJsonC(cfg, args, opts = {}) {
 
 // ---------------------------------------------------------------- ports and env file
 
-function portFree(port, host) {
+/** Try to bind host:port. Resolves null when it binds, else the error code. */
+function tryBind(port, host) {
   return new Promise((resolve) => {
     const srv = net.createServer();
-    srv.once('error', () => resolve(false));
-    srv.listen({ port, host, exclusive: true }, () => srv.close(() => resolve(true)));
+    srv.once('error', (e) => resolve(e.code || 'ERROR'));
+    srv.listen({ port, host, exclusive: true }, () => srv.close(() => resolve(null)));
   });
 }
 
+const PROBE_HOSTS = ['127.0.0.1', '0.0.0.0', '::1', '::'];
+// An address family this machine lacks says nothing about the port.
+const NO_FAMILY = new Set(['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EPROTONOSUPPORT']);
+
+/** Free for a new allocation: every loopback and wildcard address, IPv4 and IPv6, binds. */
 async function isPortFree(port) {
-  return (await portFree(port, '127.0.0.1')) && (await portFree(port, '0.0.0.0'));
+  for (const h of PROBE_HOSTS) {
+    const code = await tryBind(port, h);
+    if (code && !NO_FAMILY.has(code)) return false;
+  }
+  return true;
+}
+
+/** Some process holds the port (IPv4 or IPv6, loopback or wildcard). */
+async function portInUse(port) {
+  for (const h of PROBE_HOSTS) {
+    // Windows reports a port held with exclusive use as EACCES.
+    if (['EADDRINUSE', 'EACCES'].includes(await tryBind(port, h))) return true;
+  }
+  return false;
 }
 
 /** Stable ports: keep stored ones, else base + fnv1a(wtId+name) % 900, probed, unique in repo. */
@@ -231,8 +250,9 @@ function runHook(fn, dir, data, commonDir) {
   const hookFile = path.join(dir, '.agents', 'hooks.mjs');
   if (!fs.existsSync(hookFile)) return null;
   const cwd = fs.existsSync(data.worktreePath || '') && !data.worktreeGone ? data.worktreePath : data.repoRoot;
-  // The runner reports a missing function in a result file, so no exit code a hook can
-  // produce (process.exit(3) included) is mistaken for "no such hook".
+  // The runner writes "absent" (no such function) or "done" (the hook returned) to a result
+  // file: no exit code a hook can produce is mistaken for either, and a hook that exits early,
+  // even with 0, has not finished.
   const resultFile = path.join(os.tmpdir(), `agent-hook-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
   let r;
   let result = '';
@@ -245,6 +265,7 @@ function runHook(fn, dir, data, commonDir) {
   } finally { removeFile(resultFile); }
   if (result === 'absent') return null;
   if (r.status !== 0) throw new Error(`hooks.${fn} failed (exit ${r.status})`);
+  if (result !== 'done') throw new Error(`hooks.${fn} exited before it finished`);
   return 'ok';
 }
 
@@ -579,16 +600,6 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
       if (r.listFailed) { s.errors.push('process list failed: nothing stopped'); return s; }
       if (r.failed) { s.errors.push(`${plural(r.failed, 'process')} under the worktree could not be stopped`); return s; }
     }
-    // Windows does not expose a process's working directory, so a server started inside the
-    // worktree by an unrelated parent can escape the match above. Its port still shows it.
-    const busy = [];
-    for (const [name, port] of Object.entries((ledger && ledger.ports) || {})) {
-      if (Number.isInteger(port) && !(await isPortFree(port))) busy.push(`${name} ${port}`);
-    }
-    if (busy.length) {
-      s.errors.push(`${plural(busy.length, 'port')} of this worktree still in use (${busy.join(', ')}): a process may still run in it`);
-      return s;
-    }
   }
 
   try {
@@ -608,6 +619,20 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
   const fresh = (!dryRun && readLedger(ctx.commonDir, ctx.wtId)) || ledger;
   s.docker = dockerCleanup(ctx.wtId, fresh.resources || [], dryRun);
   s.errors.push(...s.docker.errors);
+
+  // Windows does not expose a process's working directory, so a server started inside the
+  // worktree by an unrelated parent can escape the process match. Its port still shows it:
+  // checked after the hook and Docker had their chance to stop it, before any file goes.
+  if (!worktreeGone && !dryRun) {
+    const busy = [];
+    for (const [name, port] of Object.entries((ledger && ledger.ports) || {})) {
+      if (Number.isInteger(port) && await portInUse(port)) busy.push(`${name} ${port}`);
+    }
+    if (busy.length) {
+      s.errors.push(`${plural(busy.length, 'port')} of this worktree still in use (${busy.join(', ')}): a process may still run in it`);
+      return s;
+    }
+  }
 
   for (const r of fresh.resources || []) {
     if (!isPathKind(r.kind) || r.where !== 'local') continue;
@@ -905,7 +930,8 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
       const lock = dryRun ? () => {} : tryLock(path.join(ledgerDir(id.commonDir), `${wtId}.teardown.lock`));
       if (!lock) { r.kept.push(`${name}: teardown running`); continue; }
       try {
-        const ledger = readLedger(id.commonDir, wtId) || { resources: [], ports: {} };
+        let ledger;
+        try { ledger = readLedger(id.commonDir, wtId) || { resources: [], ports: {} }; } catch (e) { r.errors.push(`${name}: ${e.message}`); continue; }
         const s = await cleanup(ctx, ledger, a.pr, { dryRun, worktreeGone: false });
         if (s.errors.length) {
           r.errors.push(`${name}: ${s.errors.join('; ')}`);
@@ -927,10 +953,14 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
   if (index && worktrees) {
     const checkedOut = new Set(worktrees.map((w) => w.branch).filter(Boolean));
     // A ledger that is not finished still needs its branch to prove, later, that it was pushed.
-    const pending = new Set(listLedgers(id.commonDir)
+    // An unreadable ledger may need any branch, so then no branch is deleted.
+    const ledgers = listLedgers(id.commonDir);
+    const unreadable = ledgers.some((l) => l.error);
+    const pending = new Set(ledgers
       .filter(({ wtId, data: d }) => d && d.state !== 'torn-down' && d.branch && !finished.has(wtId))
       .map(({ data: d }) => d.branch));
-    const refs = (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
+    const refs = unreadable ? [] : (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
+    if (unreadable) r.kept.push('branches: not swept while a ledger is unreadable');
     for (const line of refs) {
       const [branch, tip] = line.split(' ');
       if (branch === base || branch === 'agent-landing-lock' || checkedOut.has(branch)) continue;

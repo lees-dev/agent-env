@@ -148,6 +148,10 @@ describe('put', () => {
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /holds a passkey/);
     assert.ok(!s.calls('op').some((c) => c.args[1] === 'edit'));
+    // The word alone (in a title or notes) is not a passkey.
+    s.writeState((st) => { st.op.items.push({ id: 'i7', vault: 'agent-repos', title: 'demo-passkey-dev', notesPlain: 'passkey login service', fields: [] }); });
+    const ok = secret(s, ['put', 'demo-passkey-dev', 'TOKEN'], repo.wt, 'v', T);
+    assert.equal(ok.status, 0, ok.out);
   });
 
   test('stores in agent-repos even when repo.json names another vault', () => {

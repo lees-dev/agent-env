@@ -403,7 +403,10 @@ describe('teardown', () => {
   });
 
   test('a worktree port still in use keeps the worktree', async () => {
-    const { s, repo } = fixture({ config: { ports: { PORT: 41000 } } });
+    const { s, repo } = fixture({
+      config: { ports: { PORT: 41000 } },
+      files: { '.agents/hooks.mjs': 'import fs from "node:fs";\nexport function teardown(ctx) { fs.writeFileSync(ctx.worktreePath + "/hook-ran.txt", "x"); }\n' },
+    });
     assert.equal(engine(s, ['setup'], repo.wt).status, 0);
     merged(s, repo);
     const port = ledgerOf(repo).ports.PORT;
@@ -413,17 +416,35 @@ describe('teardown', () => {
       const r = engine(s, ['teardown'], repo.wt);
       assert.equal(r.status, 1, r.out);
       assert.match(r.stderr, new RegExp(`1 port of this worktree still in use \\(PORT ${port}\\)`));
-      assert.equal(s.readState().docker.containers.length, 2);
+      assert.ok(fs.existsSync(path.join(repo.wt, 'hook-ran.txt')), 'the teardown hook ran before the port check');
+      assert.equal(ledgerOf(repo).state, 'kept');
     } finally { await new Promise((resolve) => srv.close(resolve)); }
   });
 
-  test('a hook that exits 3 is a failure, not a missing hook', () => {
-    const { s, repo } = fixture({ files: { '.agents/hooks.mjs': 'export function teardown() { process.exit(3); }\n' } });
+  test('a server on IPv6 loopback also keeps the worktree', async () => {
+    const { s, repo } = fixture({ config: { ports: { PORT: 42000 } } });
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
     merged(s, repo);
-    const r = engine(s, ['teardown'], repo.wt);
-    assert.equal(r.status, 1, r.out);
-    assert.match(r.stderr, /hooks\.teardown failed \(exit 3\)/);
-    assert.equal(ledgerOf(repo).state, 'kept');
+    const port = ledgerOf(repo).ports.PORT;
+    const srv = net.createServer();
+    const ok = await new Promise((resolve) => { srv.once('error', () => resolve(false)); srv.listen(port, '::1', () => resolve(true)); });
+    if (!ok) return; // no IPv6 on this machine
+    try {
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 1, r.out);
+      assert.match(r.stderr, /still in use/);
+    } finally { await new Promise((resolve) => srv.close(resolve)); }
+  });
+
+  test('a hook that exits 3, or exits 0 before it finishes, is a failure', () => {
+    for (const code of [3, 0]) {
+      const { s, repo } = fixture({ files: { '.agents/hooks.mjs': `export async function teardown() { process.exit(${code}); }\n` } });
+      merged(s, repo);
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 1, r.out);
+      assert.match(r.stderr, code ? /hooks\.teardown failed \(exit 3\)/ : /hooks\.teardown exited before it finished/);
+      assert.equal(ledgerOf(repo).state, 'kept');
+    }
   });
 
   test('an unreadable ledger is never replaced', () => {
@@ -435,8 +456,13 @@ describe('teardown', () => {
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /not valid JSON/);
     assert.equal(fs.readFileSync(f, 'utf8'), '{ not json');
+    // A merged, pushed branch would normally go; an unreadable ledger may need it.
+    gitIn(s, repo.main, 'branch', 'agent/LEE-7-done');
+    s.writeState((st) => { st.gh.prs.push(pr({ number: 9, headRefName: 'agent/LEE-7-done', headRefOid: gitIn(s, repo.main, 'rev-parse', 'HEAD') })); });
     const sw = engine(s, ['sweep'], repo.main);
     assert.equal(sw.status, 1, sw.out);
+    assert.match(sw.stdout, /not swept while a ledger is unreadable/);
+    assert.notEqual(gitIn(s, repo.main, 'branch', '--list', 'agent/LEE-7-done'), '');
     assert.equal(fs.readFileSync(f, 'utf8'), '{ not json');
   });
 

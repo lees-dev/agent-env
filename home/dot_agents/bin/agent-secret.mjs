@@ -144,6 +144,14 @@ function getItem(vault, item) {
   throw new Error(`op item get failed (exit ${r.status}): ${firstLine(r.stderr)}`);
 }
 
+/** Passkey metadata on an item (a passkeys list, or a field or section typed as one). */
+function hasPasskey(item) {
+  if (!item) return false;
+  if (Array.isArray(item.passkeys) ? item.passkeys.length : item.passkey) return true;
+  const typed = (x) => x && /passkey/i.test(String(x.type || x.purpose || ''));
+  return (item.fields || []).some(typed) || (item.sections || []).some(typed);
+}
+
 function isOurs(field) {
   return Boolean(field && field.section && (field.section.id === SECTION || field.section.label === SECTION));
 }
@@ -208,7 +216,7 @@ function storeItem(vault, title, fields, o) {
     return { refused: [], written: fields.map((f) => f.name), created: true };
   }
   // A JSON-template edit overwrites passkeys (1Password docs): never edit such an item.
-  if (/passkey/i.test(JSON.stringify(got.item))) throw new Error(`${title} holds a passkey; edit it in the 1Password app instead`);
+  if (hasPasskey(got.item)) throw new Error(`${title} holds a passkey; edit it in the 1Password app instead`);
   const merged = mergeFields(got.item, fields, o);
   if (!merged.changed) return { refused: merged.refused, written: [] };
   const id = got.item.id || title;
