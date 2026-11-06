@@ -42,7 +42,7 @@ import {
   appendLanding, baseTreeOf, clearQueueLabels, confirmPending, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
-  named, retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepCommands, sweepDue, unmetDeps,
+  named, resolveRepo, retainedLockMessage, runCommands, runStep, runSweep, scrub, setLabels, sweepCommands, sweepDue, unmetDeps,
   validateLandingCommands, waitForPr,
 } from './lib/land.mjs';
 
@@ -204,10 +204,15 @@ async function landOne(ctx, pr) {
     const mergeCount = merges.stdout.split(/\r?\n/).filter(Boolean).length;
     if (mergeCount) return bounceOwned(ctx, pr, `the branch has ${mergeCount} merge commit(s), which an automatic rebase would drop; rebase it onto ${base} by hand, then re-gate and re-review`);
     resetTo(dir, head);
-    // Repo hooks (pre-rebase, post-rewrite) run here: without the token, like every child.
-    const rb = git(['-c', 'rebase.autoSquash=false', '-c', 'rebase.updateRefs=false', 'rebase', '--no-autostash', newBase], {
-      cwd: dir, env: childEnv({ GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' }),
+    // Repo hooks (pre-rebase, post-rewrite) run here: without the token, like every child, as a
+    // landing step (lock refreshed, command timeout).
+    const rb = await runStep(['git', '-c', 'rebase.autoSquash=false', '-c', 'rebase.updateRefs=false', 'rebase', '--no-autostash', newBase], {
+      cwd: dir, env: childEnv({ GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' }), lock, cfg, label: `the rebase onto ${base}`,
     });
+    // Lost: the checkout may be another lander's. Stuck: a hook may still run in it (the lock is
+    // kept). Either way nothing is aborted, reset or relabelled here.
+    if (rb.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the rebase', lost: true }, 'the push', lock);
+    if (rb.stuck) return { aborted: { pr: pr.number, reason: `the rebase onto ${base} timed out; the landing lock is kept and the checkout left as it is` }, stop: true };
     if (rb.status !== 0) {
       const files = git(['diff', '--name-only', '--diff-filter=U'], { cwd: dir }).stdout.split(/\r?\n/).filter(Boolean);
       git(['rebase', '--abort'], { cwd: dir });
@@ -256,7 +261,14 @@ async function landOne(ctx, pr) {
     const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started)`);
     gh.prEdit(pr.number, { body: pendingBody });
     pr.body = pendingBody;
-    const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
+    // The push runs the repo's pre-push hook: a landing step (lock refreshed, command timeout).
+    const push = await runStep(['git', 'push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], {
+      cwd: dir, env: childEnv(), lock, cfg, label: 'the push of the rebased head',
+    });
+    // Lost or stuck: the push may still complete, and the pending line already names its head
+    // for the next lander. Nothing is reset or relabelled; a stuck push keeps the lock.
+    if (push.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the push', lost: true }, 'the merge', lock);
+    if (push.stuck) return { aborted: { pr: pr.number, reason: 'the push of the rebased head timed out (it may still complete); the landing lock is kept and the checkout left as it is' }, stop: true };
     resetOwned();
     if (push.status !== 0) return bounceOwned(ctx, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`);
     // The pending line already names the pushed head: after a loss it is left for the next lander.
@@ -278,7 +290,11 @@ async function landOne(ctx, pr) {
   if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
   const last = recheck(gh, pr, want, landSha, lock);
   if (last) return abort(gh, pr, last, 'the merge', lock);
-  const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root, lock });
+  const m = await mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root, lock });
+  // Lost: nothing more is changed. Stuck: the merge may still happen, so no bounce; the lock is
+  // kept and `landing` stays for the next lander's recovery.
+  if (m.lost) return abort(gh, pr, { requeue: m.summary, lost: true }, 'the merge', lock);
+  if (m.stuck) return { aborted: { pr: pr.number, reason: m.summary }, stop: true };
   if (!m.ok) return bounceOwned(ctx, pr, `merge failed (${m.summary})`);
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
 }
@@ -311,7 +327,7 @@ function admitWaiting(ctx, report) {
 // ---------------------------------------------------------------- per repo
 
 function target(root, slug) {
-  const repo = slug || slugFromRemote(root);
+  const repo = resolveRepo(root, slug);
   if (!repo) throw new LandError(`cannot tell the GitHub repo of ${root}; pass --repo owner/name`, 2);
   return { root, repo };
 }

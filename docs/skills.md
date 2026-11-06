@@ -107,7 +107,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `herdr` | identical in both | 1 | `ec8f944a509de0497642390a564f27d23974efb874c28194d54ebb80ee48e9ab` |
 | `how` | identical in both | 3 | `c0681d3cc32d4164739a917c266b2dd5573d32037b8aba95a0b708e06664078b` |
 | `kun` | identical in both | 1 | `c5cafaca2a3c140002f140e96af2a2eb77423fe7d89251bef59e2b5577833892` |
-| `land-queue` | written here (2026-11-06) | 1 | `23b452a075e97f7f5e9d518cfa4da0de59152725d785a8963e6f70ae51eeaa11` |
+| `land-queue` | written here (2026-11-06) | 1 | `3f028e12220891c1b09fa08c3aea03f940da59c6e62238af5ff34bbbcddce498` |
 | `leaving-pr-comments` | identical in both | 2 | `247ef56da1e550f14cc3b87cab818378f714c461fb42aa4ea441def39e03e661` |
 | `maintain-verification-skill` | identical in both | 1 | `367c331254656433db735dd0f14ba8cbe4edec2f0f7ad84a899908471f5eac13` |
 | `modernize` | identical in both | 2 | `8b49a15ce260749a1fd237bf775a07b507114b1fedc2dd26ecacbeac164f1b62` |
@@ -122,7 +122,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `principle-subtract-before-you-add` | identical in both | 1 | `91cf90d82d8aeca82c237753b2022b0ca836cdb20d1b200a5b80d5ce4aef185a` |
 | `principle-type-system-discipline` | identical in both | 1 | `6a3a9db88195d3863d0a4ead13b68d5f6d996d142cdd1d04c20f9ee0c6922c1d` |
 | `react-best-practices` | identical in both | 49 | `81afad38880a4b945e92056485b04a3a75082818bb62094bbdc5329c8d82b7c1` |
-| `repo-defaults` | written here (2026-11-06) | 7 | `06a6742f1671be2a93766289dc2f7e26976119497a308d553c318892c9169a2e` |
+| `repo-defaults` | written here (2026-11-06) | 7 | `2dba3c454f145de03fe33b4426a3d7a6d9ccef745179c3bfdeb419c5ada64118` |
 | `sol-loop` | identical in both | 1 | `65db87ad81f27476d487a3c31d7e117f473e383edf8bdfb7360ae7119331631c` |
 | `subagent-routing` | `~/.claude/skills` (2026-11-05) | 2 | `5d300353b82bb5698bd3a0c647b562bdeaa03fd3abb218780e3faf64a0b1b382` |
 | `takeover` | identical in both | 1 | `87987a701b4669b52401bd0940a99a9c2dbcd250ccb3b0da434c391dd50de216` |

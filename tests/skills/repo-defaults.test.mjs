@@ -905,6 +905,19 @@ describe('repo-defaults apply.mjs', () => {
     assert.ok(fs.lstatSync(path.join(r.work, '.gitignore')).isSymbolicLink());
   });
 
+  test('env report: a tracked root env file deleted from the checkout is still listed (no values)', () => {
+    const r = repo({ '.env': 'ROOT_KEY=plainvalue\n', '.env.op': 'ROOT_KEY=op://agent-repos/x/ROOT_KEY\n' });
+    fs.rmSync(path.join(r.work, '.env'));
+    fs.rmSync(path.join(r.work, '.env.op'));
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+    const files = JSON.parse(p.stdout).env.files;
+    assert.deepEqual(files.find((f) => f.file === '.env'), { file: '.env', keys: 0, tracked: true, role: 'source', missing: true });
+    assert.equal(files.find((f) => f.file === '.env.op'), undefined, '.env.op is not an env file to rotate');
+    const txt = run(r, '--inspect').out;
+    assert.match(txt, /WARN {2}\.env: tracked in git but not in the checkout/);
+    assert.doesNotMatch(p.stdout + txt, /plainvalue/);
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

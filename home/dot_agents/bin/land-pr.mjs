@@ -53,7 +53,7 @@ import {
   Gh, LandError, LandingLock,
   addHold, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
   holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
-  parseLanding, pollMs, print, removeHold, repoTop, retainedLockMessage, setLabels, slugFromRemote, unmetDeps,
+  parseLanding, pollMs, print, removeHold, repoTop, resolveRepo, retainedLockMessage, setLabels, unmetDeps,
   validateLandingCommands, writeLanding,
 } from './lib/land.mjs';
 import { sleepMs } from './lib/proc.mjs';
@@ -120,7 +120,7 @@ function othersInLine(gh, n) {
 function hold(args, n) {
   const holder = holderId(args.holder);
   const root = repoTop();
-  const repo = args.repo || slugFromRemote(root);
+  const repo = resolveRepo(root, args.repo);
   if (!repo) throw new LandError('cannot tell the GitHub repo from origin; pass --repo owner/name', 2);
   const gh = new Gh({ repo });
   const out = (o, code) => { if (args.json) print(o, true); else print(o.line, false); return code; };
@@ -195,7 +195,7 @@ async function main() {
 
   const root = repoTop();
   const cfg = loadRepoConfig(root);
-  const repo = args.repo || slugFromRemote(root);
+  const repo = resolveRepo(root, args.repo);
   if (!repo) throw new LandError('cannot tell the GitHub repo from origin; pass --repo owner/name', 2);
   const gh = new Gh({ repo });
   const out = (o, code) => { if (args.json) print(o, true); else print(o.line, false); return code; };
@@ -370,8 +370,8 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
       line = othersInLine(gh, n);
       if (line.count === 0) {
         if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
-        const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root, lock });
-        if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);
+        const m = await mergePinned(gh, cfg, { pr: n, sha, cwd: root, lock });
+        if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.summary}`);
         // The merge stands even if its count cannot be recorded (the next sweep may run late).
         try { bumpMergeCount(repo); } catch (e) { process.stderr.write(`warning: the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late\n`); }
         // A wide sweep that is due runs now, still under the lock.

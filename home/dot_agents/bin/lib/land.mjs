@@ -3,14 +3,14 @@
 // JSON state files come from the lifecycle libs (proc, repo, ledger, op); this file holds only
 // what is about landing. No child but op ever sees the 1Password service-account token, and
 // none is started here. Output is counts, PR numbers, SHAs and labels; never a secret value.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
 import { captureToken, homeDir, stripToken } from './op.mjs';
 import { bornAfter, listProcesses, stopProcesses } from './processes.mjs';
-import { isWindows, prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
+import { isWindows, prepare, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
 import { baseBranch, canonKey, gitIdentity, loadConfig } from './repo.mjs';
 
 // Entry points call this first: OP_SERVICE_ACCOUNT_TOKEN leaves process.env, so no child (git
@@ -75,11 +75,57 @@ export function childEnv(extra = {}) {
   return { ...stripToken(process.env), ...extra };
 }
 
-// Run [cmd, ...args] synchronously (shell: false; stdin is `input`, else ignored).
-export function run(argv, { cwd, env = childEnv(), input } = {}) {
-  const r = procRun(argv[0], argv.slice(1), { cwd, env, input });
-  const stderr = r.stderr || (r.error ? String(r.error.message || r.error) : '');
-  return { status: r.status, stdout: r.stdout, stderr };
+// Time bounds for one synchronous call, from the landing lock's ttl (set by LandingLock), so no
+// single call can outlast the lock it runs under: gh and local git calls a sixth of the ttl (at
+// most 2 min, AGENT_LAND_IO_TIMEOUT_MS), git network calls a third (at most 10 min,
+// AGENT_LAND_NET_TIMEOUT_MS). The lock refreshes every third of its ttl while a repo command
+// runs, so a call at its bound still ends well inside the ttl.
+let budgetTtlMin = 45;
+export function setLockTtl(min) { budgetTtlMin = Math.max(1, Number(min) || 45); }
+function boundMs(envName, cap, share) {
+  const v = Number(process.env[envName]);
+  return Math.min(Number.isFinite(v) && v > 0 ? v : cap, Math.floor((budgetTtlMin * 60000) / share));
+}
+export const ioTimeoutMs = () => boundMs('AGENT_LAND_IO_TIMEOUT_MS', 120000, 6);
+export const netTimeoutMs = () => boundMs('AGENT_LAND_NET_TIMEOUT_MS', 600000, 3);
+
+// The lock this process holds, if any: a git network call that times out while it is held may
+// leave a transfer running, so the lock is kept (never released over it).
+let heldLock = null;
+
+// Run [cmd, ...args] synchronously (shell: false; stdin is `input`, else ignored), bounded by
+// timeoutMs. Output goes to temp files, not pipes: a process the command started that keeps its
+// output open cannot hold this call past the bound (with pipes, spawnSync waits for every
+// holder). At the bound the command itself is killed: { status: 124, timedOut: true }; anything
+// it started may survive, which the caller treats as unknown.
+export function run(argv, { cwd, env = childEnv(), input, timeoutMs = ioTimeoutMs() } = {}) {
+  let prepared;
+  try { prepared = prepare(argv[0], argv.slice(1), { cwd, env }); } catch (e) {
+    return { status: 127, stdout: '', stderr: String(e?.message || e), timedOut: false };
+  }
+  const [file, args, options] = prepared;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'land-io-'));
+  const outFile = path.join(dir, 'out');
+  const errFile = path.join(dir, 'err');
+  const fo = fs.openSync(outFile, 'w');
+  const fe = fs.openSync(errFile, 'w');
+  let r;
+  try {
+    r = spawnSync(file, args, { ...options, input, stdio: [input === undefined ? 'ignore' : 'pipe', fo, fe], timeout: timeoutMs, killSignal: 'SIGKILL' });
+  } finally {
+    fs.closeSync(fo);
+    fs.closeSync(fe);
+  }
+  const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
+  const stdout = read(outFile);
+  const stderr = read(errFile);
+  // A surviving process may still hold the files (Windows): left for the temp folder cleanup.
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* still in use */ }
+  if (r.error?.code === 'ETIMEDOUT') {
+    return { status: 124, stdout: '', stderr: `${path.basename(String(argv[0]))} ${argv[1] || ''} timed out after ${Math.round(timeoutMs / 1000)} s`, timedOut: true };
+  }
+  const status = r.status === null ? (r.error ? 127 : 128) : r.status;
+  return { status, stdout, stderr: stderr || (r.error ? String(r.error.message || r.error) : ''), timedOut: false };
 }
 
 // Run a repo command asynchronously. Its output is discarded, never kept: gate output can hold
@@ -236,8 +282,14 @@ export function scrub(text) {
 // ---------------------------------------------------------------- git
 
 // git runs without the token too: a rebase or checkout in the lander checkout runs repo hooks.
+const NETWORK_GIT = new Set(['fetch', 'ls-remote', 'push']);
 export function git(args, opts = {}) {
-  return run(['git', ...args], opts);
+  // The subcommand: the first word that is not an option or a `-c` value.
+  const sub = args.find((a, i) => !String(a).startsWith('-') && args[i - 1] !== '-c');
+  const net = NETWORK_GIT.has(sub);
+  const r = run(['git', ...args], net && opts.timeoutMs === undefined ? { ...opts, timeoutMs: netTimeoutMs() } : opts);
+  if (net && r.timedOut && heldLock?.commit) heldLock.keep(`git ${sub} timed out, and a transfer it started may still run`);
+  return r;
 }
 
 export function gitOk(args, opts = {}) {
@@ -278,6 +330,18 @@ export function slugFromRemote(cwd) {
   if (r.status !== 0) return null;
   const m = r.stdout.trim().match(/github\.com[:/]+([^/\s]+)\/([^/\s]+?)(\.git)?\/?$/i);
   return m ? `${m[1]}/${m[2]}` : null;
+}
+
+// The repo the tools act on (--repo, else origin's). The landing lock is created there through
+// the API but released with `git push origin`, so --repo must be origin's own repo: a different
+// one is refused before anything is read or changed. An origin that names no GitHub repo (a
+// local path, a mirror) cannot be checked, so --repo is taken as given there.
+export function resolveRepo(root, explicit) {
+  const origin = slugFromRemote(root);
+  if (explicit && origin && origin.toLowerCase() !== String(explicit).toLowerCase()) {
+    throw new LandError(`--repo ${explicit} is not origin's repo (${origin}): the landing lock is released through origin, so run from a checkout of ${explicit}`, 2);
+  }
+  return explicit || origin;
 }
 
 // range-diff status lines: "1:  abc1234 = 1:  def5678 subject". Anything but "=" is a change.
@@ -464,6 +528,10 @@ export function isStale(info, ttlDefault, now = Date.now()) {
 // one step, so a lock someone else took over is never removed.
 export class LandingLock {
   constructor(gh, { ttlMin, cwd }) {
+    // Every synchronous call made while it may be held is bounded inside its ttl.
+    setLockTtl(ttlMin);
+    // The lock is created in gh.repo and released through cwd's origin: they must agree.
+    resolveRepo(cwd, gh.repo);
     this.gh = gh;
     this.ttlMin = ttlMin;
     this.cwd = cwd;
@@ -489,7 +557,7 @@ export class LandingLock {
     for (let attempt = 1; ; attempt++) {
       const sha = this.makeCommit(baseTree, baseSha);
       const r = this.gh.api('POST', this.route('refs'), { fields: { ref: `refs/heads/${LOCK_REF}`, sha } });
-      if (r.ok) { this.commit = sha; return { held: true }; }
+      if (r.ok) { this.commit = sha; heldLock = this; return { held: true }; }
       if (r.status !== 422) throw new LandError(`could not create the lock ref (HTTP ${r.status})`);
       const holder = this.read();
       if (holder) return { held: false, holder, stale: isStale(holder, this.ttlMin) };
@@ -519,6 +587,7 @@ export class LandingLock {
     const r = this.gh.api('PATCH', this.route(`refs/heads/${LOCK_REF}`), { fields: { sha: next }, typed: { force: 'false' } });
     if (!r.ok) return false;
     this.commit = next;
+    heldLock = this;
     return true;
   }
 
@@ -557,6 +626,7 @@ export class LandingLock {
     if (!this.commit) return true;
     const mine = this.commit;
     this.commit = null;
+    if (heldLock === this) heldLock = null;
     this.retained = null;
     if (this.keepReason) {
       this.retained = { sha: mine, reason: `kept on purpose: ${this.keepReason}` };
@@ -786,29 +856,29 @@ export function mergeArgv(cfg, { pr, sha, repo }) {
 }
 
 // Runs from `cwd` (the repo's checkout), so a repo-relative mergeCmd or ghWrapper works from
-// wherever the tool was started (land-queue --all).
-export function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
-  // `message` (the command's first output line, scrubbed) is for the local caller only; `summary`
-  // has no command output and is what may go into a PR comment.
-  const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env, cwd });
+// wherever the tool was started (land-queue --all). The merge command (gh, or the repo's
+// mergeCmd / ghWrapper) runs as a landing step: lock ticks, the command timeout, output
+// discarded. `summary` has no command output. { ok, mergeSha } or { ok: false, summary, lost?,
+// stuck? }; stuck: it timed out (the lock is kept), lost: the lock went during it.
+export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
+  const r = await runStep(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { cwd, env: gh.env, lock, cfg, label: `the merge command for #${pr}` });
   let after;
-  if (r.status !== 0) {
-    // A wrapper can merge and still exit non-zero (a failing step after the merge): a fresh read
-    // that shows MERGED is a merge, cleaned up and counted. Anything else (or a failed read) stays
-    // a failure; an unconfirmed or pending merge is never treated as merged.
+  if (r.status === 0 && !r.lost && !r.stuck) after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
+  else {
+    // A wrapper can merge and still fail, time out or lose the lock: a fresh read that shows
+    // MERGED is a merge, counted. Anything else (or a failed read) is not; an unconfirmed or
+    // pending merge is never treated as merged.
     try { after = gh.prView(pr); } catch { after = null; }
-    if (after?.state !== 'MERGED') return { ok: false, message: firstLine(r.stderr || r.stdout), summary: `merge command exit ${r.status}` };
-  } else {
-    after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
   }
-  if (after.state !== 'MERGED') {
-    const s = `PR state is ${after.state} after the merge command`;
-    return { ok: false, message: s, summary: s };
+  if (after?.state === 'MERGED') {
+    // Labels are cleared only while the lock is still ours (the next lander clears a leftover).
+    if (!r.lost && (!lock || lock.stillHeld())) clearQueueLabels(gh, after);
+    return { ok: true, mergeSha: after.mergeCommit?.oid || null };
   }
-  // The merge and its read-back take time: labels are cleared only while the lock is still ours
-  // (a leftover label on a merged PR is cleared by the next lander).
-  if (!lock || lock.stillHeld()) clearQueueLabels(gh, after);
-  return { ok: true, mergeSha: after.mergeCommit?.oid || null };
+  if (r.lost) return { ok: false, lost: true, summary: 'the landing lock was lost during the merge command' };
+  if (r.stuck) return { ok: false, stuck: true, summary: `the merge command timed out (PR state ${after?.state || 'unknown'}); the landing lock is kept` };
+  if (r.status !== 0) return { ok: false, summary: `merge command exit ${r.status}` };
+  return { ok: false, summary: `PR state is ${after?.state || 'unknown'} after the merge command` };
 }
 
 // After a merge no queue label stays behind (best effort): the engine's teardown and the
@@ -891,6 +961,24 @@ function verifyLander(dir, mainRoot, mainCommon) {
 export function resetTo(dir, ref) {
   gitOk(['checkout', '--quiet', '--detach', '--force', ref], { cwd: dir });
   gitOk(['clean', '-fdq'], { cwd: dir });
+}
+
+// One landing step that may run repo code (a rebase's hooks, a push's pre-push hook, a merge
+// wrapper): through runAsync, with the lock refreshed and the command timeout, output discarded.
+// { status } or { status, lost } (the lock went: the caller changes nothing more) or
+// { status, stuck } (timed out or stopped: something it started may still run, so the lock is
+// kept and the checkout is not reset).
+export async function runStep(argv, { cwd, env = childEnv(), lock = null, cfg, label }) {
+  let lost = false;
+  const onTick = () => { if (lock && !lock.refresh()) { lost = true; return false; } return true; };
+  const r = await runAsync(argv, { cwd, env, tickMs: lock ? tickMs(cfg?.lockTtlMin) : 0, onTick, timeoutMs: commandTimeoutMs(cfg) });
+  if (!lost && lock && !lock.stillHeld()) lost = true;
+  if (lost) return { status: r.status, lost: true, stuck: Boolean(r.stuck) };
+  if (r.stuck) {
+    if (lock) lock.keep(`${label} timed out after ${Math.round(commandTimeoutMs(cfg) / 60000) || '<1'} min; a process it started may still run`);
+    return { status: r.status, stuck: true };
+  }
+  return { status: r.status };
 }
 
 // Repo commands (setup, gates, sweeps) never see the 1Password service-account token.

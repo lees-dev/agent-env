@@ -183,6 +183,10 @@ function api(rest) {
   const o = opts(rest);
   const method = o.method || 'GET';
   const route = o._[0];
+  // Test hook: a lock refresh (PATCH of the lock ref) that hangs for a minute.
+  if (process.env.FAKE_GH_HANG_LOCK_PATCH === '1' && method === 'PATCH' && /refs\/heads\/agent-landing-lock$/.test(route)) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+  }
   const v = route.match(/^repos\/[^/]+\/[^/]+\/actions\/variables(?:\/([A-Z0-9_]+))?$/);
   if (v) {
     const s = load();

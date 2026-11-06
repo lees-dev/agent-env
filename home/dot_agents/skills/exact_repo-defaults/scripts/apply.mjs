@@ -508,6 +508,16 @@ function envFiles(root) {
     const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
     out.push({ file: f, keys, tracked: tracked(f), role: envRole(f) });
   }
+  // A tracked root env file deleted from the checkout is still in git history: listed too.
+  const rootTracked = git(['ls-files', '-z', '--', '.env', '.env.*'], root);
+  if (rootTracked.ok) {
+    for (const f of rootTracked.out.split('\0').filter(Boolean)) {
+      if (f.includes('/') || !/^\.env(\..+)?$/.test(f) || f === '.env.op' || out.some((e) => e.file === f)) continue;
+      let present = true;
+      try { fs.lstatSync(path.join(root, f)); } catch { present = false; }
+      if (!present) out.push({ file: f, keys: 0, tracked: true, role: envRole(f), missing: true });
+    }
+  }
   // Tracked env files below the root are exposed in git history too: listed for rotation.
   // Only what git tracks (no walk of the tree, untracked files or caches), read through the same
   // containment checks; key counts only, never values.

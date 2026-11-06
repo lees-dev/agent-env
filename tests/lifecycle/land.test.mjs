@@ -12,8 +12,8 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  appendLanding, isStale, lockMessage, orderQueue, parseHolds, parseLanding, parseLockMessage, rangeDiffChanges,
-  registeredRepos, scrub, splitArgv, writeLanding,
+  appendLanding, git as landGit, ioTimeoutMs, isStale, lockMessage, netTimeoutMs, orderQueue, parseHolds, parseLanding,
+  parseLockMessage, rangeDiffChanges, registeredRepos, scrub, setLockTtl, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -228,6 +228,60 @@ function runQueue(t, ...extra) {
 // ------------------------------------------------------------------------- unit
 
 describe('lib/land.mjs', () => {
+  test('call bounds stay inside the lock ttl: a sixth for gh and local git, a third for git network calls', () => {
+    const saved = { io: process.env.AGENT_LAND_IO_TIMEOUT_MS, net: process.env.AGENT_LAND_NET_TIMEOUT_MS };
+    try {
+      delete process.env.AGENT_LAND_IO_TIMEOUT_MS;
+      delete process.env.AGENT_LAND_NET_TIMEOUT_MS;
+      setLockTtl(1);
+      assert.equal(ioTimeoutMs(), 10000);
+      assert.equal(netTimeoutMs(), 20000);
+      process.env.AGENT_LAND_IO_TIMEOUT_MS = '999999';
+      process.env.AGENT_LAND_NET_TIMEOUT_MS = '999999';
+      assert.equal(ioTimeoutMs(), 10000, 'an override never exceeds the ttl share');
+      assert.equal(netTimeoutMs(), 20000);
+      delete process.env.AGENT_LAND_IO_TIMEOUT_MS;
+      delete process.env.AGENT_LAND_NET_TIMEOUT_MS;
+      setLockTtl(45);
+      assert.equal(ioTimeoutMs(), 120000);
+      assert.equal(netTimeoutMs(), 600000);
+    } finally {
+      setLockTtl(45);
+      for (const [k, v] of [['AGENT_LAND_IO_TIMEOUT_MS', saved.io], ['AGENT_LAND_NET_TIMEOUT_MS', saved.net]]) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
+  // A transport that never answers (a remote helper that sleeps, holding git's pipes): fetch and
+  // ls-remote return at the network bound with a timeout, not when the transfer ends.
+  test('git fetch and ls-remote over a hanging transport return at the bound', { timeout: 120000 }, () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land hang '));
+    temps.push(tmp);
+    const bin = path.join(tmp, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'git-remote-hang'), '#!/bin/sh\nsleep 60\n');
+    fs.chmodSync(path.join(bin, 'git-remote-hang'), 0o755);
+    const repo = path.join(tmp, 'repo');
+    spawnSync('git', ['init', '--quiet', repo]);
+    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'hang::nowhere']);
+    const pk = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const env = { ...process.env, [pk]: `${bin}${path.delimiter}${process.env[pk]}` };
+    const saved = process.env.AGENT_LAND_NET_TIMEOUT_MS;
+    process.env.AGENT_LAND_NET_TIMEOUT_MS = '3000';
+    try {
+      for (const args of [['fetch', '--quiet', 'origin'], ['ls-remote', '--heads', 'origin']]) {
+        const started = Date.now();
+        const r = landGit(args, { cwd: repo, env });
+        assert.equal(r.timedOut, true, `${args[0]}: ${r.status} ${r.stderr}`);
+        assert.equal(r.status, 124);
+        assert.ok(Date.now() - started < 30000, `${args[0]} returned at the bound`);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.AGENT_LAND_NET_TIMEOUT_MS; else process.env.AGENT_LAND_NET_TIMEOUT_MS = saved;
+    }
+  });
+
   test('splitArgv keeps Windows paths and quoted words', () => {
     assert.deepEqual(splitArgv('node "C:\\Program Files\\x\\y.mjs" --a b'), ['node', 'C:\\Program Files\\x\\y.mjs', '--a', 'b']);
     assert.deepEqual(splitArgv("npm run 'gate:all'"), ['npm', 'run', 'gate:all']);
@@ -1204,6 +1258,105 @@ describe('land-queue', () => {
     let alive = true;
     try { process.kill(child, 0); } catch { alive = false; }
     assert.equal(alive, false, 'the gate\'s child process was stopped');
+  });
+
+  // ---- landing steps that run repo code (hooks, merge wrappers) are bounded and refresh the lock
+
+  // A pre-push hook in the shared hooks folder that runs only while <tmp>/push-hook-flag exists.
+  const pushHook = (t, body) => {
+    const flag = path.join(t.tmp, 'push-hook-flag');
+    t.env.PUSH_HOOK_FLAG = flag;
+    const hook = path.join(t.work, '.git', 'hooks', 'pre-push');
+    fs.writeFileSync(hook, `#!/bin/sh\nif [ -f "$PUSH_HOOK_FLAG" ]; then\n${body}\nfi\nexit 0\n`);
+    fs.chmodSync(hook, 0o755);
+    fs.writeFileSync(flag, '');
+  };
+
+  test('run: a pre-push hook that hangs is stopped at the command timeout: lock kept, nothing reset or relabelled', { timeout: 180000 }, () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    pushHook(t, 'sleep 90');
+    Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: '4000', AGENT_LAND_STUCK_MS: '3000' });
+    const started = Date.now();
+    const rep = runQueue(t);
+    assert.ok(Date.now() - started < 60000, 'the hung hook did not hold the lander');
+    assert.match(rep.aborted[0].reason, /push of the rebased head timed out .* landing lock is kept/);
+    assert.ok(rep.lockRetained?.sha, 'the lock is kept');
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'no relabel');
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+  });
+
+  test('run: a merge wrapper that hangs is stopped at the command timeout: no bounce, lock kept', { timeout: 180000 }, () => {
+    const t = setup({ mergeCmd: 'node scripts/hang-merge.mjs {pr}' });
+    fs.writeFileSync(path.join(t.work, 'scripts', 'hang-merge.mjs'), 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 90000);\n');
+    queuePr(t, 1);
+    Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: '4000', AGENT_LAND_STUCK_MS: '3000' });
+    const started = Date.now();
+    const rep = runQueue(t);
+    assert.ok(Date.now() - started < 60000);
+    assert.equal(rep.merged.length, 0);
+    assert.equal(rep.bounced.length, 0, 'no bounce: the merge may still happen');
+    assert.match(rep.aborted[0].reason, /merge command timed out .* landing lock is kept/);
+    assert.ok(rep.lockRetained?.sha);
+    assert.equal(prOf(t, 1).state, 'OPEN');
+    assert.deepEqual(prOf(t, 1).labels, ['landing']);
+  });
+
+  test('run: a lock refresh that hangs is bounded inside a 1-minute ttl: lost, the gate stops, nothing relabelled', { timeout: 180000 }, () => {
+    const t = setup({ lockTtlMin: 1 });
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    // The gate would run 40 s; the first refresh (every 2 s) hangs for a minute; gh calls are
+    // bounded at a sixth of the ttl (10 s).
+    Object.assign(t.env, { LAND_TEST_GATE_SLEEP_MS: '40000', AGENT_LAND_TICK_MS: '2000', FAKE_GH_HANG_LOCK_PATCH: '1' });
+    const started = Date.now();
+    const rep = runQueue(t);
+    assert.ok(Date.now() - started < 35000, `stopped at the gh bound (${Date.now() - started} ms)`);
+    assert.match(rep.aborted[0].reason, /landing lock was lost/);
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'no relabel after the loss');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+  });
+
+  test('run: the lock taken while a pre-push hook hangs: stopped as lost; no reset, relabel or release of the new lock', { timeout: 180000 }, () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const stolen = path.join(t.tmp, 'stolen');
+    t.env.STOLEN_FILE = stolen;
+    pushHook(t, [
+      // A hook runs with GIT_DIR set to the lander's repo: name the bare origin explicitly.
+      'lock=refs/heads/agent-landing-lock',
+      'c=$(git --git-dir="$FAKE_GH_BARE" commit-tree "$(git --git-dir="$FAKE_GH_BARE" rev-parse "$lock^{tree}")" -m "agent-landing-lock host=other pid=1 at=2099-01-01T00:00:00Z ttl=45")',
+      'git --git-dir="$FAKE_GH_BARE" update-ref "$lock" "$c"',
+      'printf %s "$c" > "$STOLEN_FILE"',
+      'sleep 90',
+    ].join('\n'));
+    Object.assign(t.env, { AGENT_LAND_TICK_MS: '500', AGENT_LAND_STUCK_MS: '3000' });
+    const started = Date.now();
+    const rep = runQueue(t);
+    assert.ok(Date.now() - started < 60000);
+    assert.match(rep.aborted[0].reason, /landing lock was lost during the push/);
+    assert.equal(lockSha(t), fs.readFileSync(stolen, 'utf8'), 'the other lander keeps its lock');
+    assert.deepEqual(prOf(t, 1).labels, ['landing']);
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head);
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
+  });
+
+  test('--repo that is not origin\'s repo is refused before anything is read or changed', () => {
+    const t = setup();
+    const head = makePr(t, 1);
+    sh(t.work, t.env, 'remote', 'set-url', 'origin', 'https://github.com/someone/else.git');
+    const before = state(t).calls.length;
+    const p = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(p.status, 2);
+    assert.match(p.err, /--repo o\/r is not origin's repo \(someone\/else\)/);
+    const q = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.notEqual(q.status, 0);
+    assert.equal(lockExists(t), false, 'no lock created');
+    assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge' || (c.cmd === 'api' && c.method !== 'GET')), false);
   });
 
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {
