@@ -1,6 +1,7 @@
 // Tests for home/dot_agents/bin/land-pr.mjs, land-queue.mjs and lib/land.mjs.
-// Run: node --test "tests/**/*.test.mjs"
-// Git is real (local bare "origin" plus a clone); gh is tests/bin/fake-gh.mjs on PATH, backed by
+// Run: node --test "tests/lifecycle/*.test.mjs"
+// Git is real (local bare "origin" plus a clone); gh is fakes/fake-gh.mjs on PATH (a .cmd shim on
+// Windows, a sh shim elsewhere, so commands go through lib/proc.mjs as real ones do), backed by
 // the same bare repo. Every temp path contains spaces, to cover Windows paths with spaces.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -12,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   appendLanding, isStale, lockMessage, orderQueue, parseLanding, parseLockMessage, rangeDiffChanges,
-  resolveCommand, scrub, splitArgv, writeLanding,
+  registeredRepos, scrub, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,18 @@ const LAND_PR = path.join(BIN, 'land-pr.mjs');
 const LAND_QUEUE = path.join(BIN, 'land-queue.mjs');
 const temps = [];
 after(() => { for (const t of temps) fs.rmSync(t, { recursive: true, force: true }); });
+
+// gh on PATH: the same shim shape as the lifecycle fakes (helpers.mjs installFake).
+function installGh(dir) {
+  const fake = path.join(HERE, 'fakes', 'fake-gh.mjs');
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(dir, 'gh.cmd'), `@"${process.execPath}" "${fake}" %*\r\n`);
+  } else {
+    const f = path.join(dir, 'gh');
+    fs.writeFileSync(f, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
+    fs.chmodSync(f, 0o755);
+  }
+}
 
 function pathKey(env) { return Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'PATH'; }
 
@@ -63,7 +76,9 @@ function setup(repoJson = {}) {
   const work = path.join(tmp, 'my repo');
   const fakebin = path.join(tmp, 'fake bin');
   fs.mkdirSync(fakebin);
-  fs.copyFileSync(path.join(HERE, 'fake-gh.mjs'), path.join(fakebin, 'gh.mjs'));
+  installGh(fakebin);
+  const home = path.join(tmp, 'home dir');
+  fs.mkdirSync(home);
   const stateFile = path.join(tmp, 'gh state.json');
   fs.writeFileSync(stateFile, JSON.stringify({ prs: [], labels: [], comments: [], calls: [] }));
   const gitcfg = path.join(tmp, 'gitconfig');
@@ -76,7 +91,7 @@ function setup(repoJson = {}) {
   Object.assign(env, {
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
     GIT_CONFIG_GLOBAL: gitcfg, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
-    FAKE_GH_STATE: stateFile, FAKE_GH_BARE: bare, AGENT_LAND_STATE_DIR: path.join(tmp, 'state'), AGENT_LAND_POLL_MS: '1',
+    FAKE_GH_STATE: stateFile, FAKE_GH_BARE: bare, HOME: home, USERPROFILE: home, AGENT_LAND_POLL_MS: '1',
     LAND_TEST_GATE: path.join(tmp, 'gate result'),
   });
   sh(tmp, env, 'init', '--quiet', '--bare', '-b', 'main', bare);
@@ -93,7 +108,7 @@ function setup(repoJson = {}) {
   sh(work, env, 'add', '-A');
   sh(work, env, 'commit', '--quiet', '-m', 'initial');
   sh(work, env, 'push', '--quiet', 'origin', 'HEAD:main');
-  return { tmp, bare, work, env, stateFile };
+  return { tmp, bare, work, env, stateFile, home };
 }
 
 const state = (t) => JSON.parse(fs.readFileSync(t.stateFile, 'utf8'));
@@ -221,11 +236,9 @@ describe('lib/land.mjs', () => {
     assert.equal(r.changed.length, 2);
   });
 
-  test('resolveCommand finds .mjs shims in a directory with spaces', () => {
-    const t = setup();
-    const env = t.env;
-    const hit = resolveCommand('gh', env);
-    assert.ok(hit && hit.endsWith('gh.mjs'), hit);
+  test('splitArgv refuses shell syntax, as the worktree engine does', () => {
+    assert.throws(() => splitArgv('npm test | tee log'), /shell syntax/);
+    assert.throws(() => splitArgv('a && b'), /shell syntax/);
   });
 });
 
@@ -557,6 +570,29 @@ describe('land-queue', () => {
     assert.deepEqual(s.held, [4]);
     assert.deepEqual(s.waiting, [{ pr: 5, dependsOn: [4] }]);
     assert.equal(s.lock, null);
+  });
+
+  test('status --all reads the engine registry; an unresolvable repo is an error, not a stop', () => {
+    const t = setup();
+    queuePr(t, 1);
+    // A second checkout whose origin names the GitHub repo (status needs no git remote access).
+    const gh = path.join(t.tmp, 'gh checkout');
+    sh(t.tmp, t.env, 'clone', '--quiet', t.bare, gh);
+    sh(gh, t.env, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git');
+    const reg = path.join(t.home, '.agents', 'state', 'repos.json');
+    fs.mkdirSync(path.dirname(reg), { recursive: true });
+    fs.writeFileSync(reg, JSON.stringify({ version: 1, repos: [
+      { root: gh, name: 'r', lastSeen: '2026-11-06T00:00:00Z' },
+      { root: t.work, name: 'r', lastSeen: '2026-11-06T00:00:00Z' },
+      { root: path.join(t.tmp, 'gone'), name: 'gone', lastSeen: '2026-11-06T00:00:00Z' },
+    ] }));
+    const r = tool(t, LAND_QUEUE, 'status', '--all', '--json');
+    assert.equal(r.status, 1, r.err);
+    const out = JSON.parse(r.out);
+    assert.equal(out.length, 2);
+    assert.equal(out[0].repo, 'o/r');
+    assert.deepEqual(out[0].order.map((x) => x.pr), [1]);
+    assert.match(out[1].error, /cannot tell the GitHub repo/);
   });
 
   test('run: rebases a PR behind the base, reruns the gate, pushes, merges', () => {

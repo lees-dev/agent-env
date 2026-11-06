@@ -1,5 +1,4 @@
-// A fake `gh` for the land-queue tests. Installed on PATH as gh.mjs; land.mjs runs .mjs shims
-// with node. Pull requests, labels and comments live in the JSON file $FAKE_GH_STATE. Git data
+// A fake `gh` for the land-queue tests, started by a gh.cmd / gh shim on PATH (land.test.mjs). Pull requests, labels and comments live in the JSON file $FAKE_GH_STATE. Git data
 // (branches, the landing-lock ref, merges) lives in the bare repo $FAKE_GH_BARE, so the tools
 // under test see a consistent remote through both gh and git.
 import { spawnSync } from 'node:child_process';

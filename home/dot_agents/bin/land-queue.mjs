@@ -36,7 +36,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   BOUNCE_MARKER, Gh, LandError, LandingLock,
-  appendLanding, baseTreeOf, bumpMergeCount, classifyQueue, fetchBranch, firstLine, git, gitOk,
+  appendLanding, childEnv, baseTreeOf, bumpMergeCount, classifyQueue, fetchBranch, firstLine, git, gitOk,
   isAncestor, isStale, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, markSwept, mergePinned, parseArgs,
   parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, runAsync, scrub, setLabels, slugFromRemote, splitArgv, waitForPr,
 } from './lib/land.mjs';
@@ -73,11 +73,7 @@ function changedPaths(dir, from, to) {
 }
 
 // Repo commands never see the 1Password service-account token.
-function commandEnv() {
-  const env = { ...process.env, AGENT_LANDER: '1' };
-  for (const k of Object.keys(env)) if (k.toUpperCase() === 'OP_SERVICE_ACCOUNT_TOKEN') delete env[k];
-  return env;
-}
+const commandEnv = () => childEnv({ AGENT_LANDER: '1' });
 
 async function runCommands(cmds, dir, lock, ttlMin) {
   const tickMs = Math.max(60000, Math.floor((ttlMin * 60000) / 3));
@@ -428,7 +424,10 @@ async function main() {
 
   let targets;
   if (args.all) {
-    targets = registeredRepos().map((r) => target(r));
+    // One repo that cannot be resolved is reported as an error; the others still run.
+    targets = registeredRepos().map((root) => {
+      try { return target(root); } catch (e) { return { root, repo: path.basename(root), error: e.message }; }
+    });
     if (!targets.length) throw new LandError('no repos registered in ~/.agents/state/repos.json with an .agents/repo.json', 2);
   } else {
     targets = [target(args.root ? path.resolve(args.root) : repoTop(), args.repo)];
@@ -437,6 +436,7 @@ async function main() {
   const reports = [];
   let failed = 0;
   for (const t of targets) {
+    if (t.error) { failed++; reports.push({ repo: t.repo, error: t.error }); continue; }
     try {
       if (cmd === 'run') reports.push(await runRepo(t, { dryRun: Boolean(args['dry-run']), reclaimStale: Boolean(args['reclaim-stale']) }));
       else if (cmd === 'status') reports.push(statusRepo(t));

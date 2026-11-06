@@ -1,12 +1,17 @@
 // Shared helpers for land-pr.mjs and land-queue.mjs (the local land queue).
-// Node >= 22, ESM, no dependencies. Every child process runs with shell: false and an
-// explicit stdin. Output is counts, PR numbers, SHAs and labels; never a secret value.
-import { spawn, spawnSync } from 'node:child_process';
+// Node >= 22, ESM, no dependencies. Process spawning, .agents/repo.json, the repo registry and
+// JSON state files come from the lifecycle libs (proc, repo, ledger, op); this file holds only
+// what is about landing. No child but op ever sees the 1Password service-account token, and
+// none is started here. Output is counts, PR numbers, SHAs and labels; never a secret value.
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
+import { homeDir, stripToken } from './op.mjs';
+import { prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
+import { baseBranch, gitIdentity, loadConfig } from './repo.mjs';
 
-export const IS_WIN = process.platform === 'win32';
 export const LOCK_REF = 'agent-landing-lock';
 export const LABELS = {
   queued: { color: '1d76db', description: 'Gated; waiting for the lander (land-queue)' },
@@ -20,21 +25,8 @@ export const LABELS = {
 export const PAUSE_VAR = 'AGENT_LANDING_PAUSED';
 export const DEFAULT_PRIORITY = 3;
 export const MAX_QUEUED = 5; // queued + landing PRs per repo
-export const BOUNCE_MARKER = '<!-- land-queue:bounce -->';
 
-export const DEFAULT_CONFIG = {
-  base: 'main',
-  setup: [],
-  gate: [],
-  affectedGate: null,
-  mergeMethod: 'squash',
-  mergeCmd: null,
-  ghWrapper: null,
-  sweepEveryMerges: 5,
-  wideSweep: null,
-  lockTtlMin: 45,
-  maxQueued: MAX_QUEUED,
-};
+export const BOUNCE_MARKER = '<!-- land-queue:bounce -->';
 
 // ---------------------------------------------------------------- errors and output
 
@@ -65,127 +57,34 @@ export function parseArgs(argv, spec) {
   return out;
 }
 
-// ---------------------------------------------------------------- argv strings
+// ---------------------------------------------------------------- processes
 
-// Split a command string into argv without a shell. Quotes group words; a backslash escapes
-// only a double quote or a backslash before a double quote, so Windows paths stay intact.
+// Repo commands (setup, gates, sweeps, mergeCmd, ghWrapper) are split exactly as the worktree
+// engine splits them: quotes group words, shell operators are refused.
 export function splitArgv(str) {
-  if (Array.isArray(str)) return str.slice();
-  const out = [];
-  let cur = '';
-  let inWord = false;
-  let quote = null;
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i];
-    if (quote) {
-      if (c === quote) { quote = null; continue; }
-      if (quote === '"' && c === '\\' && str[i + 1] === '"') { cur += '"'; i++; continue; }
-      cur += c;
-      continue;
-    }
-    if (c === '"' || c === "'") { quote = c; inWord = true; continue; }
-    if (/\s/.test(c)) {
-      if (inWord) { out.push(cur); cur = ''; inWord = false; }
-      continue;
-    }
-    cur += c;
-    inWord = true;
-  }
-  if (quote) throw new LandError(`unbalanced quote in command: ${str}`, 2);
-  if (inWord) out.push(cur);
-  return out.map(expandHome);
+  try { return procSplitArgv(str); } catch (e) { throw new LandError(e.message, 2); }
 }
 
-export function expandHome(token) {
-  const home = os.homedir();
-  if (token === '~') return home;
-  if (token.startsWith('~/') || token.startsWith('~\\')) return path.join(home, token.slice(2));
-  if (token.startsWith('$HOME/') || token.startsWith('$HOME\\')) return path.join(home, token.slice(6));
-  return token;
+// Environment for every child: the caller's, minus OP_SERVICE_ACCOUNT_TOKEN, plus `extra`.
+export function childEnv(extra = {}) {
+  return { ...stripToken(process.env), ...extra };
 }
 
-// ---------------------------------------------------------------- process spawning
-
-function envPath(env) {
-  const key = Object.keys(env).find((k) => k.toUpperCase() === 'PATH');
-  return key ? env[key] || '' : '';
-}
-
-function isFile(p) {
-  try { return fs.statSync(p).isFile(); } catch { return false; }
-}
-
-// Resolve a command name to a file. Windows: .exe, .com, .cmd, .bat, then .mjs (a Node shim).
-// Elsewhere: the bare name, then .mjs.
-export function resolveCommand(name, env = process.env) {
-  const exts = IS_WIN ? ['.exe', '.com', '.cmd', '.bat', '.mjs'] : ['', '.mjs'];
-  const hasDir = name.includes('/') || (IS_WIN && name.includes('\\'));
-  const tryBase = (base) => {
-    if (path.extname(base) && isFile(base)) return base;
-    for (const e of exts) if (isFile(base + e)) return base + e;
-    return null;
-  };
-  if (hasDir || path.isAbsolute(name)) return tryBase(path.resolve(name));
-  for (const dir of envPath(env).split(path.delimiter)) {
-    if (!dir) continue;
-    const hit = tryBase(path.join(dir.replace(/^"|"$/g, ''), name));
-    if (hit) return hit;
-  }
-  return null;
-}
-
-const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
-function cmdEscapeArg(arg) {
-  let a = `${arg}`;
-  a = a.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
-  a = a.replace(/(?=(\\+?)?)\1$/, '$1$1');
-  a = `"${a}"`;
-  return a.replace(CMD_META, '^$1');
-}
-
-// Turn [cmd, ...args] into what spawn needs, without a shell.
-export function prepareSpawn(argv, env = process.env) {
-  const [cmd, ...args] = argv;
-  const file = resolveCommand(cmd, env);
-  if (!file) throw new LandError(`command not found on PATH: ${cmd}`, 127);
-  const ext = path.extname(file).toLowerCase();
-  if (ext === '.mjs' || ext === '.js') return { file: process.execPath, args: [file, ...args], opts: {} };
-  if (IS_WIN && (ext === '.cmd' || ext === '.bat')) {
-    const line = [file.replace(CMD_META, '^$1'), ...args.map(cmdEscapeArg)].join(' ');
-    return {
-      file: process.env.comspec || 'cmd.exe',
-      args: ['/d', '/s', '/c', `"${line}"`],
-      opts: { windowsVerbatimArguments: true },
-    };
-  }
-  return { file, args, opts: {} };
-}
-
-// Run synchronously. stdin is the given input or empty (never inherited).
-export function run(argv, { cwd, env = process.env, input = '', timeoutMs } = {}) {
-  const p = prepareSpawn(argv, env);
-  const r = spawnSync(p.file, p.args, {
-    ...p.opts,
-    cwd,
-    env,
-    input,
-    encoding: 'utf8',
-    shell: false,
-    windowsHide: true,
-    maxBuffer: 64 * 1024 * 1024,
-    timeout: timeoutMs,
-  });
-  if (r.error) return { status: 127, stdout: '', stderr: String(r.error.message || r.error) };
-  return { status: r.status ?? 1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+// Run [cmd, ...args] synchronously (shell: false; stdin is `input`, else ignored).
+export function run(argv, { cwd, env = childEnv(), input } = {}) {
+  const r = procRun(argv[0], argv.slice(1), { cwd, env, input });
+  const stderr = r.stderr || (r.error ? String(r.error.message || r.error) : '');
+  return { status: r.status, stdout: r.stdout, stderr };
 }
 
 // Run asynchronously with stdin ignored, keeping only the last `tailLines` lines of output.
 // onTick runs every tickMs while the child runs (used to refresh the landing lock).
-export function runAsync(argv, { cwd, env = process.env, tailLines = 40, tickMs = 0, onTick } = {}) {
+export function runAsync(argv, { cwd, env = childEnv(), tailLines = 40, tickMs = 0, onTick } = {}) {
   return new Promise((resolve) => {
-    let p;
-    try { p = prepareSpawn(argv, env); } catch (e) { resolve({ status: 127, tail: [String(e.message)] }); return; }
-    const child = spawn(p.file, p.args, { ...p.opts, cwd, env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let prepared;
+    try { prepared = prepare(argv[0], argv.slice(1), { cwd, env }); } catch (e) { resolve({ status: 127, tail: [String(e.message)] }); return; }
+    const [file, args, options] = prepared;
+    const child = spawn(file, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
     const tail = [];
     let partial = '';
     const take = (chunk) => {
@@ -203,10 +102,6 @@ export function runAsync(argv, { cwd, env = process.env, tailLines = 40, tickMs 
       resolve({ status: code ?? 1, tail });
     });
   });
-}
-
-export function sleepMs(ms) {
-  if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function pollMs() {
@@ -231,6 +126,7 @@ export function scrub(text) {
 
 // ---------------------------------------------------------------- git
 
+// git runs without the token too: a rebase or checkout in the lander checkout runs repo hooks.
 export function git(args, opts = {}) {
   return run(['git', ...args], opts);
 }
@@ -257,19 +153,16 @@ export function fetchBranch(cwd, branch) {
   return gitOk(['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`], { cwd });
 }
 
-export function repoTop(cwd = process.cwd()) {
-  const r = git(['rev-parse', '--show-toplevel'], { cwd });
-  if (r.status !== 0) throw new LandError('not inside a git checkout', 2);
-  return path.resolve(r.stdout.trim());
+function identity(cwd) {
+  const id = gitIdentity(cwd, childEnv());
+  if (!id) throw new LandError('not inside a git checkout', 2);
+  return id;
 }
 
-// The main checkout of the repository that `cwd` belongs to (worktrees share its common dir).
-export function mainCheckout(cwd) {
-  const r = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd });
-  if (r.status !== 0) throw new LandError('not inside a git checkout', 2);
-  const common = path.resolve(r.stdout.trim());
-  return path.basename(common) === '.git' ? path.dirname(common) : common;
-}
+// The checkout `cwd` is in, and the main checkout of its repository (the engine's repoRoot:
+// the lander checkout is <main checkout>-lander, which the engine's sweeps skip).
+export function repoTop(cwd = process.cwd()) { return identity(cwd).worktreePath; }
+export function mainCheckout(cwd) { return identity(cwd).repoRoot; }
 
 export function slugFromRemote(cwd) {
   const r = git(['remote', 'get-url', 'origin'], { cwd });
@@ -287,22 +180,19 @@ export function rangeDiffChanges(out) {
 
 // ---------------------------------------------------------------- repo config
 
+// .agents/repo.json through the engine's loader (same defaults and validation), plus what
+// landing needs: a resolved base, affectedGate falling back to gate, numeric limits, and no
+// command left as a TODO(repo-defaults) placeholder.
 export function loadRepoConfig(root) {
-  const file = path.join(root, '.agents', 'repo.json');
-  let raw = {};
-  let found = false;
-  if (fs.existsSync(file)) {
-    try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); found = true; } catch (e) {
-      throw new LandError(`.agents/repo.json does not parse: ${e.message}`, 2);
-    }
-  }
-  const cfg = { ...DEFAULT_CONFIG, ...raw, found };
-  for (const k of ['setup', 'gate']) cfg[k] = Array.isArray(cfg[k]) ? cfg[k] : [];
-  if (!Array.isArray(cfg.affectedGate) || cfg.affectedGate.length === 0) cfg.affectedGate = cfg.gate;
-  if (!['squash', 'merge', 'rebase'].includes(cfg.mergeMethod)) throw new LandError(`mergeMethod must be squash, merge or rebase`, 2);
-  cfg.lockTtlMin = Number(cfg.lockTtlMin) > 0 ? Number(cfg.lockTtlMin) : DEFAULT_CONFIG.lockTtlMin;
-  cfg.maxQueued = Number(cfg.maxQueued) > 0 ? Number(cfg.maxQueued) : MAX_QUEUED;
-  cfg.sweepEveryMerges = Number(cfg.sweepEveryMerges) > 0 ? Number(cfg.sweepEveryMerges) : DEFAULT_CONFIG.sweepEveryMerges;
+  let cfg;
+  try { cfg = { ...loadConfig(root) }; } catch (e) { throw new LandError(e.message, 2); }
+  cfg.base = baseBranch(cfg, root, childEnv());
+  if (!cfg.affectedGate.length) cfg.affectedGate = cfg.gate;
+  if (!['squash', 'merge', 'rebase'].includes(cfg.mergeMethod)) throw new LandError('mergeMethod must be squash, merge or rebase', 2);
+  const num = (v, d) => (Number(v) > 0 ? Number(v) : d);
+  cfg.lockTtlMin = num(cfg.lockTtlMin, 45);
+  cfg.maxQueued = num(cfg.maxQueued, MAX_QUEUED);
+  cfg.sweepEveryMerges = num(cfg.sweepEveryMerges, 5);
   for (const k of ['setup', 'gate', 'affectedGate']) {
     if (cfg[k].some((c) => typeof c !== 'string' || /TODO\(repo-defaults\)/.test(c))) {
       throw new LandError(`.agents/repo.json ${k} still has a TODO(repo-defaults) or a non-string entry`, 2);
@@ -314,7 +204,7 @@ export function loadRepoConfig(root) {
 // ---------------------------------------------------------------- gh
 
 export class Gh {
-  constructor({ repo, wrapper = null, env = process.env }) {
+  constructor({ repo, wrapper = null, env = childEnv() }) {
     this.repo = repo;
     this.wrapper = wrapper ? splitArgv(wrapper) : null;
     this.env = env;
@@ -714,53 +604,45 @@ export function mergePinned(gh, cfg, { pr, sha }) {
 
 // ---------------------------------------------------------------- state (merge counts)
 
+// ~/.agents/state, the same folder as the engine's repo registry (tests point HOME at a temp dir).
 export function stateDir() {
-  return process.env.AGENT_LAND_STATE_DIR || path.join(os.homedir(), '.agents', 'state');
-}
-
-export function readJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
-}
-
-export function writeJsonAtomic(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  return path.join(homeDir(), '.agents', 'state');
 }
 
 // Merges per repo on this machine; `sinceSweep` drives the wide sweep every N merges.
-export function bumpMergeCount(repo) {
+// Read-modify-write under the ledger's lock file, so landers for two repos never lose a count.
+function updateState(fn) {
   const file = path.join(stateDir(), 'land-queue.json');
-  const s = readJson(file, {});
-  const cur = { merges: 0, sinceSweep: 0, ...(s[repo] || {}) };
-  cur.merges += 1;
-  cur.sinceSweep += 1;
-  cur.lastMergeAt = new Date().toISOString();
-  s[repo] = cur;
-  writeJsonAtomic(file, s);
-  return cur;
+  return withLock(file, () => {
+    const s = readJson(file, {}) || {};
+    const out = fn(s);
+    writeJsonAtomic(file, s);
+    return out;
+  });
+}
+
+export function bumpMergeCount(repo) {
+  return updateState((s) => {
+    const cur = { merges: 0, sinceSweep: 0, ...(s[repo] || {}) };
+    cur.merges += 1;
+    cur.sinceSweep += 1;
+    cur.lastMergeAt = new Date().toISOString();
+    s[repo] = cur;
+    return cur;
+  });
 }
 
 export function markSwept(repo) {
-  const file = path.join(stateDir(), 'land-queue.json');
-  const s = readJson(file, {});
-  s[repo] = { ...(s[repo] || {}), sinceSweep: 0, lastSweepAt: new Date().toISOString() };
-  writeJsonAtomic(file, s);
+  updateState((s) => { s[repo] = { ...(s[repo] || {}), sinceSweep: 0, lastSweepAt: new Date().toISOString() }; });
 }
 
-// Repos for --all: ~/.agents/state/repos.json, tolerant of the shapes the engine may write:
-// ["<path>", ...], {"repos": [...]}, or {"<name>": "<path>" | {repoRoot|root|path}}.
+// Repos for --all: the engine's registry (~/.agents/state/repos.json), each root that still has
+// an .agents/repo.json.
 export function registeredRepos() {
-  const file = path.join(stateDir(), 'repos.json');
-  const data = readJson(file, null);
-  if (!data) return [];
-  const list = Array.isArray(data) ? data : Array.isArray(data.repos) ? data.repos : Object.values(data);
-  const roots = [];
-  for (const e of list) {
-    const p = typeof e === 'string' ? e : e && (e.repoRoot || e.root || e.path);
-    if (typeof p === 'string' && fs.existsSync(path.join(p, '.agents', 'repo.json'))) roots.push(path.resolve(p));
-  }
+  const roots = readRegistry().repos
+    .map((r) => r && r.root)
+    .filter((p) => typeof p === 'string' && fs.existsSync(path.join(p, '.agents', 'repo.json')))
+    .map((p) => path.resolve(p));
   return [...new Set(roots)];
 }
 
