@@ -1472,6 +1472,66 @@ describe('land-queue', () => {
     assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
   });
 
+  // A fork PR whose branch name and head sha match an origin branch: that branch is not the
+  // PR's. The lander refuses the PR before any fetch, so the origin branch is never rewritten.
+  test('run: a fork PR is bounced before any fetch; the same-named origin branch is untouched; others still land', () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    queuePr(t, 2);
+    const s = state(t); s.prs.find((p) => p.number === 1).isCrossRepository = true; saveState(t, s);
+    advanceMain(t, 'other.txt', 'x\n');
+    const rep = runQueue(t);
+    assert.deepEqual(rep.bounced.map((b) => b.pr), [1]);
+    assert.match(rep.bounced[0].reason, /from a fork/);
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'the origin branch is not rewritten');
+    assert.deepEqual(rep.merged.map((m) => m.pr), [2], 'an internal PR still lands');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge' && c.pr === 1), false);
+  });
+
+  test('land-pr refuses a fork PR and changes nothing', () => {
+    const t = setup();
+    const head = makePr(t, 1);
+    const s = state(t); s.prs.find((p) => p.number === 1).isCrossRepository = true; saveState(t, s);
+    const before = state(t).calls.length;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED the PR is from a fork/);
+    assert.deepEqual(prOf(t, 1).labels, []);
+    assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge'), false);
+  });
+
+  // An error on a later PR stops the run, but what happened before it is still reported (JSON
+  // and text) with the error, and the exit is non-zero.
+  test('run: an error on a later PR keeps the earlier merge and bounce in the report', () => {
+    const t = setup();
+    queuePr(t, 1);
+    queuePr(t, 2);
+    queuePr(t, 3);
+    const s = state(t);
+    // #2: its gated sha is not its head (a bounce); #3: needs a rebase after #1 merges, and its
+    // pending-line edit fails (an error with no merge).
+    const p2 = s.prs.find((p) => p.number === 2);
+    p2.body = p2.body.replace(/Gate: pass @ [0-9a-f]{40}/, `Gate: pass @ ${'0'.repeat(40)}`);
+    s.failBodyEditMatching = 'push started';
+    saveState(t, s);
+    const j = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(j.status, 1, 'non-zero exit');
+    const rep = JSON.parse(j.out);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1], 'the earlier merge is kept');
+    assert.deepEqual(rep.bounced.map((b) => b.pr), [2], 'the earlier bounce is kept');
+    assert.match(rep.error, /502|Bad Gateway|failed/i);
+    assert.equal(prOf(t, 3).state, 'OPEN');
+    // The text form too (a fresh repo state for a second run is not needed: replay the same shape).
+    const t2 = setup();
+    queuePr(t2, 1);
+    queuePr(t2, 2);
+    const s2 = state(t2); s2.failBodyEditMatching = 'push started'; saveState(t2, s2);
+    const txt = tool(t2, LAND_QUEUE, 'run', '--repo', 'o/r');
+    assert.equal(txt.status, 1);
+    assert.match(txt.out, /MERGED #1/);
+    assert.match(txt.out, /ERROR .*the run stopped here; the results above stand/);
+  });
+
   test('run: GitHub still showing the head before the lander rebase is never a bounce', () => {
     const t = setup();
     const head = queuePr(t, 1);

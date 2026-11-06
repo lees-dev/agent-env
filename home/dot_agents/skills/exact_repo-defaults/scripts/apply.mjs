@@ -242,7 +242,7 @@ function claudeMd(root) {
 // skipped (code.claude.com/docs/en/memory, "Import additional files"). The token must stand
 // alone: `@AGENTS.md-old`, `@AGENTS.md.` or `(@AGENTS.md)` name other paths.
 function importsAgents(text) {
-  const prose = outsideFences(text).replace(/(`+)[\s\S]*?\1/g, ' ');
+  const prose = outsideFences(text).replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g, ' ');
   return /(?:^|\s)@(?:\.\/)?AGENTS\.md(?=\s|$)/m.test(prose);
 }
 

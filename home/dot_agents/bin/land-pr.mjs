@@ -164,6 +164,8 @@ async function main() {
   if (pr.state === 'MERGED') return mergedOut(pr);
   if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
   if (pr.isDraft) throw new LandError(`PR #${n} is a draft: mark it ready first`);
+  // A fork PR's head is not on origin; the queue would have to push to a branch that is not its.
+  if (pr.isCrossRepository) return refuse('the PR is from a fork, which the land queue does not land; merge it by hand');
   const sha = gitOk(['rev-parse', '--verify', `${args.sha}^{commit}`], { cwd: root });
   if (pr.headRefOid !== sha) {
     throw new LandError(`PR #${n} head is ${pr.headRefOid}, the gated sha is ${sha}: push the gated commit or re-run the gate on the PR head`);
@@ -300,6 +302,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     if (p.state === 'MERGED') return { done: mergedOut(p) };
     if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
     if (p.isDraft) throw new LandError(`PR #${n} is a draft: mark it ready first`);
+    if (p.isCrossRepository) return { done: refuse('the PR is from a fork, which the land queue does not land; merge it by hand') };
     if (p.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${p.headRefOid} while landing; re-run the gate`);
     if ((p.baseRefName || base) !== base || p.headRefName !== headRef) {
       throw new LandError(`PR #${n} now targets ${p.baseRefName} from ${p.headRefName}; re-run the gate and land-pr`);

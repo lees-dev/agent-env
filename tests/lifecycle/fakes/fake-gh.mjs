@@ -41,7 +41,7 @@ function headOid(pr) {
 
 function view(pr) {
   return {
-    number: pr.number, title: pr.title || `PR ${pr.number}`, state: pr.state || 'OPEN', isDraft: Boolean(pr.isDraft),
+    number: pr.number, title: pr.title || `PR ${pr.number}`, state: pr.state || 'OPEN', isDraft: Boolean(pr.isDraft), isCrossRepository: Boolean(pr.isCrossRepository),
     headRefName: pr.headRefName, headRefOid: pr.state === 'MERGED' ? pr.headRefOid : headOid(pr), baseRefName: pr.baseRefName || 'main',
     labels: (pr.labels || []).map((name) => ({ name })), body: pr.body || '', createdAt: pr.createdAt || '2026-11-01T00:00:00Z',
     mergeCommit: pr.mergeCommit ? { oid: pr.mergeCommit } : null, url: `https://github.com/o/r/pull/${pr.number}`,

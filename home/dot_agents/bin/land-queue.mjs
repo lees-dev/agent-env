@@ -112,6 +112,7 @@ function recheck(gh, pr, want, expectHead, lock) {
   if (!lock.stillHeld()) return { requeue: 'the landing lock was lost', lost: true };
   const p = gh.prView(pr.number);
   if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
+  if (p.isCrossRepository) return { stop: 'the PR is from a fork' };
   pr.labels = p.labels;
   pr.body = p.body;
   if ((p.baseRefName || want.base) !== want.base) return { requeue: `base changed to ${p.baseRefName}` };
@@ -148,6 +149,9 @@ async function landOne(ctx, pr) {
   const { gh, cfg, mainRoot, lock, root } = ctx;
   // A retry after a moved base starts here again: nothing is changed unless the lock is ours.
   if (!lock.stillHeld()) return { aborted: { pr: pr.number, reason: 'the landing lock was lost before the landing' }, lost: true };
+  // A fork PR's head is not on origin: a same-named origin branch (even at the same sha) is
+  // someone else's, and a rebased push would rewrite it. Fork PRs are refused before any fetch.
+  if (pr.isCrossRepository) return bounceOwned(ctx, pr, 'the PR is from a fork, which the land queue does not land; merge it by hand');
   setLabels(gh, pr, { add: ['landing'], remove: ['queued'] });
   let gated = parseLanding(pr.body).gatedSha;
   // A head that this lander rebased, gated and pushed, whose `pass` line was never written (the
@@ -408,15 +412,26 @@ async function sweepAfter(ctx, report) {
   }
 }
 
+// One repo's run. An error stops it, and the report so far (merges, bounces, aborts) is kept
+// with the error: what already happened is still reported and acted on; the exit is non-zero.
 async function runRepo(t, opts) {
-  const ctx = context(t);
-  const { gh } = ctx;
-  // A gate or merge command that cannot be run is a config error before any PR is touched.
-  validateLandingCommands(ctx.cfg);
   const report = {
     repo: t.repo, merged: [], bounced: [], admitted: [], aborted: [], reset: [], queued: 0, held: [], waiting: [], queueWaiting: [],
     stale: [], busy: false, paused: false, alerts: [], sweep: null,
   };
+  try {
+    return await runRepoSteps(t, opts, report);
+  } catch (e) {
+    report.error = scrub(firstLine(e instanceof LandError ? e.message : e?.message || e));
+    return report;
+  }
+}
+
+async function runRepoSteps(t, opts, report) {
+  const ctx = context(t);
+  const { gh } = ctx;
+  // A gate or merge command that cannot be run is a config error before any PR is touched.
+  validateLandingCommands(ctx.cfg);
   if (!opts.dryRun) {
     gh.ensureLabels();
     // Recover a crashed run first, whatever else stops this one (a pause, nothing eligible).
@@ -599,7 +614,11 @@ async function main() {
   for (const t of targets) {
     if (t.error) { failed++; reports.push({ repo: t.repo, error: t.error }); continue; }
     try {
-      if (cmd === 'run') reports.push(await runRepo(t, { dryRun: Boolean(args['dry-run']), reclaimStale: Boolean(args['reclaim-stale']) }));
+      if (cmd === 'run') {
+        const r = await runRepo(t, { dryRun: Boolean(args['dry-run']), reclaimStale: Boolean(args['reclaim-stale']) });
+        if (r.error) failed++;
+        reports.push(r);
+      }
       else if (cmd === 'status') reports.push(statusRepo(t));
       else reports.push(await unpauseRepo(t));
     } catch (e) {
@@ -608,8 +627,8 @@ async function main() {
     }
   }
   const text = (r) => {
+    if (cmd === 'run' && r.merged) return `${runText(r)}${r.error ? `\n  ERROR ${r.error} (the run stopped here; the results above stand)` : ''}`;
     if (r.error) return `${r.repo}: ERROR ${r.error}`;
-    if (cmd === 'run') return runText(r);
     if (cmd === 'status') return statusText(r);
     return `${r.repo}: ${r.paused ? 'still PAUSED' : 'not paused'} (${r.note})`;
   };

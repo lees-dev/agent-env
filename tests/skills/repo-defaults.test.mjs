@@ -762,6 +762,18 @@ describe('repo-defaults apply.mjs', () => {
     }
   });
 
+  // A code span closes only on a backtick run of exactly its opening length (CommonMark): a
+  // longer or shorter run inside it is content, so an example inside never counts as an import.
+  test('CLAUDE.md: code spans with unequal backtick runs inside hide the example; real imports after spans count', () => {
+    const status = (text) => run(repo({ 'CLAUDE.md': text }), '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status;
+    for (const text of ['Example: `literal ``` @AGENTS.md `\n', 'See ``` a ` @AGENTS.md `` b ``` here\n', 'See ``a ` @AGENTS.md`` here\n']) {
+      assert.equal(status(text), 'missing', JSON.stringify(text));
+    }
+    for (const text of ['Use `a` and @AGENTS.md\n', 'Run ``` x `` y ``` then @AGENTS.md\n']) {
+      assert.equal(status(text), 'ok', JSON.stringify(text));
+    }
+  });
+
   test('t3.json: the legacy $HOME engine scripts (cmd.exe cannot expand them) are replaced', () => {
     const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
     const legacy = want.scripts.map((s, i) => ({ ...s, command: `node "$HOME/.agents/bin/agent-worktree.mjs" ${['setup', 'teardown'][i]}` }));

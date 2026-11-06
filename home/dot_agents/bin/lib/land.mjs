@@ -402,7 +402,7 @@ export class Gh {
   }
 }
 
-export const PR_FIELDS = 'number,title,state,isDraft,headRefName,headRefOid,baseRefName,labels,body,createdAt,mergeCommit,url';
+export const PR_FIELDS = 'number,title,state,isDraft,isCrossRepository,headRefName,headRefOid,baseRefName,labels,body,createdAt,mergeCommit,url';
 
 export function labelNames(pr) {
   return (pr.labels || []).map((l) => (typeof l === 'string' ? l : l.name));

@@ -46,7 +46,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 - **busy**: another lander holds the lock. Stop; the next run picks up.
 - **lockRetained**: this run did not delete its own lock (the alert says why and gives the command). Report it; it blocks every lander until it is deleted, or reclaimed as stale once its ttl has passed. When the alert says a command could not be stopped, first make sure that command and everything it started (in the lander checkout) have stopped; then delete the lock with that command, and only while no lander run is active.
 - **paused** or a sweep alert: open a ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node "$HOME/.agents/bin/land-queue.mjs" unpause` takes the landing lock (it refuses while another lander holds it), reruns the sweep and clears the pause only when it is green; a repo without a `wideSweep` keeps the pause for the owner to clear.
-- **error** on a repo: report the message; do not retry in a loop.
+- **error** on a repo: report the message; do not retry in a loop. The run stopped at the error, but everything the report lists before it stands: handle its merged, bounced and aborted PRs as usual.
 
 ## 3. Labels
 
