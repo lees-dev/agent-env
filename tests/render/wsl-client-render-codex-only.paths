@@ -6,10 +6,13 @@
 .agents/bin/lib/proc.mjs
 .agents/bin/lib/processes.mjs
 .agents/bin/lib/repo.mjs
+.agents/docs/agents/credentials.md
 .agents/docs/agents/domain.md
 .agents/docs/agents/issue-tracker.md
 .agents/docs/agents/pr-standards.md
+.agents/docs/agents/repo-defaults.md
 .agents/docs/agents/subagent-routing.md
+.agents/docs/agents/t3-first.md
 .agents/docs/agents/triage-labels.md
 .agents/skills/babysit-pr/
 .agents/skills/blast-radius/
