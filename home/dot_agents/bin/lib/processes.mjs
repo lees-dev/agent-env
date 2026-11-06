@@ -112,8 +112,20 @@ export function processesUnder(dir, procs = listProcesses()) {
   });
 }
 
+function zombie(pid) {
+  if (isWindows) return false;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z');
+  } catch { /* no /proc */ }
+  const r = run('ps', ['-o', 'stat=', '-p', String(pid)]);
+  return r.status === 0 && r.stdout.trim().startsWith('Z');
+}
+
+/** Running (a zombie has exited and only waits for its parent to reap it). */
 function alive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  return !zombie(pid);
 }
 
 /** Stop the given processes (TERM, then KILL after a grace period). Returns {stopped, failed}. */
