@@ -74,16 +74,19 @@ function listProc() {
 
 /** ps + lsof listing (macOS and other Unix). Exported for tests, with an injectable runner. */
 export function listPs(env, runner = run) {
-  const r = runner('ps', ['-axww', '-o', 'pid=,ppid=,lstart=,command='], { env });
+  // The C locale keeps lstart in the format parsed below.
+  const r = runner('ps', ['-axww', '-o', 'pid=,ppid=,lstart=,command='], { env: { ...env, LC_ALL: 'C', LANG: 'C' } });
   if (r.status !== 0 || !String(r.stdout || '').trim()) return null;
   const procs = new Map();
   for (const line of r.stdout.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\w+\s+\w+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/);
-    if (!m) continue;
+    // A line we cannot read could be a process inside the worktree: the listing is unknown.
+    if (!m) { if (line.trim()) return null; continue; }
     // ps loses argument boundaries: keep the whole command and match it word by word
     // (see argsUnder).
     procs.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[2]), start: m[3], name: path.basename(m[4].split(' ')[0]), exe: '', cmd: m[4], args: [], cwd: '', psOnly: true });
   }
+  if (!procs.size) return null;
   // Without working directories the listing cannot tell what runs inside a worktree.
   const l = runner('lsof', ['-a', '-d', 'cwd', '-Fpn'], { env });
   if (l.error || l.status === 127 || !String(l.stdout || '').trim()) return null;

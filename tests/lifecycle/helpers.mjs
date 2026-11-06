@@ -47,8 +47,13 @@ export function scratch(tools = ['gh', 'docker', 'op']) {
   } else {
     fs.symlinkSync(GIT, path.join(tooldir, 'git'));
     fs.symlinkSync(process.execPath, path.join(tooldir, 'node'));
+    // Only the system tools the engine and git need (ps and lsof for the macOS process
+    // listing). Whole system folders would let a real op, gh or docker shadow a removed fake.
+    for (const t of ['sh', 'ps', 'lsof', 'basename', 'dirname', 'sed', 'uname', 'cat']) {
+      const p = realWhich(t);
+      if (p) fs.symlinkSync(p, path.join(tooldir, t));
+    }
     pathDirs.push(tooldir);
-    for (const d of ['/usr/bin', '/bin']) if (fs.existsSync(d)) pathDirs.push(d);
   }
   const state = path.join(dir, 'fake-state.json');
   const logFile = path.join(dir, 'fake-log.jsonl');

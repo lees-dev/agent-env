@@ -542,6 +542,12 @@ export function deleteRefusal(p, ctx, live) {
  */
 async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
   const s = { processes: 0, docker: null, paths: 0, envFile: false, remoteBranch: false, hook: null, crReview: null, left: 0, errors: [] };
+  // Check the pattern before anything is removed: a bad one must not stop clean-up half-way.
+  let pattern = null;
+  try { pattern = ctx.cfg.remoteBranchDelete ? new RegExp(ctx.cfg.remoteBranchDelete) : null; } catch {
+    s.errors.push('remoteBranchDelete in .agents/repo.json is not a valid pattern');
+    return s;
+  }
   const wt = ctx.worktreePath;
   const live = liveWorktrees(ctx.repoRoot);
   if (!live) { s.errors.push('git worktree list failed'); return s; }
@@ -598,7 +604,6 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
     }
   }
 
-  const pattern = ctx.cfg.remoteBranchDelete ? new RegExp(ctx.cfg.remoteBranchDelete) : null;
   if (pr && pr.state === 'MERGED' && ctx.branch && pattern && pattern.test(ctx.branch) && !ledger.remoteBranchDeleted) {
     const ref = `repos/{owner}/{repo}/git/ref/heads/${ctx.branch.split('/').map(encodeURIComponent).join('/')}`;
     const cwd = worktreeGone ? ctx.repoRoot : wt;

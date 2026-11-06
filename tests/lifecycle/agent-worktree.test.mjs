@@ -382,6 +382,16 @@ describe('teardown', () => {
     assert.equal(Boolean(l.remoteBranchDeleted), false);
   });
 
+  test('an invalid remoteBranchDelete pattern keeps the worktree before anything is removed', () => {
+    const { s, repo } = fixture({ config: { remoteBranchDelete: '(' } });
+    merged(s, repo);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /remoteBranchDelete .* is not a valid pattern/);
+    assert.equal(s.readState().docker.containers.length, 2);
+    assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
   test('a failing cr-review --cleanup keeps the worktree', () => {
     const { s, repo } = fixture();
     merged(s, repo);

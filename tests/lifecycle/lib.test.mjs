@@ -180,9 +180,13 @@ describe('processes', () => {
   test('the ps listing fails when lsof cannot give working directories', () => {
     const psOut = { status: 0, stdout: '  1     0 Thu Nov  6 10:00:00 2026 /sbin/init\n', stderr: '' };
     assert.equal(procs.listPs({}, (cmd) => (cmd === 'ps' ? psOut : { status: 127, stdout: '', stderr: '', error: new Error('ENOENT') })), null);
-    const ok = procs.listPs({}, (cmd) => (cmd === 'ps' ? psOut : { status: 0, stdout: 'p1\nn/\n', stderr: '' }));
+    let psEnv;
+    const ok = procs.listPs({}, (cmd, args, o) => { if (cmd === 'ps') { psEnv = o.env; return psOut; } return { status: 0, stdout: 'p1\nn/\n', stderr: '' }; });
     assert.equal(ok.length, 1);
     assert.equal(ok[0].cwd, '/');
+    assert.equal(psEnv.LC_ALL, 'C');
+    const odd = { status: 0, stdout: `${psOut.stdout}  2     1 jeu. 6 nov. 10:00:00 2026 /bin/x\n`, stderr: '' };
+    assert.equal(procs.listPs({}, (cmd) => (cmd === 'ps' ? odd : { status: 0, stdout: 'p1\nn/\n', stderr: '' })), null, 'an unreadable line makes the listing unknown');
   });
 
   test('stopProcesses re-checks a pid before SIGKILL', { skip: isWin }, async () => {
