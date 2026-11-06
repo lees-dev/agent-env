@@ -40,6 +40,14 @@ chezmoi reads its source state from `home/` (`.chezmoiroot`). A path under `home
 | `scripts/backup.d/20-skills.list` | | The `exact_` skill directories apply may prune, and the link paths the script may replace |
 | `versions.toml` `[skills.*]` | | Vendor skill packs: installed at pinned versions, never vendored |
 
+#### lifecycle (part of rules+skills)
+
+| Path | Deploys to | What |
+|---|---|---|
+| `home/dot_agents/bin/**` | `~/.agents/bin/` | Node lifecycle tools run as `node <path>` (no `executable_` prefix): the worktree engine, the credentials helper, the landing tools, and their shared `lib/*.mjs` |
+| `tests/lifecycle/**` | (not deployed) | `node:test` suites with fake `gh`, `docker` and `op` |
+| `docs/lifecycle.md` | | How setup, teardown, sweep and the credentials helper work |
+
 **Skill links.** `~/.claude/skills/<name>` is a link to `~/.agents/skills/<name>`, so the two cannot drift. The link is a junction on Windows (`linkMode = "junction"`, because symlinks need Developer Mode) and a symlink elsewhere. Make the links with the run script on every OS, so all platforms take the same path. The script never touches `~/.claude/skills/synced/`, and never replaces a real directory without backing it up first.
 
 ### harness
