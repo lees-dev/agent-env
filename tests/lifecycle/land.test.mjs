@@ -12,9 +12,14 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  appendLanding, git as landGit, ioTimeoutMs, isStale, lockMessage, netTimeoutMs, orderQueue, parseHolds, parseLanding,
-  parseLockMessage, rangeDiffChanges, registeredRepos, scrub, setLockTtl, splitArgv, writeLanding,
+  appendLanding, git as landGit, isStale, lockMessage, orderQueue, parseHolds, parseLanding,
+  parseLockMessage, rangeDiffChanges, registeredRepos, scrub, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
+// Through the namespace, so an older land.mjs without them fails only the tests that use them.
+import * as landLib from '../../home/dot_agents/bin/lib/land.mjs';
+const setLockTtl = (m) => landLib.setLockTtl(m);
+const ioTimeoutMs = () => landLib.ioTimeoutMs();
+const netTimeoutMs = () => landLib.netTimeoutMs();
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(HERE, '../../home/dot_agents/bin');
