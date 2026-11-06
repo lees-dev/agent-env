@@ -22,7 +22,7 @@
 // then fixed, re-gated and re-reviewed) goes back in line: queue-blocked -> queued (or
 // queue-waiting). None of these is ever merged now.
 // Editing a queued PR (pr-workflow section 4): `hold` adds `queue-hold` and a PR-body line
-// `Hold-By: <holder> <ISO time>` in one edit. <holder> is --holder, else $T3CODE_THREAD_ID; with
+// `Hold-By: <holder> <ISO time> events>N` in one edit (N: the PR's newest event id then). <holder> is --holder, else $T3CODE_THREAD_ID; with
 // neither it refuses (exit 2), because the same id must release the hold. `hold` refuses when the
 // PR is `landing` or `queue-hold` is already there, and makes its edit under the landing lock
 // (a busy lock refuses too, with no edit). After the push, gate and review, `--release-hold` (same holder) first runs
@@ -68,18 +68,38 @@ function refusal(gh, pr, { ignoreHold = false } = {}) {
   return '';
 }
 
-// Whether queue-hold was removed from PR n at or after `at` (the caller's Hold-By time, less a
-// minute for clock skew), from the issue events. null when that cannot be told.
-function holdRemovedSince(gh, n, at) {
-  const since = Date.parse(at || '');
-  if (!Number.isFinite(since)) return null;
+// Every issue event of PR n (up to 2000), or null when they cannot be read.
+function issueEvents(gh, n) {
+  const all = [];
   for (let page = 1; page <= 20; page++) {
     const r = gh.api('GET', `repos/${gh.repo}/issues/${n}/events?per_page=100&page=${page}`);
     if (!r.ok || !Array.isArray(r.data)) return null;
-    if (r.data.some((e) => e?.event === 'unlabeled' && e?.label?.name === 'queue-hold' && Date.parse(e.created_at || '') >= since - 60000)) return true;
-    if (r.data.length < 100) return false;
+    all.push(...r.data.filter((e) => e && Number.isSafeInteger(e.id)));
+    if (r.data.length < 100) return all;
   }
   return null;
+}
+
+// The newest event id on PR n now: the hold's baseline. null when the events cannot be read.
+function eventBaseline(gh, n) {
+  const ev = issueEvents(gh, n);
+  return ev ? ev.reduce((m, e) => Math.max(m, e.id), 0) : null;
+}
+
+// Whether the queue-hold label now on PR n is someone else's: true when it was removed after
+// the caller's hold set it (the owner may have set it again), false when the caller's own
+// `labeled` event is the last change. Decided by GitHub's event order after the hold's baseline
+// (events>N), never by clocks: a removal by an earlier holder comes before this hold's label
+// and does not count. null (unknown, so the label stays) when there is no baseline, the events
+// cannot be read, or this hold's `labeled` event is not there.
+function holdRelabelled(gh, n, mine) {
+  if (!Number.isSafeInteger(mine.after)) return null;
+  const ev = issueEvents(gh, n);
+  if (!ev) return null;
+  const q = ev.filter((e) => e.label?.name === 'queue-hold' && e.id > mine.after).sort((a, b) => a.id - b.id);
+  const own = q.find((e) => e.event === 'labeled');
+  if (!own) return null;
+  return q.some((e) => e.event === 'unlabeled' && e.id > own.id);
 }
 
 // Other PRs in line: queued, landing or queue-waiting (held ones included: fairness).
@@ -128,7 +148,10 @@ function hold(args, n) {
       return refuse(`the PR now targets ${pr.baseRefName} from ${pr.headRefName} (it changed while taking the lock); run hold again`);
     }
     gh.ensureLabels();
-    gh.prEdit(n, { body: addHold(pr.body, holder), add: ['queue-hold'] });
+    // The baseline for telling this hold's label from earlier ones at release (no baseline when
+    // the events cannot be read: the release then leaves the label for the owner).
+    const baseline = eventBaseline(gh, n);
+    gh.prEdit(n, { body: addHold(pr.body, holder, undefined, baseline), add: ['queue-hold'] });
     const after = gh.prView(n);
     if (!parseHolds(after.body).some((h) => h.holder === holder) || !labelNames(after).includes('queue-hold')) {
       throw new LandError(`PR #${n}: the hold was not recorded (Hold-By line or queue-hold missing after the edit); check the PR by hand`);
@@ -268,14 +291,14 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString() });
     // The label is the caller's only while nobody removed it since the caller's hold: a removal
     // after that (the owner cleared it, maybe set it again) makes the current label someone
-    // else's. Unknown (the timeline cannot be read) counts as someone else's.
-    const relabelled = labelNames(pr).includes('queue-hold') ? holdRemovedSince(gh, n, mine.at) : false;
+    // else's. Unknown (no baseline, or the events cannot be read) counts as someone else's.
+    const relabelled = labelNames(pr).includes('queue-hold') ? holdRelabelled(gh, n, mine) : false;
     if (others.length || relabelled !== false) {
       // Only the caller's own hold is released (its Hold-By line goes, the new gated sha is
       // recorded); queue-hold stays, so REFUSED: nothing lands or queues.
       gh.prEdit(n, { body });
       const reason = others.length ? `queue-hold is still set by ${others.length} other holder(s)`
-        : relabelled === null ? 'the queue-hold label history could not be read, so the label is left in place'
+        : relabelled === null ? 'the queue-hold label history could not be read or has no baseline for your hold, so the label is left in place'
           : 'queue-hold was removed and set again after your hold, so it is not yours';
       return refuse(`${reason}; your hold line was removed and the gated sha recorded`);
     }

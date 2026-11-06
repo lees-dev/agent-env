@@ -605,7 +605,7 @@ describe('land-pr', () => {
     assert.equal(JSON.parse(r.out).holder, 'thread-from-env');
     const p = prOf(t, 1);
     assert.deepEqual(p.labels.sort(), ['queue-hold', 'queued']);
-    assert.match(p.body, /^- Hold-By: thread-from-env \d{4}-\d\d-\d\dT\S+Z$/m);
+    assert.match(p.body, /^- Hold-By: thread-from-env \d{4}-\d\d-\d\dT\S+Z events>\d+$/m);
     const edits = state(t).calls.filter((c) => c.cmd === 'pr edit');
     assert.equal(edits.length, 1);
     assert.deepEqual(edits[0].add, ['queue-hold']);
@@ -628,6 +628,34 @@ describe('land-pr', () => {
     assert.match(r.out, /^REFUSED queue-hold was removed and set again after your hold/);
     assert.ok(prOf(t, 1).labels.includes('queue-hold'), 'the owner\'s label stays');
     assert.doesNotMatch(prOf(t, 1).body, new RegExp(`Hold-By: ${HOLDER}`));
+  });
+
+  // Holder A holds and releases; holder B holds right after (well within any clock window) and
+  // releases: A's removal came before B's label in GitHub's event order, so B's release removes
+  // B's label and the PR goes on; nothing is left for the owner to clear.
+  test('--release-hold: a hold right after another holder\'s release is released normally', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const a = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(a.status, 0, a.err || a.out);
+    assert.equal(prOf(t, 1).labels.includes('queue-hold'), false);
+    const b = tool(t, LAND_PR, 'hold', '1', '--holder', 'holder-b', '--repo', 'o/r');
+    assert.equal(b.status, 0, b.err);
+    assert.match(prOf(t, 1).body, /^- Hold-By: holder-b \S+ events>\d+$/m);
+    const rb = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', 'holder-b', '--repo', 'o/r');
+    assert.equal(rb.status, 0, rb.err || rb.out);
+    assert.doesNotMatch(rb.out, /REFUSED/);
+    assert.equal(prOf(t, 1).labels.includes('queue-hold'), false, 'no orphan label');
+    assert.doesNotMatch(prOf(t, 1).body, /Hold-By:/);
+  });
+
+  test('--release-hold of a hold line with no event baseline leaves the label (unknown is not mine)', () => {
+    const t = setup();
+    const head = queuePr(t, 1, { body: 'Hold-By: old-holder 2026-11-06T09:00:00Z\n', labels: ['queue-hold'] });
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', 'old-holder', '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /no baseline for your hold, so the label is left in place/);
+    assert.ok(prOf(t, 1).labels.includes('queue-hold'));
   });
 
   test('--release-hold leaves queue-hold when its history cannot be read', () => {

@@ -242,7 +242,9 @@ function claudeMd(root) {
 // skipped (code.claude.com/docs/en/memory, "Import additional files"). The token must stand
 // alone: `@AGENTS.md-old`, `@AGENTS.md.` or `(@AGENTS.md)` name other paths.
 function importsAgents(text) {
-  const prose = outsideFences(text).replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g, ' ');
+  // A code span can run over lines, but never past a blank line (the end of a paragraph).
+  const prose = outsideFences(text).split(/\n[ \t]*\n/)
+    .map((para) => para.replace(/(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)/g, ' ')).join('\n\n');
   return /(?:^|\s)@(?:\.\/)?AGENTS\.md(?=\s|$)/m.test(prose);
 }
 
@@ -335,6 +337,23 @@ function isCanonical(s) {
 
 // ------------------------------------------------------------------ detection
 
+// Yarn 1 enforces the lockfile with --frozen-lockfile, Yarn 2+ with --immutable (Yarn 1 ignores
+// it). The version comes from the repo's own metadata, never by running yarn: package.json
+// packageManager, then the lockfile's format (v1 header, or Berry's __metadata), then
+// .yarnrc.yml (Berry only). Unknown: a TODO, not a guess.
+function yarnInstall(root, pkg) {
+  const pmField = typeof pkg?.packageManager === 'string' ? pkg.packageManager.match(/^yarn@(\d+)\./) : null;
+  let major = pmField ? Number(pmField[1]) : null;
+  if (major === null) {
+    const head = (readText(path.join(root, 'yarn.lock'), root) || '').slice(0, 4096);
+    if (/^# yarn lockfile v1\b/m.test(head)) major = 1;
+    else if (/^__metadata:/m.test(head)) major = 2;
+    else if (fs.existsSync(path.join(root, '.yarnrc.yml'))) major = 2;
+  }
+  if (major === null) return `${TODO}: yarn install command (yarn install --frozen-lockfile for Yarn 1, --immutable for Yarn 2+)`;
+  return major === 1 ? 'yarn install --frozen-lockfile' : 'yarn install --immutable';
+}
+
 export function detect(root) {
   const has = (f) => fs.existsSync(path.join(root, f));
   const pkg = json(readText(path.join(root, 'package.json'), root) ?? 'null').value || null;
@@ -342,7 +361,7 @@ export function detect(root) {
   let install = null;
   if (has('pnpm-lock.yaml')) { pm = 'pnpm'; install = 'pnpm install --frozen-lockfile'; }
   else if (has('bun.lock') || has('bun.lockb')) { pm = 'bun'; install = 'bun install --frozen-lockfile'; }
-  else if (has('yarn.lock')) { pm = 'yarn'; install = 'yarn install --immutable'; }
+  else if (has('yarn.lock')) { pm = 'yarn'; install = yarnInstall(root, pkg); }
   else if (has('package-lock.json')) { pm = 'npm'; install = 'npm ci --no-audit --no-fund'; }
   else if (pkg) { pm = 'npm'; install = null; }
   const scripts = pkg?.scripts || {};
@@ -400,7 +419,9 @@ function repoJson(root) {
       name: '.agents/repo.json', status: 'outdated', detail: `missing keys: ${missing.join(', ')}`,
       fix: () => {
         const out = { ...cur };
-        for (const k of missing) out[k] = tmpl[k];
+        // A missing itemPrefix defaults to the repo's own `repo` (the engine's default too), not
+        // the name detected from origin: existing .env.op references keep their prefix.
+        for (const k of missing) out[k] = k === 'itemPrefix' && typeof cur.repo === 'string' && cur.repo ? cur.repo : tmpl[k];
         writeIn(root, p, `${JSON.stringify(out, null, 2)}\n`);
         return `added ${missing.length} key(s) to .agents/repo.json`;
       },
@@ -479,6 +500,25 @@ function envFiles(root) {
     if (!st.isFile()) continue;
     const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
     out.push({ file: f, keys, tracked: tracked(f), role: envRole(f) });
+  }
+  // Tracked env files below the root are exposed in git history too: listed for rotation.
+  // Only what git tracks (no walk of the tree, untracked files or caches), read through the same
+  // containment checks; key counts only, never values.
+  const nested = git(['ls-files', '-z', '--', '*/.env', '*/.env.*'], root);
+  if (nested.ok) {
+    for (const f of nested.out.split('\0').filter(Boolean).slice(0, 200)) {
+      const base = f.split('/').pop();
+      if (!/^\.env(\..+)?$/.test(base) || base === '.env.op') continue;
+      const p = path.join(root, ...f.split('/'));
+      let st;
+      try { st = fs.lstatSync(p); } catch { out.push({ file: f, keys: 0, tracked: true, role: envRole(base), missing: true }); continue; }
+      if (st.isSymbolicLink()) {
+        try { st = fs.statSync(p); } catch { out.push({ file: f, keys: 0, tracked: true, role: envRole(base), dangling: true }); continue; }
+      }
+      if (!st.isFile()) continue;
+      const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
+      out.push({ file: f, keys, tracked: true, role: envRole(base) });
+    }
   }
   const op = readText(path.join(root, '.env.op'), root);
   const refs = op ? op.split(/\r?\n/).filter((l) => /=\s*["']?op:\/\//.test(l)) : [];
@@ -628,6 +668,7 @@ function main() {
       for (const e of ev.env.files) {
         const tracked = e.tracked && e.role !== 'template' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
         if (e.dangling) L.push(`WARN  ${e.file}: a link to nothing`);
+        else if (e.missing) L.push(`WARN  ${e.file}: tracked in git but not in the checkout (still in history: rotate its values)`);
         else if (e.role === 'source') L.push(`INFO  ${e.file}: ${e.keys} keys${tracked}; migrate with agent-secret import`);
         else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);
       }

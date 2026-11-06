@@ -656,10 +656,12 @@ export function writeLanding(body, { gateSha, queuedAt }) {
   return joinLanding(parts);
 }
 
-// `Hold-By: <holder> <ISO time>` lines anywhere in the body record who set queue-hold.
+// `Hold-By: <holder> <ISO time> events>N` lines anywhere in the body record who set queue-hold.
 // <holder> is `--holder <id>`, else $T3CODE_THREAD_ID. Nothing else is stable enough to release
 // the hold with later (a shell's parent pid changes between calls), so without either it refuses.
-const HOLD_LINE = /^[ \t]*(?:[-*][ \t]+)?Hold-By:[ \t]*(\S+)(?:[ \t]+(\S+))?[ \t]*$/i;
+// N is the newest issue-event id on the PR when the hold was set (GitHub's own ordering, no
+// clock): the hold's own `labeled` event is the first queue-hold one after it.
+const HOLD_LINE = /^[ \t]*(?:[-*][ \t]+)?Hold-By:[ \t]*(\S+)(?:[ \t]+(?!events>)(\S+))?(?:[ \t]+events>(\d+))?[ \t]*$/i;
 
 export function holderId(explicit) {
   const id = String(explicit || process.env.T3CODE_THREAD_ID || '').trim();
@@ -672,13 +674,13 @@ export function parseHolds(body) {
   const out = [];
   for (const l of String(body || '').replace(/\r\n/g, '\n').split('\n')) {
     const m = l.match(HOLD_LINE);
-    if (m) out.push({ holder: m[1], at: m[2] || null });
+    if (m) out.push({ holder: m[1], at: m[2] || null, after: m[3] === undefined ? null : Number(m[3]) });
   }
   return out;
 }
 
-export function addHold(body, holder, at = new Date().toISOString()) {
-  return appendLanding(body, `Hold-By: ${holder} ${at}`);
+export function addHold(body, holder, at = new Date().toISOString(), after = null) {
+  return appendLanding(body, `Hold-By: ${holder} ${at}${Number.isSafeInteger(after) ? ` events>${after}` : ''}`);
 }
 
 export function removeHold(body, holder) {

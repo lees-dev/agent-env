@@ -215,7 +215,8 @@ function api(rest) {
     const s = load();
     if (s.eventsFail) die('Server Error', 500);
     const page = Number(new URLSearchParams(ev[2] || '').get('page') || 1);
-    const list = (s.events || []).filter((e) => e.pr === Number(ev[1]));
+    // GitHub's event ids grow in order: the position in the log, unless a test set one.
+    const list = (s.events || []).map((e, i) => ({ id: i + 1, ...e })).filter((e) => e.pr === Number(ev[1]));
     process.stdout.write(JSON.stringify(page === 1 ? list : []));
     return;
   }
