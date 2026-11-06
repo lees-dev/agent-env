@@ -46,7 +46,8 @@ missing or pre-failing checks in the brief.
 ## 2. Start Sol
 
 In T3, call `orchestrator_capabilities`. Pick the latest Sol unless the user
-named a version. Do not hardcode an ID. Record provider, model, and effort
+named a version. Do not hardcode an ID. Target `codex` with
+`{reasoningEffort: "high"}` (Sol defaults to `low`). Record provider, model, and effort
 only if exposed. Use `delegate_task` every round (`role: "review"`,
 `mode: "async"`). Save `taskId`. New `clientRequestId` per round.
 `childThreadId` is storage, not the next target. Do not use
@@ -59,7 +60,8 @@ not substitute a model.
 
 Do not edit scoped files while review runs. Wait for the notice. Do not
 poll or start a second reviewer. Timeout, error, or no reply is not
-approval. On failure, cancel, verify stop, restart with the ledger.
+approval. On failure, `task_cancel` the run, verify it stopped, restart
+with the ledger.
 
 Round 1 brief (T3 children get no history):
 
@@ -82,7 +84,8 @@ S1 [blocker|should|nit] <file>:<line> <claim>. Fix: <suggestion> (stable ids)
 Check each finding and severity yourself. Another path, rare case, or
 small cost is a nit, whatever label it came with.
 
-- Agree: smallest fix. Prefer delete or narrow over new lock, cache,
+- Agree: smallest fix. Beyond a small fix (about 20 lines, no new
+  behavior), send it to an Opus builder (`subagent-routing`). Prefer delete or narrow over new lock, cache,
   helper, or option. Fix the case that happened. Add one focused test
   that fails without the fix, if intent needs it.
 - Disagree: say why, with evidence (file:line, test, output).
@@ -108,7 +111,10 @@ or budget ends. Show both sides in 2-3 lines each. The user decides.
 Budget end is not approval.
 
 Do not push during the loop. Push after agreement only if the user asked
-to push, ship, or update the PR. If you push to a PR, add above the model
+to push, ship, or update the PR. Shipping means landing it with `land-pr`
+(`pr-workflow` section 4). Pushing to a PR with a queue label follows
+"Editing a queued PR" there. In T3, call `link_pull_request` after
+pushing to a PR. If you push to a PR, add above the model
 blurb:
 
 `Reviewed with sol-loop: <N> rounds with <model>. Sol verdict: approved`.

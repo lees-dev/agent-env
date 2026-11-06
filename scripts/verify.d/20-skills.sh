@@ -66,10 +66,23 @@ case " $HARNESSES " in
   *" muse "*) ae_info "muse: rules come from a one-time /rules import (docs/skills.md); rerun it after the rules change" ;;
 esac
 
-# 5. The retired hand sync must not rewrite the managed files.
+# 5. Every managed rules block comes from agent-env. The interim ~/bin/sync-agent-standards
+#    wrote the same blocks with its own marker; agent-env now ships all five, so the tool is
+#    only reported, and a block it rewrote fails here (and in chezmoi verify).
+for _s_h in claude codex grok; do
+  case " $HARNESSES " in *" $_s_h "*) ;; *) continue ;; esac
+  case "$_s_h" in claude) _s_f="$HOME/.claude/CLAUDE.md" ;; *) _s_f="$HOME/.$_s_h/AGENTS.md" ;; esac
+  [ -f "$_s_f" ] || continue
+  _s_miss=0
+  for _s_b in engineering-standards subagent-routing t3-first credentials repo-defaults; do
+    grep -q "^<!-- BEGIN $_s_b (managed by agent-env;" "$_s_f" || _s_miss=$((_s_miss + 1))
+  done
+  if [ "$_s_miss" -eq 0 ]; then ae_ok "$_s_h rules carry all 5 agent-env managed blocks"
+  else ae_fail "$_s_h rules: $_s_miss of 5 managed blocks missing or not from agent-env"; ae_hint "scripts/backup && chezmoi apply --force --no-tty"
+  fi
+done
 if [ -e "$HOME/bin/sync-agent-standards" ]; then
-  ae_warn '~'"/bin/sync-agent-standards still exists; chezmoi now owns the rules files"
-  ae_hint "retire it (move it to ~/.agent-env-backups) so it cannot rewrite the standards block"
+  ae_info '~'"/bin/sync-agent-standards is superseded by agent-env (it ships every managed block); it may be deleted"
 fi
 
 # 6. The backup list names every exact_ skill directory (apply --force deletes whatever the

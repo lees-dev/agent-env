@@ -15,6 +15,8 @@ test "${HERDR_ENV:-}" = 1
 
 If the check fails, say that you are not running inside Herdr and stop. Do not inspect or control the focused Herdr session from outside Herdr.
 
+Inside T3 Code, Herdr is only for what the user asked you to do with Herdr: inspecting or controlling their existing panes. Anything T3 has a tool for still uses it: start agents with `delegate_task`, not `herdr agent start`; make checkouts with T3 worktrees, not `herdr worktree`; wait for your own background builds with `t3_background_wait` in Claude Code (other harnesses use their own wait). Use `herdr agent wait` and `herdr pane wait-output` only on panes and agents that Herdr owns.
+
 When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, create terminal layout, start agents and commands, read output, and wait for state changes.
 
 ## Learn the current CLI

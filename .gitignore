@@ -13,6 +13,8 @@ auth.json.*
 .credentials.json
 credentials
 credentials.*
+# The credentials rules document (policy text, no secret material) is deployed to ~/.agents/docs/agents/.
+!/home/dot_agents/docs/agents/credentials.md
 *.pem
 *.key
 *.p12

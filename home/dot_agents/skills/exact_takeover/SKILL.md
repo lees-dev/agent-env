@@ -9,7 +9,8 @@ Take responsibility for finishing the original goal while preserving the
 original contributors' credit. Do not defend an implementation just because
 another agent already built it.
 
-Read the source PR, branch, or thread, including review findings and the user's
+Read the source PR, branch, or thread (in T3, read a thread with
+`t3_thread_read`; find it with `t3_thread_search`), including review findings and the user's
 later corrections. Resolve the handoff to the actual code and current head,
 and account for uncommitted work. Treat the handoff as context, not proof.
 
@@ -34,9 +35,14 @@ Independently verify the original failure and realistic workflows, following
 repository guidance and permissions. Green mocked tests do not prove the user
 experience works. State what remains unverified.
 
-When the requested finish includes a PR, use `file-pr` to file or update it,
-then `babysit-pr` rather than stopping at creation. Use `leaving-pr-comments`
-for replies. Merge or close the original PR only when authorized.
+When the finish includes a PR: run the local gate, file with `file-pr`, land
+it with `land-pr` (`babysit-pr` lands an open PR), per `pr-workflow` section 4;
+a PR with a queue label is edited only per "Editing a queued PR" there. In T3, call `link_pull_request` on every PR
+you create, take over, or push to, and `watch_pull_request` only when something
+outside your control still blocks the merge (then `unwatch_pull_request`
+before handback). Code beyond a small fix goes to an Opus builder through
+`delegate_task` when you are not Opus (`subagent-routing`). Use `leaving-pr-comments` for replies.
+Merge or close the original PR only when authorized.
 
 Report what you inherited, what you changed, how you verified it, how credit
 was preserved, and any remaining decision.

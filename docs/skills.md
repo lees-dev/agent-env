@@ -8,14 +8,14 @@ This page belongs to the rules+skills area. It covers where each skill comes fro
 |---|---|---|
 | `home/dot_agents/skills/exact_<name>/` | `~/.agents/skills/<name>/` | Codex (user scope), Muse (user scope), Grok (`.agents/skills` at each tier) |
 | `home/.chezmoiscripts/run_after_20-skills-links.{ps1,sh}.tmpl` | a link at `~/.claude/skills/<name>` → `~/.agents/skills/<name>` | Claude Code. Grok also scans `~/.claude/skills` and dedupes skills by name |
-| `home/dot_agents/docs/agents/*.md` | `~/.agents/docs/agents/` | Linked from the rules: issue tracker, triage labels, domain docs, PR standards, subagent routing |
+| `home/dot_agents/docs/agents/*.md` | `~/.agents/docs/agents/` | Linked from the rules: issue tracker, triage labels, domain docs, PR standards, subagent routing, T3-first, credentials, repo defaults |
 | `home/.chezmoitemplates/rules/global.md` and `machine-<osFlavour>.md` | (partials) | The one source of the global rules |
 | `home/dot_claude/CLAUDE.md.tmpl` | `~/.claude/CLAUDE.md` | Claude Code. Grok also reads it, through Claude compatibility |
 | `home/dot_codex/AGENTS.md.tmpl` | `~/.codex/AGENTS.md` | Codex (default `CODEX_HOME`), and Muse's `/rules import` |
 | `home/dot_grok/AGENTS.md.tmpl` | `~/.grok/AGENTS.md` | Grok (default `GROK_HOME`) |
 
 - Each skill directory is `exact_`, so chezmoi removes any file the repo no longer has. `~/.agents/skills/` itself is not `exact_`, so vendor packs installed there survive an apply.
-- A file that starts with `#!` gets the `executable_` prefix. Two files have it: `babysit-pr/scripts/pr-wait` and `pr-workflow/scripts/pr-workflow-hook.mjs`.
+- A file that starts with `#!` gets the `executable_` prefix. One file has it: `pr-workflow/scripts/pr-workflow-hook.mjs`.
 - Every file is LF in git (`.gitattributes`). The source files were already LF.
 - The rules+skills block in `home/.chezmoiignore` skips a harness's rules file when that harness is not selected. It also keeps `~/.claude/skills/**` out of chezmoi's entries, because the run script makes those links.
 
@@ -55,19 +55,23 @@ One template, `rules/global.md`, renders all three rules files. `.harness` turns
 | Claude desktop app (MSIX) caveat | Windows only | no | no |
 | WSL2 (available, not the default) | Windows only | Windows only | Windows only |
 | Stack, mattpocock defaults, where skills live, the useEffect rule, Linear | yes | yes | yes |
-| Default way of working | Phase-by-phase, routed agents; Claude fan-out as Workflow, other families as `delegate_task` | Phase-by-phase, every subagent routed by `subagent-routing` | as codex |
+| Default way of working | Phase-by-phase through T3 delegates (`delegate_task`); Workflow only outside T3 | Phase-by-phase, every subagent routed by `subagent-routing`, `delegate_task` inside T3 | as codex |
+| Plan in detail; issue batches in T3 (one thread per issue) | yes | yes | yes |
 | pr-workflow | `/pr-workflow` | `~/.agents/skills/pr-workflow/SKILL.md` | as codex |
 | Engineering standards | `include` of `home/dot_agents/docs/agents/pr-standards.md` between BEGIN/END markers | same | same |
 | Subagent routing | `include` of `home/dot_agents/docs/agents/subagent-routing.md` in a second managed block | same | same |
+| T3-first, credentials, repo defaults | `include` of `t3-first.md`, `credentials.md` and `repo-defaults.md` from the same folder, one managed block each | same | same |
 
 The wording is the owner's. It comes verbatim from three files: `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` on Beast (2026-11-04), and `~/.claude/CLAUDE.md` on WSL. Merging them made these changes:
 - Codex and Grok now get the Linear section and the decision that the factory is retired. The old Codex file had neither. The old Grok file had only the standards block.
 - The Codex shells line said "PowerShell". It now says "PowerShell 5.1", as the Claude file did.
 - The `linux` and `macos` machine fragments are new and short. They repeat this repo's own rules: on `server`, install user-level only, with no sudo, dnf or system units.
 - A new subsection, "Where skills and these rules live", says to edit the repo and not the deployed file.
-- The BEGIN marker names the source in this repo. `~/bin/sync-agent-standards` is the interim tool on machines that have not applied agent-env. Once a machine applies, agent-env supersedes it. `scripts/verify` warns while the interim tool still exists, because it can rewrite the managed blocks. This sync does not edit anything under `~/bin/`.
+- The BEGIN marker names the source in this repo. `~/bin/sync-agent-standards` was the interim tool that wrote the same five blocks with its own marker. agent-env now ships all five, so it supersedes the tool: `scripts/verify` fails when a rules file lacks any of the five `managed by agent-env` blocks (for example after the old tool rewrote one), and only prints an INFO line while the tool still exists. This repo does not edit anything under `~/bin/`.
 
-The engineering-standards block in this repo's `AGENTS.md` was byte-identical to `home/dot_agents/docs/agents/pr-standards.md` when synced from BEAST on 2026-11-05. Change both in the same commit.
+On 2026-11-06 the hand-written sections (agent skills, default way of working, plan in detail, issue batches in T3, Linear, pull requests) were synced from the owner's live `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`; the rendered Claude and Codex files match them apart from the BEGIN markers. The five managed documents were synced from the live `~/.agents/docs/agents/` the same day.
+
+The engineering-standards block in this repo's `AGENTS.md` is byte-identical to `home/dot_agents/docs/agents/pr-standards.md` (2026-11-06). Change both in the same commit.
 
 ### Grok reads the rules twice
 
@@ -89,25 +93,27 @@ The original sources were `~/.claude/skills` and `~/.agents/skills` on Beast, on
 
 On 2026-11-05, `council` and `pr-workflow` were refreshed from the live `~/.claude/skills` copies on BEAST. `subagent-routing` was added from the same source and replaces the retired routing roster. Both managed standards documents were synced from `~/.agents/docs/agents/`. Source files were read only.
 
+On 2026-11-06, 16 skills were refreshed from the owner's live `~/.agents/skills` (the T3-first and land-pr rewrite): `babysit-pr`, `blast-radius`, `correct`, `council`, `create-verification-skill`, `file-pr`, `full-send`, `full-stop`, `herdr`, `how`, `maintain-verification-skill`, `modernize`, `pr-workflow`, `sol-loop`, `subagent-routing` and `takeover`. The live copies retired three files, which leave the repo too: `babysit-pr/scripts/pr-wait` (T3 `watch_pull_request` replaces it), and `pr-workflow/references/cost-model.md` and `workflow-patterns.md` (the no-CI workflow has no runner costs). `subagent-routing` gains `references/issue-threads.md` and its own `scripts/test-hook.mjs`. Two private names were replaced with generic ones (a repository in a `pr-workflow` example and in its hook test).
+
 The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<target relpath>\t<sha256 of the file with CRLF turned to LF>\n`. `run_after_20-skills-links` computes the same hash.
 
 | Skill | Copy used | Files | Tree sha256 (LF) |
 |---|---|---|---|
-| `babysit-pr` | identical in both | 2 | `1cb131361fde93c19f46ddb1138889392fd915852d26b416afc40d1e054cd41b` |
-| `blast-radius` | identical in both | 1 | `bafd0101174596ae39f1e12bd7c1f5a76211577fc7fdcaccfb6ee20cac67a388` |
-| `correct` | identical in both | 1 | `f571ea587df33670d27167db89caf5d286c15640b78642ae683617f1176cfb9d` |
-| `council` | `~/.claude/skills` (2026-11-05) | 1 | `d94bf3cb64b116faf586401562ffc91074411d1b2f73dbdcfc5ad276cc77970c` |
-| `create-verification-skill` | identical in both | 4 | `fea6d8affef154e3d8991460c6b5c35dd60bf2386bfb945852b3532e0d0745ec` |
-| `file-pr` | identical in both | 1 | `15797147a51b9f04d6fa66c213f7db06fc273aa053cdf64e7248d1d6ff93ea12` |
-| `full-send` | identical in both | 2 | `0003534b4ccd4e8565cbf5728e55db63493587c16940f923f0be849881c766b9` |
-| `full-stop` | identical in both | 2 | `024a802ab441a6cdf9f3afedfeee48e22de0de4887c224b6377f79db231a20d0` |
-| `herdr` | identical in both | 1 | `ec8f944a509de0497642390a564f27d23974efb874c28194d54ebb80ee48e9ab` |
-| `how` | identical in both | 3 | `c0681d3cc32d4164739a917c266b2dd5573d32037b8aba95a0b708e06664078b` |
+| `babysit-pr` | `~/.agents/skills` (2026-11-06) | 1 | `5f18b31abf71f7599531cd38b0ab8854f05cd667a88788905dd2267c62c1addd` |
+| `blast-radius` | `~/.agents/skills` (2026-11-06) | 1 | `63cfa68e3114c9df352eeed367ed19b360de904a45085bcc945df4cbbbf0d354` |
+| `correct` | `~/.agents/skills` (2026-11-06) | 1 | `5fe5b4ed3ad388333f973c233f53c20da26a19fe27fb712d0a69d34d7b6b4dbf` |
+| `council` | `~/.agents/skills` (2026-11-06) | 1 | `e146d54dbadb6be4a4e063f086bb8b17ae2b957c6b7fdb094254a90e5c376ea9` |
+| `create-verification-skill` | `~/.agents/skills` (2026-11-06) | 4 | `e925605e281747f1c7fcc8d3a2c17fe86056938a47145bc9a4d7986a70e370db` |
+| `file-pr` | `~/.agents/skills` (2026-11-06) | 1 | `5dbe2a12a0543cc4d5c773d8e7170e23a969d42621d29557a8bc2d986f3a4ad8` |
+| `full-send` | `~/.agents/skills` (2026-11-06) | 2 | `b1acb74410c8c4528bad24c8102219ffbc15e3be2baa13cd1df4fa7602d13c7a` |
+| `full-stop` | `~/.agents/skills` (2026-11-06) | 2 | `05f49da5dc201a6c4a73e9cc608066b8c0199c56abab9789a69190cb088cd64b` |
+| `herdr` | `~/.agents/skills` (2026-11-06) | 1 | `8c9f01af045c4d01ec4faae51bfdf12358d24691f4ec1d43c87dcd53dedb53fb` |
+| `how` | `~/.agents/skills` (2026-11-06) | 3 | `a05f3e51167a925f215d309b3790543185e386b4bcfdd93fee291d471c47f716` |
 | `kun` | identical in both | 1 | `c5cafaca2a3c140002f140e96af2a2eb77423fe7d89251bef59e2b5577833892` |
 | `leaving-pr-comments` | identical in both | 2 | `247ef56da1e550f14cc3b87cab818378f714c461fb42aa4ea441def39e03e661` |
-| `maintain-verification-skill` | identical in both | 1 | `367c331254656433db735dd0f14ba8cbe4edec2f0f7ad84a899908471f5eac13` |
-| `modernize` | identical in both | 2 | `8b49a15ce260749a1fd237bf775a07b507114b1fedc2dd26ecacbeac164f1b62` |
-| `pr-workflow` | `~/.claude/skills` (2026-11-05), public examples | 6 | `208fdd21ea1f23081a742c15558c593c8a79a6492d24cdf43348d2ecb6567cb0` |
+| `maintain-verification-skill` | `~/.agents/skills` (2026-11-06) | 1 | `7bb23921fde2e10024b0927a163abea4a783c4b8c7e17b79877bd68f77aa5ef1` |
+| `modernize` | `~/.agents/skills` (2026-11-06) | 2 | `0186bfc60db5655fc52b60487797b8a2b98d1d8a166cc46bca87c949ad556b3d` |
+| `pr-workflow` | `~/.agents/skills` (2026-11-06), public examples | 4 | `20b86f5e7d25e07fa1dd489939648fd2e2927e60386390532a299953b2686f25` |
 | `principle-boundary-discipline` | identical in both | 1 | `cb9a0b008885757b969430d0f85b4edb6ba5b41994455474c3f9b7f2a5d341d0` |
 | `principle-encode-lessons-in-structure` | identical in both | 1 | `f4c2345b2b07f5c6a067012c58325f36bd98ab40e3bc470c8414dc29ebbe89be` |
 | `principle-fix-root-causes` | identical in both | 1 | `2317a5ac92561c97fe4609b5a54f4379a35a2b7c542aa92f0dc3344d5e4b6959` |
@@ -118,9 +124,9 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `principle-subtract-before-you-add` | identical in both | 1 | `91cf90d82d8aeca82c237753b2022b0ca836cdb20d1b200a5b80d5ce4aef185a` |
 | `principle-type-system-discipline` | identical in both | 1 | `6a3a9db88195d3863d0a4ead13b68d5f6d996d142cdd1d04c20f9ee0c6922c1d` |
 | `react-best-practices` | identical in both | 49 | `81afad38880a4b945e92056485b04a3a75082818bb62094bbdc5329c8d82b7c1` |
-| `sol-loop` | identical in both | 1 | `65db87ad81f27476d487a3c31d7e117f473e383edf8bdfb7360ae7119331631c` |
-| `subagent-routing` | `~/.claude/skills` (2026-11-05) | 2 | `5d300353b82bb5698bd3a0c647b562bdeaa03fd3abb218780e3faf64a0b1b382` |
-| `takeover` | identical in both | 1 | `87987a701b4669b52401bd0940a99a9c2dbcd250ccb3b0da434c391dd50de216` |
+| `sol-loop` | `~/.agents/skills` (2026-11-06) | 1 | `a9177def69cf130930cfffc2e909988e4f1faa93b917de44d63af29f6b4b2077` |
+| `subagent-routing` | `~/.agents/skills` (2026-11-06) | 4 | `50a62c3d0280092e2f479c2774427cc4d95fc4fa60f8255afb23fc60bc299884` |
+| `takeover` | `~/.agents/skills` (2026-11-06) | 1 | `49e3728a144a614f49939c104370d184e5a0c1588d2e8009d6baf52571cb70e7` |
 | `technical-writing` | identical in both | 1 | `a8ca05d14bccb71b3ad671ed5b858cf1b45c555fcb6eda68c9e0a70d3e4585d6` |
 | `typescript-best-practices` | identical in both | 2 | `12d7a54225c5632d9dd5b837cfc89eaaf93b13ab181cc4e410db1e8e660f0f6c` |
 | `unslop` | identical in both | 1 | `8f6ab7d04f0f8af7ee54b3cf842044ef1ddbb79fb22263e18c75895668d10c9f` |

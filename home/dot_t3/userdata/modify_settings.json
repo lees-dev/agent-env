@@ -7,6 +7,14 @@
   The UI preferences and keybindings are seeded once by create_client-settings.json and
   create_keybindings.json, then left to T3.
 
+  T3 defaults (set only when absent; a value the user already has is kept):
+  defaultModelSelection, the sidebarAutoSettle* keys, worktreeCleanup,
+  the 1Password entry of secretProviders, and the agent-setup / agent-teardown entries of
+  defaultProjectScripts (added by id; other scripts are kept). Elsewhere T3 runs project
+  scripts in $SHELL, where "$HOME" expands. On Windows it uses pwsh, then Windows
+  PowerShell, then cmd, which does not expand "$HOME", so the command names the absolute
+  path there (docs/lifecycle.md).
+
   binaryPath: the first candidate that exists, else the harness found on PATH, else the
   first candidate (the install location the packages area uses).
 */ -}}
@@ -42,6 +50,39 @@
 {{-     $s = setValueAtPath (list "providerInstances" $h "config" "binaryPath") $path $s -}}
 {{-   end -}}
 {{- end -}}
+
+{{- $defaults := dict
+      "defaultModelSelection" (dict "instanceId" "codex" "model" "gpt-6.1-sol" "options" (list (dict "id" "reasoningEffort" "value" "medium")))
+      "sidebarAutoSettleOnMerge" true
+      "sidebarAutoSettleAfterDays" 7
+      "sidebarAutoSettleKeepPullRequests" true
+      "worktreeCleanup" (dict "mode" "off") -}}
+{{- range $k, $v := $defaults -}}
+{{-   if not (hasKey $s $k) -}}{{- $s = set $s $k $v -}}{{- end -}}
+{{- end -}}
+
+{{- $providers := dict -}}
+{{- if kindIs "map" (get $s "secretProviders") -}}{{- $providers = $s.secretProviders -}}{{- end -}}
+{{- if not (hasKey $providers "onepassword") -}}
+{{-   $_ := set $providers "onepassword" (dict "kind" "one_password" "label" "1Password (service account)" "config" (dict "account" "service-account")) -}}
+{{-   $s = set $s "secretProviders" $providers -}}
+{{- end -}}
+
+{{- $wtPath := "$HOME/.agents/bin/agent-worktree.mjs" -}}
+{{- if $win -}}{{- $wtPath = printf "%s/.agents/bin/agent-worktree.mjs" $home -}}{{- end -}}
+{{- $wt := printf "node %s" (quote $wtPath) -}}
+{{- $want := list
+      (dict "id" "agent-setup" "name" "Agent setup" "icon" "configure" "command" (printf "%s setup" $wt) "runOnWorktreeCreate" true "async" false)
+      (dict "id" "agent-teardown" "name" "Agent teardown" "icon" "configure" "command" (printf "%s teardown" $wt) "runOnWorktreeCreate" false "runOnSettle" true) -}}
+{{- $scripts := list -}}
+{{- if kindIs "slice" (get $s "defaultProjectScripts") -}}{{- $scripts = $s.defaultProjectScripts -}}{{- end -}}
+{{- $ids := list -}}
+{{- range $scripts -}}{{- if kindIs "map" . -}}{{- $ids = append $ids (toString (get . "id")) -}}{{- end -}}{{- end -}}
+{{- $added := false -}}
+{{- range $want -}}
+{{-   if not (has .id $ids) -}}{{- $scripts = append $scripts . -}}{{- $added = true -}}{{- end -}}
+{{- end -}}
+{{- if $added -}}{{- $s = set $s "defaultProjectScripts" $scripts -}}{{- end -}}
 
 {{- if and (trim .chezmoi.stdin) (eq (toJson $s) (toJson $orig)) -}}
 {{-   .chezmoi.stdin -}}

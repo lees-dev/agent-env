@@ -63,10 +63,22 @@ if ($Harnesses -contains 'grok') {
 }
 if ($Harnesses -contains 'muse') { Ae-Info 'muse: rules come from a one-time /rules import (docs/skills.md); rerun it after the rules change' }
 
-# 5. The retired hand sync must not rewrite the managed files.
+# 5. Every managed rules block comes from agent-env. The interim ~/bin/sync-agent-standards
+#    wrote the same blocks with its own marker; agent-env now ships all five, so the tool is
+#    only reported, and a block it rewrote fails here (and in chezmoi verify).
+foreach ($skH in @('claude', 'codex', 'grok')) {
+    if ($Harnesses -notcontains $skH) { continue }
+    if ($skH -eq 'claude') { $skF = Join-Path $HOME '.claude\CLAUDE.md' } else { $skF = Join-Path $HOME ('.' + $skH + '\AGENTS.md') }
+    if (-not (Test-Path -LiteralPath $skF)) { continue }
+    $skMiss = 0
+    foreach ($skB in @('engineering-standards', 'subagent-routing', 't3-first', 'credentials', 'repo-defaults')) {
+        if (-not (Select-String -LiteralPath $skF -Pattern ('^<!-- BEGIN ' + $skB + ' \(managed by agent-env;') -Quiet)) { $skMiss++ }
+    }
+    if ($skMiss -eq 0) { Ae-Ok ($skH + ' rules carry all 5 agent-env managed blocks') }
+    else { Ae-Fail ($skH + ' rules: ' + $skMiss + ' of 5 managed blocks missing or not from agent-env'); Ae-Hint 'scripts/backup.ps1, then chezmoi apply --force --no-tty' }
+}
 if (Test-Path -LiteralPath (Join-Path $HOME 'bin\sync-agent-standards')) {
-    Ae-Warn '~/bin/sync-agent-standards still exists; chezmoi now owns the rules files'
-    Ae-Hint 'retire it (move it to ~/.agent-env-backups) so it cannot rewrite the standards block'
+    Ae-Info '~/bin/sync-agent-standards is superseded by agent-env (it ships every managed block); it may be deleted'
 }
 
 # 6. The backup list names every exact_ skill directory (apply --force deletes whatever the

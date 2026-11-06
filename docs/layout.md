@@ -28,7 +28,7 @@ chezmoi reads its source state from `home/` (`.chezmoiroot`). A path under `home
 | Path | Deploys to | What |
 |---|---|---|
 | `home/dot_agents/skills/<name>/**` | `~/.agents/skills/<name>/` | The one canonical copy of each user skill |
-| `home/dot_agents/docs/agents/*.md` | `~/.agents/docs/agents/` | `domain.md`, `issue-tracker.md`, `pr-standards.md`, `subagent-routing.md`, `triage-labels.md` |
+| `home/dot_agents/docs/agents/*.md` | `~/.agents/docs/agents/` | `credentials.md`, `domain.md`, `issue-tracker.md`, `pr-standards.md`, `repo-defaults.md`, `subagent-routing.md`, `t3-first.md`, `triage-labels.md` |
 | `home/.chezmoitemplates/rules/*` | (partials, not deployed) | Rule fragments: global rules, one fragment per `osFlavour`, the engineering-standards block |
 | `home/dot_claude/CLAUDE.md.tmpl` | `~/.claude/CLAUDE.md` | Rendered from the rule partials |
 | `home/dot_codex/AGENTS.md.tmpl`, `home/dot_grok/AGENTS.md.tmpl` | `~/.codex/AGENTS.md`, `~/.grok/AGENTS.md` | Rendered from the same partials |
