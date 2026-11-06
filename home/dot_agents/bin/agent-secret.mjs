@@ -23,6 +23,7 @@ const ITEM_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/;
 const FIELD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
 const VAULT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,99}$/;
 const ENVS = ['dev', 'test', 'prod'];
+const LEADING_BOM = new RegExp('^' + String.fromCharCode(0xfeff));
 const PROD_REFUSED = 'production values never go into agent-repos; they stay in the deploy platform';
 
 const USAGE = `usage:
@@ -83,7 +84,7 @@ function envOfItem(item) {
  */
 export function parseEnvFile(text) {
   const out = new Map();
-  const lines = String(text).replace(/^﻿/, '').split(/\r?\n/);
+  const lines = String(text).replace(LEADING_BOM, '').split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/);
     if (!m) continue;
