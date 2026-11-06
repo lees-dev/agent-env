@@ -572,6 +572,21 @@ describe('land-pr', () => {
     });
   }
 
+  test('merge-now: a PR queued during the final checks goes first (fairness re-checked after the last read)', () => {
+    const t = setup();
+    makePr(t, 2);
+    const head = makePr(t, 1);
+    // Repo-variable reads: #1 before the lock, #2 first read under the lock, #3 the last read;
+    // PR 2 is queued right after #3, after the earlier fairness check.
+    const s = state(t); s.mutateAfter = { kind: 'varGet', n: 3, pr: 2, addLabel: 'queued' }; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    assert.equal(state(t).mutateAfter.seen >= 3, true);
+    assert.equal(JSON.parse(r.out).result, 'QUEUED');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+    assert.equal(lockExists(t), false);
+  });
+
   test('capacity: a queue-hold PR does not use a slot (it still counts for fairness)', () => {
     const t = setup({ maxQueued: 2 });
     queuePr(t, 1, { labels: ['queue-hold'] });

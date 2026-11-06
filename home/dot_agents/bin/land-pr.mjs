@@ -199,9 +199,15 @@ async function main() {
         line = othersInLine(gh, n);
         fetchBranch(root, base);
         const stillCurrent = isAncestor(`refs/remotes/origin/${base}`, sha, root);
+        let fair = false;
         if (stillCurrent && line.count === 0) {
           const lastRead = validate(gh.prView(n));
           if (lastRead) return lastRead.done;
+          // Fairness once more, after the last read: a PR queued meanwhile goes first.
+          line = othersInLine(gh, n);
+          fair = line.count === 0;
+        }
+        if (fair) {
           if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
           const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root });
           if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);

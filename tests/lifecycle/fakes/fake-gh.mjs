@@ -127,7 +127,7 @@ function label(sub, rest) {
 
 // Test hook: right after the n-th call of one kind ('varGet': a repo variable read, 'lockGet':
 // a landing-lock ref read), change one PR once, so only the reads after it see the change:
-// s.mutateAfter = { kind, n, pr, base?, appendBody? }.
+// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel? }.
 function countAndMutate(s, kind) {
   const m = s.mutateAfter;
   if (!m || m.kind !== kind) return;
@@ -136,6 +136,7 @@ function countAndMutate(s, kind) {
   const p = s.prs.find((x) => x.number === m.pr);
   if (m.base) p.baseRefName = m.base;
   if (m.appendBody) p.body = `${p.body || ''}${m.appendBody}`;
+  if (m.addLabel) p.labels = [...new Set([...(p.labels || []), m.addLabel])];
 }
 
 function api(rest) {
