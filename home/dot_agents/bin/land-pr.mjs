@@ -44,7 +44,7 @@ import {
   Gh, LandError, LandingLock,
   addHold, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
   holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
-  parseLanding, print, removeHold, repoTop, setLabels, slugFromRemote, unmetDeps, writeLanding,
+  parseLanding, print, removeHold, repoTop, retainedLockMessage, setLabels, slugFromRemote, unmetDeps, writeLanding,
 } from './lib/land.mjs';
 
 const USAGE = [
@@ -215,10 +215,12 @@ async function main() {
             sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
             process.stderr.write(`warning: the wide sweep could not run: ${sweep.error}\n`);
           }
-          return out({ result: 'MERGED', pr: n, sha, mergeSha: m.mergeSha, released, sweep, line: `MERGED ${m.mergeSha || ''}`.trim() }, 0);
+          const freed = lock.release();
+          if (!freed) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);
+          return out({ result: 'MERGED', pr: n, sha, mergeSha: m.mergeSha, released, sweep, lockRetained: freed ? null : lock.retained, line: `MERGED ${m.mergeSha || ''}`.trim() }, 0);
         }
       } finally {
-        lock.release();
+        if (!lock.release()) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);
       }
     } else {
       lockInfo = { busy: true, stale: got.stale, holder: got.holder ? { host: got.holder.host, pid: got.holder.pid, ageMin: got.holder.ageMin } : null };

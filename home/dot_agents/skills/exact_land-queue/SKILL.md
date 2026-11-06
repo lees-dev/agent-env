@@ -31,7 +31,7 @@ The script works one repo at a time, one PR at a time, under the repo lock (`ref
 
 ## 2. Act on the report
 
-Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted`, `admitted`, `reset`, `queued`, `held`, `waiting`, `queueWaiting`, `stale`, `busy`, `paused`, `alerts`, `sweep`.
+Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted`, `admitted`, `reset`, `queued`, `held`, `waiting`, `queueWaiting`, `stale`, `busy`, `paused`, `alerts`, `sweep`, and `lockRetained` when the lock could not be released.
 
 - **merged**: mark each PR's Linear ticket Done with the merge sha; clean up per `pr-workflow` section 7 (worktree teardown does most of it).
 - **bounced**, not parked: move the Linear ticket back to In Progress with the reason. Start an Opus fixer (`subagent-routing`): in this project `delegate_task` with `isolation: "worktree"`; for another repo `t3_thread_launch` with a worktree. Brief it with the PR, the bounce reason, and `pr-workflow` "Editing a queued PR":
@@ -45,6 +45,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 - **reset**: a crashed run left `landing`; it is `queued` again. Mention it.
 - **stale**: the lock is older than its ttl. Confirm the holder (`host`, `pid`) is gone: same machine, no such process, no lander thread running. Only then rerun with `--reclaim-stale`. Otherwise report it. Only the lander reclaims a stale lock.
 - **busy**: another lander holds the lock. Stop; the next run picks up.
+- **lockRetained**: this run could not delete its own lock (the alert says why and gives the command). Report it; it blocks every lander until its ttl. Delete it with that command only once no lander run is active.
 - **paused** or a sweep alert: open a ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node ~/.agents/bin/land-queue.mjs unpause` takes the landing lock (it refuses while another lander holds it), reruns the sweep and clears the pause only when it is green; the owner may also clear it.
 - **error** on a repo: report the message; do not retry in a loop.
 

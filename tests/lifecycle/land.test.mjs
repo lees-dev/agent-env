@@ -960,6 +960,84 @@ describe('land-queue', () => {
     assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
   });
 
+  // A pre-push hook (shared by the main and the lander checkout) that rejects every push while
+  // the file <tmp>/reject-push exists; the test's own setup pushes run without it.
+  const rejectPush = (t, on = true) => {
+    const hook = path.join(t.work, '.git', 'hooks', 'pre-push');
+    const flag = path.join(t.tmp, 'reject-push');
+    t.env.REJECT_PUSH_FLAG = flag;
+    fs.writeFileSync(hook, '#!/bin/sh\nif [ -f "$REJECT_PUSH_FLAG" ]; then echo "pre-push: rejected by the repo hook" >&2; exit 1; fi\nexit 0\n');
+    fs.chmodSync(hook, 0o755);
+    if (on) fs.writeFileSync(flag, ''); else fs.rmSync(flag, { force: true });
+  };
+
+  test('run: a rejecting pre-push hook does not keep the lock after a merge; PR pushes still run the hook', () => {
+    const t = setup();
+    queuePr(t, 1);
+    rejectPush(t);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.equal(rep.lockRetained, undefined);
+    assert.equal(lockExists(t), false, 'the lock release skips the hook');
+    // A rebased head is PR content: its push keeps the repo hook, which rejects it.
+    rejectPush(t, false);
+    queuePr(t, 2);
+    advanceMain(t, 'other.txt', 'x\n');
+    rejectPush(t);
+    const again = runQueue(t);
+    assert.match(again.bounced[0].reason, /push of the rebased head was rejected/);
+    assert.equal(lockExists(t), false);
+  });
+
+  test('run: with a rejecting pre-push hook, another lander\'s replacement lock is still never deleted', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    rejectPush(t);
+    t.env.LAND_TEST_GATE_ACTION = 'steal:1';
+    const rep = runQueue(t);
+    assert.match(rep.aborted[0].reason, /landing lock was lost/);
+    assert.equal(lockSha(t), fs.readFileSync(`${t.env.LAND_TEST_GATE}.stolen`, 'utf8'));
+  });
+
+  test('a lock that cannot be released is reported, by the lander and by merge-now', () => {
+    const t = setup();
+    queuePr(t, 1);
+    // Pushes to origin fail (the lease delete included); the GitHub API still answers.
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', path.join(t.tmp, 'no such remote.git'));
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.ok(rep.lockRetained?.sha);
+    assert.match(rep.alerts.join('\n'), /landing lock could not be released.*git push --no-verify origin :refs\/heads\/agent-landing-lock/);
+    assert.equal(lockExists(t), true);
+    const t2 = setup();
+    const head = makePr(t2, 2);
+    sh(t2.work, t2.env, 'remote', 'set-url', '--push', 'origin', path.join(t2.tmp, 'no such remote.git'));
+    const r = tool(t2, LAND_PR, '2', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    assert.equal(JSON.parse(r.out).result, 'MERGED');
+    assert.ok(JSON.parse(r.out).lockRetained?.sha);
+    assert.match(r.err, /WARNING: the landing lock could not be released/);
+  });
+
+  test('run: a registered, dirty checkout at the lander path is refused with its work intact', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const dir = `${t.work}-lander`;
+    sh(t.work, t.env, 'worktree', 'add', '--quiet', '--detach', dir, 'origin/main');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'my tracked edit\n');
+    fs.writeFileSync(path.join(dir, 'notes.txt'), 'my notes\n');
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1);
+    assert.match(JSON.parse(r.out).error, /refusing to use .* it has 2 changed or untracked file\(s\); it was left untouched/);
+    assert.equal(fs.readFileSync(path.join(dir, 'README.md'), 'utf8'), 'my tracked edit\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'notes.txt'), 'utf8'), 'my notes\n');
+    assert.doesNotMatch(sh(t.work, t.env, 'worktree', 'list', '--porcelain'), /land-queue lander checkout/, 'not locked by the lander');
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.equal(lockExists(t), false);
+  });
+
   test('run: the lander rebase runs repo hooks without the 1Password token', () => {
     const t = setup();
     queuePr(t, 1);

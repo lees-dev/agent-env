@@ -293,6 +293,35 @@ describe('repo-defaults apply.mjs', () => {
     assert.match(read(r, '.gitignore'), /^\.env\.local$/m);
   });
 
+  test('an existing file that cannot be read is invalid and never overwritten', () => {
+    const r = repo();
+    fs.mkdirSync(path.join(r.work, 't3.json'));
+    fs.mkdirSync(path.join(r.work, 'CLAUDE.md'));
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1, a.err);
+    const st = Object.fromEntries(a.json.items.map((i) => [i.name, i]));
+    assert.equal(st['t3.json'].status, 'invalid');
+    assert.match(st['t3.json'].detail, /cannot be read/);
+    assert.equal(st['CLAUDE.md'].status, 'invalid');
+    assert.ok(fs.statSync(path.join(r.work, 't3.json')).isDirectory());
+    assert.equal(st['AGENTS.md block'].status, 'ok', 'the other items still apply');
+  });
+
+  test('a write-only AGENTS.md (no read permission) is invalid and left as it was', (t) => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) { t.skip('POSIX permissions as a normal user'); return; }
+    const r = repo({ 'AGENTS.md': 'Owned rules.\n' });
+    const p = path.join(r.work, 'AGENTS.md');
+    fs.chmodSync(p, 0o200);
+    try {
+      const a = run(r, '--apply', '--json');
+      assert.equal(a.status, 1);
+      assert.equal(a.json.items.find((i) => i.name === 'AGENTS.md block').status, 'invalid');
+    } finally {
+      fs.chmodSync(p, 0o644);
+    }
+    assert.equal(fs.readFileSync(p, 'utf8'), 'Owned rules.\n');
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

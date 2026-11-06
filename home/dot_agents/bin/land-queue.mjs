@@ -40,7 +40,7 @@ import {
   appendLanding, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
-  runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
+  retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
 } from './lib/land.mjs';
 
 const USAGE = 'usage: node land-queue.mjs <run|status|unpause> [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]';
@@ -264,6 +264,15 @@ function takeLock(ctx, report, opts) {
   return false;
 }
 
+// Release the lock; one that could not be deleted while still ours is reported (it blocks every
+// lander until its ttl), and the run stops.
+function releaseLock(ctx, report) {
+  if (ctx.lock.release()) return true;
+  report.lockRetained = ctx.lock.retained;
+  report.alerts.push(retainedLockMessage(ctx.lock));
+  return false;
+}
+
 // Holding the lock, nothing can be landing: a `landing` label is left over from a crash.
 function resetLeftovers(gh, report) {
   for (const p of listQueue(gh)) {
@@ -299,7 +308,9 @@ async function runRepo(t, opts) {
     // Recover a crashed run first, whatever else stops this one (a pause, nothing eligible).
     if (listQueue(gh).some((p) => labelNames(p).includes('landing'))) {
       if (!takeLock(ctx, report, opts)) { fillQueueState(gh, report); return report; }
-      try { resetLeftovers(gh, report); } finally { ctx.lock.release(); }
+      let kept = false;
+      try { resetLeftovers(gh, report); } finally { kept = !releaseLock(ctx, report); }
+      if (kept) { fillQueueState(gh, report); return report; }
     }
   }
   let lost = false;
@@ -335,7 +346,7 @@ async function runRepo(t, opts) {
       if (pr && !res?.merged) { try { setLabels(gh, gh.prView(pr.number), { add: ['queued'], remove: ['landing'] }); } catch { /* reported below */ } }
       throw e;
     } finally {
-      ctx.lock.release();
+      if (!releaseLock(ctx, report)) lost = true;
     }
     if (!res) break;
     if (res.bounced) report.bounced.push(res.bounced);
@@ -350,7 +361,7 @@ async function runRepo(t, opts) {
   // nothing else is in the way.
   if (!opts.dryRun && !report.paused && !report.busy && !report.stale.length && !lost && sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
     if (takeLock(ctx, report, opts)) {
-      try { await sweepAfter(ctx, report); } finally { ctx.lock.release(); }
+      try { await sweepAfter(ctx, report); } finally { releaseLock(ctx, report); }
     }
   }
   fillQueueState(gh, report);
@@ -368,13 +379,14 @@ async function unpauseRepo(t) {
     if (!takeLock(ctx, probe, {})) {
       return { repo: t.repo, paused: true, sweep: null, busy: true, note: probe.stale.length ? 'the landing lock is stale; the lander reclaims it' : 'the landing lock is busy; try again after the lander finishes' };
     }
+    let r;
     try {
-      const r = await runSweep(ctx);
+      r = await runSweep(ctx);
       sweep = { ok: r.ok, cmd: r.cmd, status: r.status };
-      if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red` };
     } finally {
-      ctx.lock.release();
+      if (!releaseLock(ctx, probe)) process.stderr.write(`WARNING: ${probe.alerts.at(-1)}\n`);
     }
+    if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red`, lockRetained: probe.lockRetained || null };
   }
   gh.setPaused(false);
   return { repo: t.repo, paused: false, sweep, note: 'cleared AGENT_LANDING_PAUSED' };

@@ -439,13 +439,34 @@ export class LandingLock {
     return this.advance(holder.sha, holder.tree);
   }
 
+  // True when the lock is no longer ours (deleted, or another lander owns the ref now). False
+  // when it could not be deleted and still points at our commit: `retained` then says why, and
+  // the caller must report it (it stays until its ttl or until deleted by hand). The delete is
+  // lock plumbing, not repo content, so it skips the repo's pre-push hook (--no-verify); every
+  // push of PR content keeps the hooks.
   release() {
-    if (!this.commit) return false;
+    if (!this.commit) return true;
     const mine = this.commit;
     this.commit = null;
-    const r = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${LOCK_REF}:${mine}`, 'origin', `:refs/heads/${LOCK_REF}`], { cwd: this.cwd });
-    return r.status === 0;
+    this.retained = null;
+    const r = git(['push', '--no-verify', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${LOCK_REF}:${mine}`, 'origin', `:refs/heads/${LOCK_REF}`], { cwd: this.cwd });
+    if (r.status === 0) return true;
+    let cur;
+    try {
+      const g = this.gh.api('GET', this.route(`ref/heads/${LOCK_REF}`));
+      cur = g.ok ? g.data?.object?.sha : g.status === 404 ? null : mine;
+    } catch {
+      cur = mine;
+    }
+    if (cur !== mine) return true;
+    this.retained = { sha: mine, reason: firstLine(r.stderr || r.stdout) || `git push exit ${r.status}` };
+    return false;
   }
+}
+
+// What to tell the user when release() kept the lock.
+export function retainedLockMessage(lock) {
+  return `the landing lock could not be released (${lock.retained?.reason}); it stays until its ttl (${lock.ttlMin} min) or until removed with: git push --no-verify origin :refs/heads/${LOCK_REF}`;
 }
 
 export function baseTreeOf(cwd, ref) {
@@ -655,20 +676,39 @@ export function clearQueueLabels(gh, pr) {
 // one is used only when it is exactly that: its own top level, a registered worktree of this
 // repository (same common git dir), and not a link or junction to the main checkout. Anything
 // else at that path is refused before any fetch, reset, clean or push touches it.
+// Ownership: the lander locks its checkout with LANDER_LOCK_REASON. A checkout locked that way
+// is the lander's own, and resetting and cleaning it is safe. Any other registered worktree at
+// that path (unlocked, or locked by someone else) is used only when it is detached and has no
+// changes or untracked files; then an unlocked one is locked for the lander. Someone else's
+// lock is never replaced, and a checkout holding work is refused with that work intact.
+export const LANDER_LOCK_REASON = 'land-queue lander checkout';
+
 export function landerCheckout(mainRoot, base) {
   const dir = `${mainRoot}-lander`;
   const mainCommon = canonKey(gitOk(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: mainRoot }));
   let exists = true;
   try { fs.lstatSync(dir); } catch { exists = false; }
-  if (!exists) gitOk(['worktree', 'add', '--detach', dir, `refs/remotes/origin/${base}`], { cwd: mainRoot });
-  verifyLander(dir, mainRoot, mainCommon);
-  const lock = git(['worktree', 'lock', '--reason', 'land-queue lander checkout', dir], { cwd: mainRoot });
-  if (lock.status !== 0 && !/already locked/i.test(lock.stderr)) throw new LandError(`git worktree lock failed: ${firstLine(lock.stderr)}`);
+  if (!exists) {
+    gitOk(['worktree', 'add', '--detach', dir, `refs/remotes/origin/${base}`], { cwd: mainRoot });
+    gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
+  }
+  const entry = verifyLander(dir, mainRoot, mainCommon);
+  if (entry.locked !== LANDER_LOCK_REASON) {
+    const refuse = (why) => { throw new LandError(`refusing to use ${dir} as the lander checkout: ${why}; it was left untouched`); };
+    if (entry.locked !== null) refuse(`it is locked by someone else (${entry.locked || 'no reason given'})`);
+    if (!entry.detached) refuse('it has a branch checked out (the lander uses a detached checkout)');
+    const st = git(['status', '--porcelain', '--untracked-files=all'], { cwd: dir });
+    if (st.status !== 0) refuse('git status failed there');
+    if (st.stdout.trim()) refuse(`it has ${st.stdout.trim().split(/\r?\n/).length} changed or untracked file(s)`);
+    gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
+  }
   // Leave any earlier half-finished rebase.
   if (fs.existsSync(path.join(gitOk(['rev-parse', '--absolute-git-dir'], { cwd: dir }), 'rebase-merge'))) git(['rebase', '--abort'], { cwd: dir });
   return dir;
 }
 
+// The checkout's `git worktree list --porcelain` entry: { detached, locked } (locked: null when
+// not locked, else the reason, '' without one). Throws when it is not the lander checkout.
 function verifyLander(dir, mainRoot, mainCommon) {
   const refuse = (why) => { throw new LandError(`refusing to use ${dir} as the lander checkout: ${why}; move it away by hand`); };
   if (canonKey(dir) === canonKey(mainRoot)) refuse('it is the main checkout (a link or junction to it)');
@@ -678,8 +718,14 @@ function verifyLander(dir, mainRoot, mainCommon) {
   const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: dir });
   if (common.status !== 0 || canonKey(common.stdout.trim()) !== mainCommon) refuse('it belongs to another repository');
   const list = gitOk(['worktree', 'list', '--porcelain'], { cwd: mainRoot });
-  const registered = list.split(/\r?\n/).filter((l) => l.startsWith('worktree ')).some((l) => canonKey(l.slice('worktree '.length)) === canonKey(dir));
-  if (!registered) refuse('it is not a registered worktree of this repository');
+  for (const block of list.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const wt = lines.find((l) => l.startsWith('worktree '));
+    if (!wt || canonKey(wt.slice('worktree '.length)) !== canonKey(dir)) continue;
+    const locked = lines.find((l) => l === 'locked' || l.startsWith('locked '));
+    return { detached: lines.includes('detached'), locked: locked === undefined ? null : locked.slice('locked'.length).trim() };
+  }
+  return refuse('it is not a registered worktree of this repository');
 }
 
 export function resetTo(dir, ref) {

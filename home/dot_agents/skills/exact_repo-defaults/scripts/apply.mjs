@@ -36,6 +36,16 @@ function git(args, cwd) {
 }
 
 function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
+// A file this script may write: its text, or null only when it does not exist. One that exists
+// but cannot be read (a directory, no read permission) throws Unreadable: the item is then
+// invalid and nothing is written, so an existing file is never replaced unseen.
+class Unreadable extends Error {}
+function readOwned(p) {
+  try { return fs.readFileSync(p, 'utf8'); } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw new Unreadable(`exists but cannot be read (${e.code || e.message}): fix by hand`);
+  }
+}
 function eolOf(text) { return /\r\n/.test(text) ? '\r\n' : '\n'; }
 function withEol(text, eol) { return eol === '\n' ? text : text.replace(/\r?\n/g, eol); }
 function asset(name) { return fs.readFileSync(path.join(ASSETS, name), 'utf8').replace(/\r\n/g, '\n'); }
@@ -67,7 +77,7 @@ export const BLOCK_VERSION = Number(BLOCK.match(/agent-standard v(\d+)/)[1]);
 
 function agentsBlock(root) {
   const p = path.join(root, 'AGENTS.md');
-  const text = readText(p);
+  const text = readOwned(p);
   if (text === null) {
     return {
       name: 'AGENTS.md block', status: 'missing', detail: 'no AGENTS.md',
@@ -113,7 +123,7 @@ function claudeMd(root) {
     const target = path.basename(fs.readlinkSync(p));
     return target === 'AGENTS.md' ? { name: 'CLAUDE.md', status: 'ok', detail: 'link to AGENTS.md' } : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${target}: fix by hand` };
   }
-  const text = readText(p) ?? '';
+  const text = readOwned(p) ?? '';
   if (/^@AGENTS\.md\s*$/m.test(text)) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
   const eol = eolOf(text);
   return {
@@ -128,7 +138,7 @@ const isTeardown = (s) => /agent-worktree\.mjs"?\s+teardown\b/.test(s?.command |
 function t3Json(root) {
   const p = path.join(root, 't3.json');
   const want = JSON.parse(asset('t3.json'));
-  const text = readText(p);
+  const text = readOwned(p);
   if (text === null) return { name: 't3.json', status: 'missing', detail: 'no t3.json', fix: () => { writeFile(p, `${JSON.stringify(want, null, 2)}\n`); return 'created t3.json'; } };
   const cur = jsonObject(text);
   if (!cur) return { name: 't3.json', status: 'invalid', detail: 'not a JSON object: fix by hand' };
@@ -220,7 +230,7 @@ export function repoJsonFromDetection(d) {
 
 function repoJson(root) {
   const p = path.join(root, '.agents', 'repo.json');
-  const text = readText(p);
+  const text = readOwned(p);
   const d = detect(root);
   if (text === null) {
     return {
@@ -267,10 +277,11 @@ function gitignore(root) {
   const p = path.join(root, '.gitignore');
   const missing = GITIGNORE_LINES.filter((l) => !ignoredByRepo(root, l));
   if (!missing.length) return { name: '.gitignore', status: 'ok', detail: GITIGNORE_LINES.join(', ') };
+  const current = readOwned(p) ?? '';
   return {
     name: '.gitignore', status: 'missing', detail: `not ignored: ${missing.join(', ')}`,
     fix: () => {
-      const text = readText(p) ?? '';
+      const text = current;
       const eol = text ? eolOf(text) : '\n';
       const sep = text && !text.endsWith('\n') ? eol : '';
       fs.writeFileSync(p, `${text}${sep}${text ? eol : ''}# agent-standard: secrets injected from 1Password (repo-defaults)${eol}${missing.join(eol)}${eol}`);
@@ -360,8 +371,19 @@ function rulesets(root, offline) {
 
 // ------------------------------------------------------------------ main
 
+// One item; an existing file it cannot read makes it invalid, with no fix.
+function item(name, fn, root) {
+  try { return fn(root); } catch (e) {
+    if (e instanceof Unreadable) return { name, status: 'invalid', detail: e.message };
+    throw e;
+  }
+}
+
 export function evaluate(root, { offline = false } = {}) {
-  const items = [agentsBlock(root), claudeMd(root), t3Json(root), repoJson(root), gitignore(root), repoMd(root)];
+  const items = [
+    item('AGENTS.md block', agentsBlock, root), item('CLAUDE.md', claudeMd, root), item('t3.json', t3Json, root),
+    item('.agents/repo.json', repoJson, root), item('.gitignore', gitignore, root), item('docs/agents/repo.md', repoMd, root),
+  ];
   const todo = todos(root);
   return {
     items, todo,
