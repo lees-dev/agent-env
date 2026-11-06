@@ -40,7 +40,7 @@ function isFile(p) {
  * Absolute path of an executable, or null. On Windows tries PATHEXT (.EXE first, then .CMD,
  * .BAT, .COM) and never returns an extension-less file, which Windows cannot run.
  */
-export function which(cmd, env = process.env) {
+export function which(cmd, env = process.env, cwd = undefined) {
   if (!cmd) return null;
   const exts = isWindows
     ? ['.exe', '.cmd', '.bat', '.com'].concat(
@@ -55,7 +55,8 @@ export function which(cmd, env = process.env) {
     return uniq.map((e) => base + e);
   };
   if (hasDir || path.isAbsolute(cmd)) {
-    for (const c of candidates(path.resolve(cmd))) {
+    // A relative path (./scripts/x.sh) is relative to the directory the command runs in.
+    for (const c of candidates(path.resolve(cwd || process.cwd(), cmd))) {
       if (isFile(c) && (isWindows || isExecutable(c))) return c;
     }
     return null;
@@ -94,7 +95,7 @@ function escapeArgument(arg, twice) {
  */
 export function prepare(cmd, args = [], opts = {}) {
   const env = opts.env || process.env;
-  const file = which(cmd, env);
+  const file = which(cmd, env, opts.cwd);
   if (!file) {
     const e = new Error(`${cmd}: not found on PATH`);
     e.code = 'ENOENT';

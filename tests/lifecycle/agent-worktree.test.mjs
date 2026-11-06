@@ -54,6 +54,7 @@ describe('units', () => {
     assert.equal(foreignRefs(ok, 'demo'), 0);
     assert.equal(foreignRefs('A=op://other-vault/demo-api-dev/A\n', 'demo'), 1);
     assert.equal(foreignRefs('A=op://agent-repos/other-api-dev/A\n', 'demo'), 1);
+    assert.equal(foreignRefs('A=OP://other-vault/demo-api-dev/A\nB=Op://Agent-Repos/Demo-api-dev/B\n', 'demo'), 1, 'case-insensitive');
     assert.equal(foreignRefs('A=op://agent-repos/demo-/A\nB=op://agent-repos/demoapi/B\n', 'demo'), 2);
   });
   test('gatedShas reads Gate lines', () => {
@@ -81,6 +82,13 @@ describe('units', () => {
     assert.notEqual(c.PORT, a.PORT);
     assert.deepEqual(await allocatePorts({ PORT: 41000 }, 'x', { PORT: 41234 }), { PORT: 41234 });
   });
+  test('a stored port that another ledger now holds is reallocated', async () => {
+    const p = await allocatePorts({ P: 43000 }, 'w', { P: 43005 }, new Set([43005]));
+    assert.notEqual(p.P, 43005);
+    const keep = await allocatePorts({ P: 43000 }, 'w', { P: 43005 }, new Set());
+    assert.equal(keep.P, 43005);
+  });
+
   test('parseArgs', () => {
     const o = parseArgs(['track', 'neon-branch', 'b1', '--where', 'neon', '--dry-run']);
     assert.deepEqual([o._, o.where, o.dryRun], [['track', 'neon-branch', 'b1'], 'neon', true]);
@@ -631,12 +639,18 @@ describe('teardown', () => {
       'setInterval(() => {}, 1000);',
     ].join('\n'));
     const parent = spawn(process.execPath, [path.join(scratchDir, 'parent.js')], { stdio: 'ignore', windowsHide: true });
+    const pidFile = path.join(scratchDir, 'child.pid');
+    const killQuietly = (pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } };
+    // Stop everything this test starts even when an assertion fails first.
+    cleanups.unshift(() => {
+      killQuietly(parent.pid);
+      try { killQuietly(Number(fs.readFileSync(pidFile, 'utf8'))); } catch { /* no pid file */ }
+    });
     // A sibling folder whose name starts with the worktree's name.
     const copy = `${repo.wt} copy`;
     write(path.join(copy, 'server.js'), 'setInterval(() => {}, 1000);\n');
     const sibling = spawn(process.execPath, [path.join(copy, 'server.js')], { stdio: 'ignore', windowsHide: true });
-    cleanups.unshift(() => { try { sibling.kill(); } catch { /* gone */ } });
-    const pidFile = path.join(scratchDir, 'child.pid');
+    cleanups.unshift(() => killQuietly(sibling.pid));
     for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await sleep(100);
     const childPid = Number(fs.readFileSync(pidFile, 'utf8'));
     await sleep(200);

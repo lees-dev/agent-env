@@ -60,7 +60,7 @@ Locks: one lock per ledger, one repo-wide lock around port allocation, one per w
 
 1. Records the worktree in its ledger (reactivating a torn-down one) and in `~/.agents/state/repos.json`.
 2. Allocates the ports.
-3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<itemPrefix>-<item>/<field>`. The output must be untracked, git-ignored, not a link, and not under a linked folder. When any of that fails, or `op` or the service token is missing, setup warns loudly, writes nothing and removes a stale untracked output, so a stale secret is never left behind. An output that is not git-ignored is removed only when setup wrote it earlier (its managed block, or the ledger records it), never a file you created.
+3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<itemPrefix>-<item>/<field>`. The output must be untracked, git-ignored, not a link, and not under a linked folder. When any of that fails, or `op` or the service token is missing, setup warns loudly, injects no secrets (a usable output gets only the managed footer) and removes a stale untracked output, so a stale secret is never left behind. An output that is not git-ignored is removed only when setup wrote it earlier (its managed block, or the ledger records it), never a file you created.
 4. Writes a managed footer (`AGENT_WT_ID` and the ports) into the output file.
 5. Runs the `setup` commands. A rejected or failing command makes setup exit 1; a missing secret only warns. A broken config (for example an `env.output` outside the worktree) exits 2.
 6. Runs `hooks.setup` and the `repo-defaults` drift check (warnings only), then starts `sweep --quick` in the background.

@@ -217,10 +217,18 @@ export function readRegistry(env = process.env) {
   return data && Array.isArray(data.repos) ? data : { version: 1, repos: [] };
 }
 
+/** The registry for an update: empty only when missing; throws when it exists but is unreadable. */
+function registryForUpdate(env) {
+  const data = readExisting(registryFile(env));
+  if (data === null) return { version: 1, repos: [] };
+  if (!Array.isArray(data.repos)) throw new Error('repos.json has no repos list; left as it is for a person to repair');
+  return data;
+}
+
 export function registerRepo(repoRoot, name, env = process.env) {
   const file = registryFile(env);
   withLock(file, () => {
-    const data = readRegistry(env);
+    const data = registryForUpdate(env);
     const key = normPath(repoRoot);
     const hit = data.repos.find((r) => normPath(r.root) === key);
     const now = new Date().toISOString();

@@ -26,7 +26,9 @@ export const DEFAULTS = Object.freeze({
 
 /** Normalise a path for comparisons: resolved, forward slashes, lower case on Windows. */
 export function normPath(p) {
-  const r = path.resolve(String(p).replace(/^\\\\\?\\(UNC\\)?/i, (m, unc) => (unc ? '\\\\' : ''))).replace(/\\/g, '/').replace(/\/+$/, '');
+  // A backslash separates folders only on Windows; on POSIX it is part of a name.
+  const resolved = path.resolve(String(p).replace(/^\\\\\?\\(UNC\\)?/i, (m, unc) => (unc ? '\\\\' : '')));
+  const r = (isWindows ? resolved.replace(/\\/g, '/') : resolved).replace(/\/+$/, '');
   return isWindows ? r.toLowerCase() : r;
 }
 
@@ -102,6 +104,12 @@ export function loadConfig(dir) {
       raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (e) {
       throw new Error(`.agents/repo.json is not valid JSON: ${e.message}`);
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('.agents/repo.json must contain a JSON object');
+    for (const k of ['env', 'ports']) {
+      if (raw[k] !== undefined && raw[k] !== null && (typeof raw[k] !== 'object' || Array.isArray(raw[k]))) {
+        throw new Error(`.agents/repo.json: "${k}" must be an object`);
+      }
     }
     if (raw.version !== undefined && raw.version !== 1) {
       throw new Error(`.agents/repo.json version ${raw.version} is not supported (expected 1)`);

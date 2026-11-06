@@ -255,10 +255,16 @@ function retireSource(src) {
   const dir = path.dirname(src);
   if (!gitOut(['rev-parse', '--show-toplevel'], { cwd: dir })) return 'the source is not inside a git checkout';
   if (git(['check-ignore', '-q', '--', dest], { cwd: dir }).status !== 0) return `${path.basename(dest)} would not be git-ignored`;
+  // Create the copy private from the start (exclusive, mode 0600), then fill it.
   try {
-    fs.copyFileSync(src, dest, fs.constants.COPYFILE_EXCL);
+    const fd = fs.openSync(dest, 'wx', 0o600);
+    try { fs.writeFileSync(fd, fs.readFileSync(src)); } finally { fs.closeSync(fd); }
   } catch (e) { return `could not create ${path.basename(dest)} (${e.code || e.message})`; }
-  try { fs.chmodSync(dest, 0o600); } catch { /* Windows */ }
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(dest, 0o600); } catch (e) {
+      return `${path.basename(dest)} could not be made private (${e.code || e.message}); the source was kept`;
+    }
+  }
   try { fs.unlinkSync(src); } catch (e) {
     return `copied to ${path.basename(dest)} but could not delete the source (${e.code || e.message}); delete one copy before retrying`;
   }
@@ -352,6 +358,10 @@ function cmdImport(opts) {
     if (!envOfItem(item)) throw new UsageError(`map entry for ${key}: ${NEEDS_ENV}`);
     if (importPrefix && !item.startsWith(`${importPrefix}-`)) throw new UsageError(`map entry for ${key}: item names for --repo ${opts.repo} start with ${importPrefix}-`);
     if (!groups.has(item)) groups.set(item, []);
+    const previous = groups.get(item).find((e) => e.name === field);
+    if (previous && previous.value !== value) {
+      throw new UsageError(`map entries ${previous.key} and ${key} both target ${item}/${field} with different values`);
+    }
     groups.get(item).push({ key, name: field, value, env });
   }
   const missing = Object.keys(map).filter((k) => map[k] !== 'skip' && !values.has(k)).length;
@@ -409,12 +419,12 @@ function cmdRef(opts) {
   const [item, field] = opts._.slice(1);
   if (!item || !field) throw new UsageError('ref needs <item> <FIELD>');
   if (!ITEM_RE.test(item) || !FIELD_RE.test(field)) throw new UsageError('invalid item or field name');
-  log(reference(vaultOf(opts, cwdRepo()), item, field));
+  log(reference(vaultOf(opts), item, field));
   return 0;
 }
 
 function cmdCheck(opts) {
-  const vault = vaultOf(opts, cwdRepo());
+  const vault = vaultOf(opts);
   const st = opStatus();
   log(`op: ${st.op ? 'found' : 'not found'}; token: ${st.hasToken ? 'present' : 'missing'}`);
   if (!st.op || !st.hasToken) return 1;

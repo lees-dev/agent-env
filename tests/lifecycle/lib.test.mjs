@@ -47,6 +47,17 @@ describe('proc', () => {
     assert.equal(proc.run('definitely-not-installed-x', [], { env }).status, 127);
   });
 
+  test('a relative command path resolves against the cwd it runs in', () => {
+    const s = tmp();
+    const sub = path.join(s.dir, 'repo dir');
+    const name = isWin ? 'tool.cmd' : 'tool';
+    write(path.join(sub, 'scripts', name), isWin ? '@echo from-script\r\n' : '#!/bin/sh\necho from-script\n');
+    fs.chmodSync(path.join(sub, 'scripts', name), 0o755);
+    const r = proc.run(`./scripts/${name}`, [], { cwd: sub });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /from-script/);
+  });
+
   test('run feeds stdin only when input is given', () => {
     const r = proc.run(process.execPath, ['-e', 'process.stdout.write(require("fs").readFileSync(0,"utf8"))'], { input: 'piped' });
     assert.equal(r.stdout, 'piped');
@@ -245,6 +256,20 @@ describe('repo and ledger', () => {
     const long = repo.makeWtId('a-very-long-repository-name', '/x/agent-lee-12345-an-extremely-long-worktree-name');
     assert.ok(long.length <= 40);
     assert.match(long, /^[a-z0-9-]+$/);
+  });
+
+  test('on POSIX a backslash is part of a name, not a separator', { skip: isWin }, () => {
+    assert.equal(repo.isUnder('/srv/wt\\outside', '/srv/wt'), false);
+    assert.equal(repo.isUnder('/srv/wt/inside', '/srv/wt'), true);
+  });
+
+  test('loadConfig rejects non-object JSON and non-object env or ports', () => {
+    const s = tmp();
+    fs.mkdirSync(path.join(s.dir, '.agents'));
+    for (const bad of ['null', '[]', '"x"', '{"env":"x"}', '{"ports":[1]}']) {
+      fs.writeFileSync(path.join(s.dir, '.agents', 'repo.json'), bad);
+      assert.throws(() => repo.loadConfig(s.dir), /must (contain a JSON object|be an object)/, bad);
+    }
   });
 
   test('canonical resolves links and the \\\\?\\ prefix', () => {

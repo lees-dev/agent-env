@@ -138,7 +138,8 @@ export async function allocatePorts(cfgPorts, wtId, stored = {}, taken = new Set
   for (const [name, baseRaw] of Object.entries(cfgPorts || {})) {
     const base = Number(baseRaw);
     if (!Number.isInteger(base) || base < 1 || base > 65535 - 900) throw new Error(`ports.${name}: invalid base ${baseRaw}`);
-    if (Number.isInteger(stored[name])) {
+    // A stored port is kept unless another live ledger now holds it.
+    if (Number.isInteger(stored[name]) && !taken.has(stored[name])) {
       out[name] = stored[name];
       taken.add(stored[name]);
       continue;
@@ -170,8 +171,9 @@ export function writeFooter(file, values) {
 
 /** Number of op:// references that are not op://agent-repos/<prefix>-<item>/<field>. */
 export function foreignRefs(text, prefix) {
-  const refs = String(text).match(/op:\/\/[^\s"'`#]+/g) || [];
-  const ok = new RegExp(`^op://agent-repos/${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[^/]+/[^/]+`);
+  // 1Password references are case-insensitive: OP://Other-Vault/... is a reference too.
+  const refs = String(text).match(/op:\/\/[^\s"'`#]+/gi) || [];
+  const ok = new RegExp(`^op://agent-repos/${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[^/]+/[^/]+`, 'i');
   return refs.filter((r) => !ok.test(r)).length;
 }
 
@@ -777,7 +779,10 @@ async function teardown(ctx, { dryRun }) {
     log(`dry run, ${a.detail}: would do: ${describe(s)}`);
     return 0;
   }
+  // Record the identity too: a worktree set up without this engine has no ledger yet.
   updateLedger(ctx.commonDir, ctx.wtId, (l) => Object.assign(l, {
+    repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath,
+    branch: ctx.branch || l.branch || null, ticket: ctx.branch ? ctx.ticket : l.ticket || null,
     state: s.errors.length ? 'kept' : 'torn-down',
     keptReason: s.errors.length ? s.errors.join('; ') : null,
     prNumber: a.pr.number,
@@ -959,7 +964,8 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
     const pending = new Set(ledgers
       .filter(({ wtId, data: d }) => d && d.state !== 'torn-down' && d.branch && !finished.has(wtId))
       .map(({ data: d }) => d.branch));
-    const refs = unreadable ? [] : (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
+    // lstrip=2 gives the exact branch name even when a tag has the same name.
+    const refs = unreadable ? [] : (gitOut(['for-each-ref', '--format=%(refname:lstrip=2) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
     if (unreadable) r.kept.push('branches: not swept while a ledger is unreadable');
     for (const line of refs) {
       const [branch, tip] = line.split(' ');

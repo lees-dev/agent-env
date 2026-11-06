@@ -276,6 +276,15 @@ describe('import, ref, check', () => {
     assert.ok(fs.existsSync(env));
   });
 
+  test('two map entries with different values for one field are refused before op runs', () => {
+    const { s, repo } = fixture();
+    const { env, mapFile } = files(repo, { API_KEY: { item: 'demo-api-dev', field: 'K' }, DEBUG: { item: 'demo-api-dev', field: 'K' } });
+    const r = secret(s, ['import', '--env', env, '--map', mapFile], repo.wt, undefined, T);
+    assert.equal(r.status, 2, r.out);
+    assert.match(r.stderr, /both target demo-api-dev\/K with different values/);
+    assert.equal(s.calls('op').length, 0);
+  });
+
   test('refused fields make import exit 1', () => {
     const { s, repo } = fixture();
     s.writeState((st) => { st.op.items.push({ id: 'i9', vault: 'agent-repos', title: 'demo-api-dev', fields: [{ id: 'API_KEY', label: 'API_KEY', type: 'CONCEALED', value: 'owner-value' }] }); });
