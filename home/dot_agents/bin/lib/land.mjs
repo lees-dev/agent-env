@@ -783,8 +783,16 @@ export function mergePinned(gh, cfg, { pr, sha, cwd }) {
   // `message` (the command's first output line, scrubbed) is for the local caller only; `summary`
   // has no command output and is what may go into a PR comment.
   const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env, cwd });
-  if (r.status !== 0) return { ok: false, message: firstLine(r.stderr || r.stdout), summary: `merge command exit ${r.status}` };
-  const after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
+  let after;
+  if (r.status !== 0) {
+    // A wrapper can merge and still exit non-zero (a failing step after the merge): a fresh read
+    // that shows MERGED is a merge, cleaned up and counted. Anything else (or a failed read) stays
+    // a failure; an unconfirmed or pending merge is never treated as merged.
+    try { after = gh.prView(pr); } catch { after = null; }
+    if (after?.state !== 'MERGED') return { ok: false, message: firstLine(r.stderr || r.stdout), summary: `merge command exit ${r.status}` };
+  } else {
+    after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
+  }
   if (after.state !== 'MERGED') {
     const s = `PR state is ${after.state} after the merge command`;
     return { ok: false, message: s, summary: s };
@@ -891,6 +899,8 @@ export async function runCommands(entries, dir, lock, cfg) {
   for (const { name, cmd } of entries) {
     const r = await runAsync(splitArgv(cmd), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(cfg.lockTtlMin) : 0, onTick, timeoutMs: limit });
     const what = `${name} \`${cmd}\``;
+    // A command can end before any refresh noticed a new owner: ownership is checked after each.
+    if (!lost && lock && !lock.stillHeld()) lost = true;
     // The lock is someone else's now: nothing is kept or released for it, and since processes
     // this command started may survive, the checkout must not be reused (stuck).
     if (lost) return { ok: false, lost: true, stuck: Boolean(r.stuck), name, cmd, status: r.status, summary: `${what}: the landing lock was lost, so it was stopped` };

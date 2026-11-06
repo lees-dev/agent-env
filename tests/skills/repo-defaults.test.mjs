@@ -677,12 +677,76 @@ describe('repo-defaults apply.mjs', () => {
 
   test('an @AGENTS.md import inside a fenced code block is not an import (``` and ~~~)', () => {
     for (const fence of ['```', '~~~~']) {
-      const text = `Example:\n\n${fence}md\n@AGENTS.md\n${fence}\n`;
+      const text = ['Example:', '', `${fence}md`, '@AGENTS.md', fence, ''].join('\n');
       const r = repo({ 'CLAUDE.md': text });
       assert.equal(run(r, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'missing', fence);
       assert.equal(run(r, '--apply').status, 0);
       assert.equal(read(r, 'CLAUDE.md'), `@AGENTS.md\n\n${text}`, `${fence}: the real import is added, the example kept`);
     }
+  });
+
+  test('a leading BOM stays first; a BOM never hides a fence or an import', () => {
+    const BOM = '\uFEFF';
+    // AGENTS.md: the block goes after the BOM.
+    const a = repo({ 'AGENTS.md': `${BOM}# Rules\n` });
+    assert.equal(run(a, '--apply').status, 0);
+    assert.equal(read(a, 'AGENTS.md'), `${BOM}${BLOCK}\n\n# Rules\n`);
+    // CLAUDE.md: an example in a fence that starts the file is not an import.
+    const fence = '```';
+    const body = [`${fence}md`, '@AGENTS.md', fence, ''].join('\n');
+    const c = repo({ 'CLAUDE.md': `${BOM}${body}` });
+    assert.equal(run(c, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'missing');
+    assert.equal(run(c, '--apply').status, 0);
+    assert.equal(read(c, 'CLAUDE.md'), `${BOM}@AGENTS.md\n\n${body}`);
+    // A real import on the first line after a BOM is an import.
+    const ok = repo({ 'CLAUDE.md': `${BOM}@AGENTS.md\n` });
+    assert.equal(run(ok, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'ok');
+  });
+
+  test('rulesets: every page, each read in full; only required checks and merge queues listed; unreadable ones reported', () => {
+    const r = repo();
+    git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');
+    const bin = path.join(path.dirname(r.work), 'fake bin');
+    fs.mkdirSync(bin);
+    const fake = path.join(bin, 'fake-gh.mjs');
+    fs.writeFileSync(fake, [
+      "import { spawnSync } from 'node:child_process';",
+      'const [tool, ...args] = process.argv.slice(2);',
+      "if (tool === 'git') process.exit(spawnSync(process.env.REC_REAL_GIT, args, { stdio: 'inherit' }).status ?? 1);",
+      'const out = (v) => { process.stdout.write(JSON.stringify(v)); process.exit(0); };',
+      "const all = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: `r${i + 1}`, enforcement: 'active', target: 'branch' }));",
+      "const route = args.find((a) => a.startsWith('repos/'));",
+      "const f = Object.fromEntries(args.flatMap((a, i) => (args[i - 1] === '-f' ? [a.split('=')] : [])));",
+      "if (route === 'repos/o/sample-app/rulesets') {",
+      '  const n = Number(f.per_page || 30); const p = Number(f.page || 1);',
+      '  out(all.slice((p - 1) * n, p * n));',
+      '}',
+      "if (route && route.startsWith('repos/o/sample-app/rulesets/')) {",
+      "  const id = Number(route.split('/').pop());",
+      '  if (id === 50) process.exit(1);',
+      "  out({ id, rules: id === 1 ? [{ type: 'required_status_checks' }, { type: 'deletion' }] : id === 101 ? [{ type: 'merge_queue' }] : [{ type: 'deletion' }] });",
+      '}',
+      'process.exit(1);',
+    ].join('\n'));
+    for (const tool of ['git', 'gh']) {
+      if (process.platform === 'win32') fs.writeFileSync(path.join(bin, `${tool}.cmd`), `@"${process.execPath}" "${fake}" ${tool} %*\r\n`);
+      else { fs.writeFileSync(path.join(bin, tool), `#!/bin/sh\nexec "${process.execPath}" "${fake}" ${tool} "$@"\n`); fs.chmodSync(path.join(bin, tool), 0o755); }
+    }
+    const pk = Object.keys(r.e).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const e = { ...r.e, [pk]: `${bin}${path.delimiter}${r.e[pk]}`, REC_REAL_GIT: GIT };
+    const j = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--json'], { env: e, encoding: 'utf8', shell: false });
+    assert.equal(j.status, 0, j.stderr);
+    const rs = JSON.parse(j.stdout).rulesets;
+    assert.deepEqual(rs.list, [
+      { name: 'r1', enforcement: 'active', target: 'branch', rules: ['required_status_checks'] },
+      { name: 'r101', enforcement: 'active', target: 'branch', rules: ['merge_queue'] },
+    ]);
+    assert.deepEqual(rs.unreadable, [{ name: 'r50', id: 50 }]);
+    assert.equal(rs.incomplete, null);
+    const txt = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect'], { env: e, encoding: 'utf8', shell: false });
+    assert.match(txt.stdout, /INFO {2}ruleset r1 \(active\) has required_status_checks: drop only those rules/);
+    assert.match(txt.stdout, /WARN {2}ruleset r50: its rules could not be read/);
+    assert.doesNotMatch(txt.stdout, /ruleset r2 /, 'a ruleset with no gating rule is not reported');
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

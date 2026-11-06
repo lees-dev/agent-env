@@ -86,6 +86,9 @@ function readOwned(p, root) {
   }
 }
 function eolOf(text) { return /\r\n/.test(text) ? '\r\n' : '\n'; }
+// A leading byte-order mark stays the file's first character on every write; checks read the
+// text after it (a BOM before a fence or an import line would hide it).
+function splitBom(text) { return text.startsWith('\uFEFF') ? ['\uFEFF', text.slice(1)] : ['', text]; }
 function withEol(text, eol) { return eol === '\n' ? text : text.replace(/\r?\n/g, eol); }
 function asset(name) { return fs.readFileSync(path.join(ASSETS, name), 'utf8').replace(/\r\n/g, '\n'); }
 // Write without ever leaving a half-written file: the text goes to a temp file next to the real
@@ -184,7 +187,7 @@ function agentsBlock(root) {
   if (!blocks.length) {
     return {
       name: 'AGENTS.md block', status: 'missing', detail: 'no managed block',
-      fix: () => { writeIn(root, p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
+      fix: () => { const [bom, body] = splitBom(text); writeIn(root, p, `${bom}${withEol(BLOCK, eol)}${eol}${eol}${body}`); return 'inserted the block at the top of AGENTS.md'; },
     };
   }
   const found = blocks.map((b) => `v${b[1]}`).join(', ');
@@ -225,11 +228,12 @@ function claudeMd(root) {
       : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${raw}, not this repo's AGENTS.md: fix by hand` };
   }
   const text = readOwned(p, root) ?? '';
-  if (/^@AGENTS\.md\s*$/m.test(outsideFences(text))) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
+  const [bom, body] = splitBom(text);
+  if (/^@AGENTS\.md\s*$/m.test(outsideFences(body))) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
   const eol = eolOf(text);
   return {
     name: 'CLAUDE.md', status: 'missing', detail: 'does not import @AGENTS.md',
-    fix: () => { writeIn(root, p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
+    fix: () => { writeIn(root, p, `${bom}@AGENTS.md${eol}${eol}${body}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
   };
 }
 
@@ -485,16 +489,46 @@ function gatingWorkflows(root) {
   return out;
 }
 
+// The rules that gate PRs on CI; every other rule (deletion, force-push, reviews) stays.
+const GATING_RULES = new Set(['required_status_checks', 'merge_queue']);
+const RULESET_PAGE = 100;
+const RULESET_MAX_PAGES = 20;
+
+// Every ruleset (all pages), each read in full: only those with a gating rule are listed, with
+// those rules. One whose rules cannot be read is reported as unreadable, never as non-gating; a
+// list page that cannot be read makes the report incomplete.
 function rulesets(root, offline) {
   if (offline) return { skipped: 'offline' };
   const remote = git(['remote', 'get-url', 'origin'], root);
   const m = remote.ok ? remote.out.match(/github\.com[:/]+([^/\s]+)\/([^/\s]+?)(\.git)?\/?$/i) : null;
   if (!m) return { skipped: 'origin is not on GitHub' };
-  const r = child('gh', ['api', `repos/${m[1]}/${m[2]}/rulesets`], root, { timeout: 30000 });
-  if (r.status !== 0) return { skipped: 'gh api failed (no gh, no access, or no network)' };
-  const parsed = json(r.stdout).value;
-  const list = Array.isArray(parsed) ? parsed.filter((x) => x && typeof x === 'object') : [];
-  return { list: list.map((x) => ({ name: x.name, enforcement: x.enforcement, target: x.target })) };
+  const route = `repos/${m[1]}/${m[2]}/rulesets`;
+  const api = (r, params = []) => {
+    const c = child('gh', ['api', '--method', 'GET', r, ...params.flatMap((x) => ['-f', x])], root, { timeout: 30000 });
+    return c.status === 0 ? json(c.stdout).value : undefined;
+  };
+  const all = [];
+  let incomplete = null;
+  for (let page = 1; ; page++) {
+    if (page > RULESET_MAX_PAGES) { incomplete = `more than ${RULESET_MAX_PAGES * RULESET_PAGE} rulesets; only the first ${all.length} were checked`; break; }
+    const v = api(route, [`per_page=${RULESET_PAGE}`, `page=${page}`]);
+    if (!Array.isArray(v)) {
+      if (page === 1) return { skipped: 'gh api failed (no gh, no access, or no network)' };
+      incomplete = `page ${page} of the ruleset list could not be read; only the first ${all.length} were checked`;
+      break;
+    }
+    all.push(...v.filter((x) => x && typeof x === 'object'));
+    if (v.length < RULESET_PAGE) break;
+  }
+  const list = [];
+  const unreadable = [];
+  for (const x of all) {
+    const d = Number.isSafeInteger(x.id) ? api(`${route}/${x.id}`) : undefined;
+    if (!d || typeof d !== 'object' || !Array.isArray(d.rules)) { unreadable.push({ name: x.name, id: x.id ?? null }); continue; }
+    const gating = [...new Set(d.rules.map((r) => r?.type).filter((t) => GATING_RULES.has(t)))];
+    if (gating.length) list.push({ name: x.name, enforcement: x.enforcement, target: x.target, rules: gating });
+  }
+  return { list, unreadable, incomplete };
 }
 
 // ------------------------------------------------------------------ main
@@ -580,7 +614,9 @@ function main() {
       if (ev.env.envOp?.foreignVaultRefs) L.push(`WARN  .env.op: ${ev.env.envOp.foreignVaultRefs} reference(s) outside op://agent-repos/`);
       for (const w of result.gatingWorkflows) L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
       if (result.gatingWorkflowsError) L.push(`WARN  ${result.gatingWorkflowsError}: PR-gating workflows not checked`);
-      for (const r of ev.rulesets.list || []) L.push(`INFO  ruleset ${r.name} (${r.enforcement}): drop required checks and merge queue in the separate PR`);
+      for (const r of ev.rulesets.list || []) L.push(`INFO  ruleset ${r.name} (${r.enforcement}) has ${r.rules.join(', ')}: drop only those rules in the separate PR, keep its other rules`);
+      for (const r of ev.rulesets.unreadable || []) L.push(`WARN  ruleset ${r.name}: its rules could not be read; check by hand for required status checks or a merge queue`);
+      if (ev.rulesets.incomplete) L.push(`WARN  rulesets: ${ev.rulesets.incomplete}`);
       if (ev.rulesets.skipped) L.push(`INFO  rulesets not listed: ${ev.rulesets.skipped}`);
     }
     L.push(`${drift.length ? 'repo-defaults: drift' : 'repo-defaults: ok'} (${drift.length} item(s))`);

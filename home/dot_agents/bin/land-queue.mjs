@@ -65,6 +65,13 @@ function changedPaths(dir, from, to) {
 
 // ---------------------------------------------------------------- bounce
 
+// A bounce changes the PR (body, labels, comment): only while this lander still owns the lock.
+// After a loss the PR is left for the next lander, like an abort.
+function bounceOwned(ctx, pr, reason) {
+  if (!ctx.lock.stillHeld()) return { aborted: { pr: pr.number, reason: 'the landing lock was lost; the PR is left for the next lander' }, lost: true };
+  return { bounced: bounce(ctx.gh, pr, reason) };
+}
+
 // The reason is a summary built here (commands, exit codes, paths, SHAs); the output of a
 // command never goes into a PR comment, where a secret it printed would be public.
 function bounce(gh, pr, rawReason) {
@@ -101,6 +108,8 @@ function bounce(gh, pr, rawReason) {
 // the pause flag and lock ownership. Used before the push and twice before the merge (around
 // the final base check), so no read that a merge relies on goes unchecked.
 function recheck(gh, pr, want, expectHead, lock) {
+  // Ownership first: any other reason found after a loss must not lead to changes of ours.
+  if (!lock.stillHeld()) return { requeue: 'the landing lock was lost', lost: true };
   const p = gh.prView(pr.number);
   if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
   pr.labels = p.labels;
@@ -119,13 +128,16 @@ function recheck(gh, pr, want, expectHead, lock) {
 
 // A failed re-check never merges: the PR goes back to `queued` (queue-hold kept) and the next
 // round starts its validation again; a closed PR just loses `landing`.
-function abort(gh, pr, r, stage) {
-  if (r.stop) {
+function abort(gh, pr, r, stage, lock) {
+  // Ownership first: a lock lost at any point (even alongside another reason) means the PR is
+  // not ours to relabel (the new holder may be landing it); the next lander recovers a leftover
+  // `landing` under its own lock.
+  if (!r.lost && lock && !lock.stillHeld()) r = { ...r, lost: true };
+  if (r.stop && !r.lost) {
     setLabels(gh, pr, { remove: ['landing'] });
     return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}` } };
   }
-  // After a lost lock the PR is not ours to relabel (the new holder may be landing it): the
-  // next lander recovers a leftover `landing` under its own lock.
+  if (r.stop) return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}; the landing lock was lost` }, lost: true };
   if (!r.lost) setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
   return { aborted: { pr: pr.number, reason: `${r.requeue} before ${stage}` }, paused: Boolean(r.paused), lost: Boolean(r.lost) };
 }
@@ -134,6 +146,8 @@ function abort(gh, pr, r, stage) {
 
 async function landOne(ctx, pr) {
   const { gh, cfg, mainRoot, lock, root } = ctx;
+  // A retry after a moved base starts here again: nothing is changed unless the lock is ours.
+  if (!lock.stillHeld()) return { aborted: { pr: pr.number, reason: 'the landing lock was lost before the landing' }, lost: true };
   setLabels(gh, pr, { add: ['landing'], remove: ['queued'] });
   let gated = parseLanding(pr.body).gatedSha;
   // A head that this lander rebased, gated and pushed, whose `pass` line was never written (the
@@ -144,7 +158,7 @@ async function landOne(ctx, pr) {
     pr.body = body;
     gated = pr.headRefOid;
   }
-  if (!gated) return { bounced: bounce(gh, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section') };
+  if (!gated) return bounceOwned(ctx, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section');
   if (!pr.headRefOid.startsWith(gated)) {
     // GitHub can lag behind a push: it may still show the head this lander replaced (the gate
     // before its last `lander rebase` gate). The branch itself decides: if origin already has the
@@ -154,27 +168,37 @@ async function landOne(ctx, pr) {
     const last = gates[gates.length - 1];
     if (gates.length >= 2 && /lander rebase/.test(last.note) && pr.headRefOid === gates[gates.length - 2].sha
       && remoteHead(mainRoot, pr.headRefName) === last.sha) {
-      return { ...abort(gh, pr, { requeue: `GitHub still shows the head before the lander rebase (${pr.headRefOid.slice(0, 12)}; the branch has ${last.sha.slice(0, 12)})` }, 'landing'), stop: true };
+      return { ...abort(gh, pr, { requeue: `GitHub still shows the head before the lander rebase (${pr.headRefOid.slice(0, 12)}; the branch has ${last.sha.slice(0, 12)})` }, 'landing', lock), stop: true };
     }
-    return { bounced: bounce(gh, pr, `head changed after the gate (head ${pr.headRefOid.slice(0, 12)}, gated ${gated.slice(0, 12)})`) };
+    return bounceOwned(ctx, pr, `head changed after the gate (head ${pr.headRefOid.slice(0, 12)}, gated ${gated.slice(0, 12)})`);
   }
   const head = pr.headRefOid;
   const base = pr.baseRefName || cfg.base;
   const want = { base, headRef: pr.headRefName };
+  const baseRef = `refs/remotes/origin/${base}`;
   const dir = landerCheckout(mainRoot, base);
+  // Resets of the checkout happen only while this lander still owns the lock: after a loss it
+  // may be another lander's.
+  const resetOwned = () => { if (lock.stillHeld()) resetTo(dir, baseRef); };
   fetchBranch(dir, base);
   const f = git(['fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${pr.headRefName}:refs/remotes/origin/${pr.headRefName}`], { cwd: dir });
-  if (f.status !== 0) return { bounced: bounce(gh, pr, `cannot fetch ${pr.headRefName} from origin (fork PRs are not supported)`) };
+  if (f.status !== 0) return bounceOwned(ctx, pr, `cannot fetch ${pr.headRefName} from origin (fork PRs are not supported)`);
   const fetched = gitOk(['rev-parse', '--verify', `refs/remotes/origin/${pr.headRefName}^{commit}`], { cwd: dir });
-  if (fetched !== head) return { bounced: bounce(gh, pr, `branch moved while landing (origin has ${fetched.slice(0, 12)})`) };
+  if (fetched !== head) return bounceOwned(ctx, pr, `branch moved while landing (origin has ${fetched.slice(0, 12)})`);
 
-  const baseRef = `refs/remotes/origin/${base}`;
   let landSha = head;
   let rebased = false;
   if (!isAncestor(baseRef, head, dir)) {
     rebased = true;
     const forkPoint = gitOk(['merge-base', baseRef, head], { cwd: dir });
     const newBase = gitOk(['rev-parse', baseRef], { cwd: dir });
+    // A plain rebase drops merge commits, and with them any change made only in a merge (a
+    // conflict resolution): range-diff skips merges and the path check sees no new path, so that
+    // loss would pass. A branch with merges is rebased by hand, then re-gated and re-reviewed.
+    const merges = git(['rev-list', '--merges', `${forkPoint}..${head}`], { cwd: dir });
+    if (merges.status !== 0) return bounceOwned(ctx, pr, `cannot list the branch's commits (git rev-list exit ${merges.status})`);
+    const mergeCount = merges.stdout.split(/\r?\n/).filter(Boolean).length;
+    if (mergeCount) return bounceOwned(ctx, pr, `the branch has ${mergeCount} merge commit(s), which an automatic rebase would drop; rebase it onto ${base} by hand, then re-gate and re-review`);
     resetTo(dir, head);
     // Repo hooks (pre-rebase, post-rewrite) run here: without the token, like every child.
     const rb = git(['-c', 'rebase.autoSquash=false', '-c', 'rebase.updateRefs=false', 'rebase', '--no-autostash', newBase], {
@@ -183,27 +207,27 @@ async function landOne(ctx, pr) {
     if (rb.status !== 0) {
       const files = git(['diff', '--name-only', '--diff-filter=U'], { cwd: dir }).stdout.split(/\r?\n/).filter(Boolean);
       git(['rebase', '--abort'], { cwd: dir });
-      resetTo(dir, baseRef);
+      resetOwned();
       const list = files.slice(0, 10).join(', ');
-      return { bounced: bounce(gh, pr, `rebase onto ${base} conflicts in ${files.length} file(s)${list ? `: ${list}` : ''}; re-gate and re-review after resolving`) };
+      return bounceOwned(ctx, pr, `rebase onto ${base} conflicts in ${files.length} file(s)${list ? `: ${list}` : ''}; re-gate and re-review after resolving`);
     }
     const rebasedSha = gitOk(['rev-parse', 'HEAD'], { cwd: dir });
     const rd = git(['range-diff', '--no-color', `${forkPoint}..${head}`, `${newBase}..${rebasedSha}`], { cwd: dir });
     if (rd.status !== 0) {
-      resetTo(dir, baseRef);
-      return { bounced: bounce(gh, pr, `git range-diff failed (exit ${rd.status})`) };
+      resetOwned();
+      return bounceOwned(ctx, pr, `git range-diff failed (exit ${rd.status})`);
     }
     const changes = rangeDiffChanges(rd.stdout);
     if (changes.total === 0 || changes.changed.length) {
-      resetTo(dir, baseRef);
+      resetOwned();
       const what = changes.total === 0 ? 'the rebase left no commits' : `the rebase changed ${changes.changed.length} of ${changes.total} commit(s)`;
-      return { bounced: bounce(gh, pr, `${what}; re-gate and re-review`) };
+      return bounceOwned(ctx, pr, `${what}; re-gate and re-review`);
     }
     const before = changedPaths(dir, forkPoint, head);
     const added = [...changedPaths(dir, newBase, rebasedSha)].filter((p) => !before.has(p));
     if (added.length) {
-      resetTo(dir, baseRef);
-      return { bounced: bounce(gh, pr, `the rebased diff touches ${added.length} new path(s): ${added.slice(0, 10).join(', ')}; re-gate and re-review`) };
+      resetOwned();
+      return bounceOwned(ctx, pr, `the rebased diff touches ${added.length} new path(s): ${added.slice(0, 10).join(', ')}; re-gate and re-review`);
     }
     // Same patches on a newer base: rerun the affected gate only.
     // A failed gate gets one retry; a lost lock or a timeout does not.
@@ -212,44 +236,44 @@ async function landOne(ctx, pr) {
     if (!g.ok && !g.lost && !g.timedOut) { retried = true; g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg); }
     // A lost lock: the checkout may be another lander's now (and processes this gate started may
     // survive), so it is left as it is.
-    if (g.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push');
+    if (g.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push', lock);
     // A gate that could not be stopped may still use the checkout: no reset; the lock is kept
     // (runCommands) and the run stops when it is not released.
-    if (g.stuck) return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}, after the rebase`) };
+    if (g.stuck) return bounceOwned(ctx, pr, `affected gate failed: ${g.summary}, after the rebase`);
     if (!g.ok) {
-      resetTo(dir, baseRef);
-      return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}${retried ? ' (retried once)' : ''}, after the rebase`) };
+      resetOwned();
+      return bounceOwned(ctx, pr, `affected gate failed: ${g.summary}${retried ? ' (retried once)' : ''}, after the rebase`);
     }
     landSha = rebasedSha;
     const pre = recheck(gh, pr, want, head, lock);
-    if (pre) { if (!pre.lost) resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
+    if (pre) { if (!pre.lost) resetOwned(); return abort(gh, pr, pre, 'the push', lock); }
     // Record the gated rebased head before pushing it, as pending: if recording `pass` after the
     // push fails, the next run recognises the pushed head as this lander's gated one.
     const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started)`);
     gh.prEdit(pr.number, { body: pendingBody });
     pr.body = pendingBody;
     const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
-    resetTo(dir, baseRef);
-    if (push.status !== 0) return { bounced: bounce(gh, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`) };
+    resetOwned();
+    if (push.status !== 0) return bounceOwned(ctx, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`);
     const body = confirmPending(pr.body, landSha);
     gh.prEdit(pr.number, { body });
     pr.body = body;
     const seen = waitForPr(gh, pr.number, (p) => p.headRefOid === landSha);
     // GitHub lagging behind the push is not the PR's fault: back to queued, no bounce; the next
     // run recognises the pushed head (see the gate check above).
-    if (seen.headRefOid !== landSha) return { ...abort(gh, pr, { requeue: 'GitHub has not shown the pushed head yet' }, 'the merge'), stop: true };
+    if (seen.headRefOid !== landSha) return { ...abort(gh, pr, { requeue: 'GitHub has not shown the pushed head yet' }, 'the merge', lock), stop: true };
   }
 
   // Right before the merge: the full re-check; then the final base check (a moved base means
   // the caller redoes the rebase and validation); then the full re-check again, the last read.
   const first = recheck(gh, pr, want, landSha, lock);
-  if (first) return abort(gh, pr, first, 'the merge');
+  if (first) return abort(gh, pr, first, 'the merge', lock);
   fetchBranch(dir, base);
   if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
   const last = recheck(gh, pr, want, landSha, lock);
-  if (last) return abort(gh, pr, last, 'the merge');
+  if (last) return abort(gh, pr, last, 'the merge', lock);
   const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root });
-  if (!m.ok) return { bounced: bounce(gh, pr, `merge failed (${m.summary})`) };
+  if (!m.ok) return bounceOwned(ctx, pr, `merge failed (${m.summary})`);
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
 }
 
@@ -334,17 +358,19 @@ function resetLeftovers(gh, report) {
 // After an error mid-landing, settle the PR from a fresh read: never leave `landing`, and never
 // put a bounced (queue-blocked) or merged PR back in line. A merge that went through (the error
 // came after it, for example while reading the PR back) is counted: returns { merged }.
-function settleAfterError(gh, pr, res, report) {
+function settleAfterError(gh, pr, res, report, lock) {
   if (!pr || res?.merged) return null;
+  const owned = !lock || lock.stillHeld();
   let fresh;
   try { fresh = gh.prView(pr.number); } catch { return null; }
   if (fresh.state === 'MERGED') {
     const merged = { pr: pr.number, sha: fresh.headRefOid, mergeSha: fresh.mergeCommit?.oid || null, rebased: null };
-    clearQueueLabels(gh, fresh);
+    if (owned) clearQueueLabels(gh, fresh);
     report.merged.push(merged);
     try { bumpMergeCount(gh.repo); } catch { /* the merge stands; only the sweep count is off */ }
     return { merged };
   }
+  if (!owned) return null;
   try {
     if (fresh.state !== 'OPEN' || labelNames(fresh).includes('queue-blocked')) setLabels(gh, fresh, { remove: ['landing'] });
     else setLabels(gh, fresh, { add: ['queued'], remove: ['landing'] });
@@ -420,7 +446,7 @@ async function runRepo(t, opts) {
         for (let k = 1; ; k++) {
           res = await landOne(ctx, pr);
           if (!res.retry) break;
-          if (k >= MAX_BASE_RETRIES) { res = { bounced: bounce(gh, pr, `could not land after ${k} tries: ${res.note}`) }; break; }
+          if (k >= MAX_BASE_RETRIES) { res = bounceOwned(ctx, pr, `could not land after ${k} tries: ${res.note}`); break; }
           pr = gh.prView(pr.number);
         }
       }
@@ -432,7 +458,7 @@ async function runRepo(t, opts) {
     } catch (e) {
       // Settle the PR from a fresh read. A merge that went through is counted and the run goes
       // on; anything else is reported as the error.
-      const settled = settleAfterError(gh, pr, res, report);
+      const settled = settleAfterError(gh, pr, res, report, ctx.lock);
       if (!settled) throw e;
       res = settled;
       report.alerts.push(`#${pr.number} merged, but reading it back failed (${firstLine(e?.message || e)}); confirmed merged from a fresh read`);
@@ -482,6 +508,7 @@ async function unpauseRepo(t) {
       if (!releaseLock(ctx, probe)) process.stderr.write(`WARNING: ${probe.alerts.at(-1)}\n`);
     }
     if (r.lost) return { repo: t.repo, paused: true, sweep, note: 'the landing lock was lost during the sweep; the pause stays', lockRetained: probe.lockRetained || null };
+    if (r.stuck || r.timedOut) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} did not finish (${r.summary}); the pause stays`, lockRetained: probe.lockRetained || null };
     if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red (${r.summary})`, lockRetained: probe.lockRetained || null };
   }
   gh.setPaused(false);
