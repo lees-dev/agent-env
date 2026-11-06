@@ -72,9 +72,9 @@ Teardown is idempotent. Exit 0 means T3 may remove the worktree; exit 1 means ke
 | State | Result |
 |---|---|
 | Any PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` | Keep, exit 1 |
+| Uncommitted or untracked files (ignored files and an untracked env output are fine), whatever the PR state | Keep, exit 1 |
 | No PR, or an open PR | Nothing removed, exit 0 |
 | An open PR uses this branch as its base | Keep, exit 1 |
-| Uncommitted or untracked files (ignored files and an untracked env output are fine) | Keep, exit 1 |
 | Unpushed work | Keep, exit 1 |
 | Detached HEAD with commits on no branch, remote or tag, or with uncommitted files | Keep, exit 1 |
 | Merged or closed, clean, pushed | Clean up, exit 0 |
@@ -106,7 +106,7 @@ node ~/.agents/bin/agent-secret.mjs ref demo-api-dev API_KEY
 node ~/.agents/bin/agent-secret.mjs check
 ```
 
-- `put` reads the value from stdin, never from arguments. It creates or edits the item through a JSON template on stdin, reads the value back and compares hashes, and prints the reference. With `--repo`, the item name must start with `<itemPrefix>-`, and the reference is added to that repo's `.env.op` when you run it inside the repo. It refuses `--env prod` and any `-prod` item, whatever `--env` says. It refuses to overwrite a field it did not create (fields it creates sit in the item's `agent-secret` section) unless you pass `--replace`.
+- `put` reads the value from stdin, never from arguments. It creates or edits the item through a JSON template on stdin, reads the value back and compares hashes, and prints the reference. Item names must end in `-dev` or `-test`. With `--repo`, the item name must start with `<itemPrefix>-`, and the reference is added to that repo's `.env.op` when you run it inside the repo (the template must be a file inside the checkout, not a link). It refuses `--env prod` and any `-prod` item, whatever `--env` says. It refuses to overwrite a field it did not create (fields it creates sit in the item's `agent-secret` section) unless you pass `--replace`.
 - `import` parses an env file as data and stores each mapped key. The map is `{"ENV_NAME": "<item>" | {"item": "...", "field": "..."} | "skip"}`, with the same prod and prefix rules. It prints `migrated N, skipped M, mismatches K`, and exits 1 on any mismatch or refused field. With `--retire-source` and no mismatches, it moves the source to `<file>.pre-op` (mode 0600). It refuses when that file already exists or would not be git-ignored.
 - `check` prints the account type and whether the vault is visible.
 

@@ -592,7 +592,10 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
 
   if (!worktreeGone) {
     const { out } = envPaths(ctx);
-    if ((fs.existsSync(out) || isSymlink(out)) && !linkedAncestor(wt, out) && !isTracked(wt, out)) s.envFile = dryRun ? 'would delete' : removeFile(out);
+    if ((fs.existsSync(out) || isSymlink(out)) && !linkedAncestor(wt, out) && !isTracked(wt, out)) {
+      s.envFile = dryRun ? 'would delete' : removeFile(out);
+      if (s.envFile === false) s.errors.push(`could not delete ${path.basename(out)}`);
+    }
   }
 
   const pattern = ctx.cfg.remoteBranchDelete ? new RegExp(ctx.cfg.remoteBranchDelete) : null;
@@ -658,9 +661,10 @@ async function teardown(ctx, { dryRun }) {
   const ledger = readLedger(ctx.commonDir, ctx.wtId) || { resources: [], ports: {} };
   const note = (state, keptReason, pr) => {
     if (dryRun) return;
+    // A detached HEAD keeps the branch this worktree last had, so sweep can still assess it.
     updateLedger(ctx.commonDir, ctx.wtId, (l) => Object.assign(l, {
-      repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, branch: ctx.branch,
-      ticket: ctx.ticket, state, keptReason, prNumber: pr ? pr.number : l.prNumber || null,
+      repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, branch: ctx.branch || l.branch || null,
+      ticket: ctx.branch ? ctx.ticket : l.ticket || null, state, keptReason, prNumber: pr ? pr.number : l.prNumber || null,
       prState: pr ? pr.state : l.prState || null,
     }));
   };
@@ -693,6 +697,14 @@ async function teardown(ctx, { dryRun }) {
   const { out } = envPaths(ctx);
   const a = assess({ prs, worktreePath: ctx.worktreePath, ignore: envIgnore(ctx.worktreePath, out) });
   if (a.verdict === 'no-pr' || a.verdict === 'open') {
+    // Exit 0 lets T3 remove the worktree, which would lose uncommitted files.
+    const dirty = dirtyCount(ctx.worktreePath, envIgnore(ctx.worktreePath, out));
+    if (dirty !== 0) {
+      const why = `${a.detail}; ${dirty === null ? 'git status failed' : plural(dirty, 'changed or untracked file')}`;
+      warn(`keep: ${why}`);
+      note('kept', why, a.pr);
+      return 1;
+    }
     log(`${a.detail}: nothing removed`);
     note('active', a.detail, a.pr);
     return 0;

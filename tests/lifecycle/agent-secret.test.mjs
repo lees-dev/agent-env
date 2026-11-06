@@ -82,6 +82,27 @@ describe('put', () => {
     assert.equal(s.calls('op').length, 0);
   });
 
+  test('refuses item names without a -dev or -test suffix', () => {
+    const { s, repo } = fixture();
+    for (const item of ['demo-api', 'demo-api-production']) {
+      const r = secret(s, ['put', item, 'K'], repo.wt, 'v', T);
+      assert.equal(r.status, 2, r.out);
+      assert.match(r.stderr, /end in -dev or -test/);
+    }
+    assert.equal(s.calls('op').length, 0);
+  });
+
+  test('refuses an env.template outside the checkout before storing anything', () => {
+    const s = scratch();
+    cleanups.push(s.cleanup);
+    const repo = makeRepo(s, { config: { env: { template: '../outside.env' } } });
+    const r = secret(s, ['put', 'demo-api-dev', 'K', '--repo', 'demo'], repo.wt, 'v', T);
+    assert.equal(r.status, 2, r.out);
+    assert.match(r.stderr, /env\.template must be a file inside the checkout/);
+    assert.equal(s.calls('op').length, 0);
+    assert.equal(fs.existsSync(path.join(s.dir, 'outside.env')), false);
+  });
+
   test('itemPrefix in repo.json sets the required prefix', () => {
     const s = scratch();
     cleanups.push(s.cleanup);

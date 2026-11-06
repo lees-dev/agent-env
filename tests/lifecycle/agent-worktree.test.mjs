@@ -279,6 +279,28 @@ describe('teardown', () => {
     assert.match(r.stdout, /no PR for this branch: nothing removed/);
   });
 
+  test('no PR or an open PR with uncommitted files: kept, exit 1', () => {
+    for (const state of [null, 'OPEN']) {
+      const { s, repo } = fixture();
+      if (state) merged(s, repo, { state });
+      write(path.join(repo.wt, 'notes.txt'), 'wip\n');
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 1, r.out);
+      assert.match(r.stderr, /keep: .*1 changed or untracked file/);
+      assert.equal(ledgerOf(repo).state, 'kept');
+    }
+  });
+
+  test('an env file that cannot be deleted keeps the worktree', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    write(path.join(repo.wt, '.env.local', 'inner'), 'X=1\n');
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /could not delete \.env\.local/);
+    assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
   test('gh failure: keep, exit 1', () => {
     const { s, repo } = fixture();
     s.writeState((st) => { st.gh.fail = true; });
@@ -435,6 +457,14 @@ describe('teardown', () => {
     const r = engine(s, ['teardown'], repo.wt);
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /detached HEAD with 1 commit on no branch, remote or tag/);
+  });
+
+  test('detached HEAD keeps the branch the ledger recorded', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    gitIn(s, repo.wt, 'checkout', '-q', '--detach');
+    assert.equal(engine(s, ['teardown'], repo.wt).status, 0);
+    assert.equal(ledgerOf(repo).branch, repo.branch);
   });
 
   test('detached HEAD with uncommitted files: kept', () => {

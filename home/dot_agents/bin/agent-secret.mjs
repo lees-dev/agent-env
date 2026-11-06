@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { captureToken, opStatus, runOp } from './lib/op.mjs';
 import { git, gitOut } from './lib/proc.mjs';
-import { canonKey, loadConfig, repoName } from './lib/repo.mjs';
+import { canonKey, isUnder, loadConfig, repoName, samePath } from './lib/repo.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const NAME = 'agent-secret';
@@ -261,9 +261,18 @@ function prefixFor(name, repo) {
   return n;
 }
 
+/** The repo's env template: a file inside the checkout, not a link and not under one. */
 function templateFile(repo) {
-  return path.resolve(repo.top, repo.cfg.env.template || '.env.op');
+  const top = path.resolve(repo.top);
+  const file = path.resolve(top, repo.cfg.env.template || '.env.op');
+  if (!isUnder(file, top) || samePath(file, top)) throw new UsageError('env.template must be a file inside the checkout');
+  for (let cur = file; !samePath(cur, top); cur = path.dirname(cur)) {
+    if (isLink(cur)) throw new UsageError('env.template must not be a link or sit under one');
+  }
+  return file;
 }
+
+const NEEDS_ENV = 'item names end in -dev or -test (<repo>-<service>-<env>)';
 
 // ---------------------------------------------------------------- commands
 
@@ -274,10 +283,13 @@ function cmdPut(opts) {
   if (!FIELD_RE.test(field)) throw new UsageError('FIELD must be an env var name');
   if (opts.env && !ENVS.includes(opts.env)) throw new UsageError('--env is dev or test');
   if (opts.env === 'prod' || envOfItem(item) === 'prod') throw new UsageError(PROD_REFUSED);
+  if (!envOfItem(item)) throw new UsageError(NEEDS_ENV);
   const repo = cwdRepo();
   const prefix = opts.repo ? prefixFor(opts.repo, repo) : null;
   if (prefix && !item.startsWith(`${prefix}-`)) throw new UsageError(`item names for --repo ${opts.repo} start with ${prefix}-`);
   const vault = vaultOf(opts, repo);
+  const addsRef = Boolean(opts.repo && repo && repo.name === opts.repo.toLowerCase() && vault === 'agent-repos');
+  const tplFile = addsRef ? templateFile(repo) : null;
   const value = readStdin();
   requireOp();
   const res = storeItem(vault, item, [{ name: field, value }], { replace: opts.replace, repo: opts.repo ? opts.repo.toLowerCase() : null, notes: opts.notes || null });
@@ -288,8 +300,8 @@ function cmdPut(opts) {
   const ref = reference(vault, item, field);
   if (!verify(ref, value)) { warn(`verification failed for ${ref} (read-back hash differs or read failed)`); return 1; }
   log(`stored ${ref}`);
-  if (opts.repo && repo && repo.name === opts.repo.toLowerCase() && vault === 'agent-repos') {
-    const file = templateFile(repo);
+  if (tplFile) {
+    const file = tplFile;
     const st = appendRef(file, field, ref);
     if (st === 'added') log(`added ${field} to ${path.basename(file)}`);
     else if (st === 'conflict') warn(`${path.basename(file)} already defines ${field} with another value; left unchanged`);
@@ -308,6 +320,7 @@ function cmdImport(opts) {
   const repo = cwdRepo();
   const vault = vaultOf(opts, repo);
   const importPrefix = opts.repo ? prefixFor(opts.repo, repo) : null;
+  const tplFile = repo ? templateFile(repo) : null;
 
   const groups = new Map();
   let skipped = 0;
@@ -321,6 +334,7 @@ function cmdImport(opts) {
     const env = (typeof m === 'object' && m.env) || envOfItem(item);
     if (env && !ENVS.includes(env)) throw new UsageError(`map entry for ${key}: env is dev or test`);
     if (env === 'prod' || envOfItem(item) === 'prod') throw new UsageError(`map entry for ${key}: ${PROD_REFUSED}`);
+    if (!envOfItem(item)) throw new UsageError(`map entry for ${key}: ${NEEDS_ENV}`);
     if (importPrefix && !item.startsWith(`${importPrefix}-`)) throw new UsageError(`map entry for ${key}: item names for --repo ${opts.repo} start with ${importPrefix}-`);
     if (!groups.has(item)) groups.set(item, []);
     groups.get(item).push({ key, name: field, value, env });
@@ -351,8 +365,8 @@ function cmdImport(opts) {
   }
   skipped += refused;
   if (refused) warn(`${refused} fields refused: they exist and were not created by ${NAME} (use --replace)`);
-  if (repo && lines.length) {
-    const file = templateFile(repo);
+  if (tplFile && lines.length) {
+    const file = tplFile;
     let added = 0;
     let conflicts = 0;
     for (const [k, ref] of lines) {
