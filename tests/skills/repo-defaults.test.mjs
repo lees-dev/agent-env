@@ -1,5 +1,5 @@
 // Tests for home/dot_agents/skills/exact_repo-defaults/scripts/apply.mjs on temp git repos.
-// Run: node --test "tests/**/*.test.mjs"
+// Run: node --test "tests/skills/*.test.mjs"
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -15,6 +15,16 @@ const APPLY = path.join(SKILL, 'scripts', 'apply.mjs');
 const BLOCK = fs.readFileSync(path.join(SKILL, 'assets', 'agents-block.md'), 'utf8').trimEnd();
 const temps = [];
 after(() => { for (const t of temps) fs.rmSync(t, { recursive: true, force: true }); });
+
+// The real git binary (Git for Windows: the cmd\ launcher), for the forwarding shim.
+function realGit() {
+  const r = process.platform === 'win32'
+    ? spawnSync('where.exe', ['git'], { encoding: 'utf8' })
+    : spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
+  const lines = (r.stdout || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return process.platform === 'win32' ? lines.find((l) => /\\cmd\\git\.exe$/i.test(l)) || lines.find((l) => /\.exe$/i.test(l)) : lines[0];
+}
+const GIT = realGit();
 
 function env(tmp) {
   const gitcfg = path.join(tmp, 'gitconfig');
@@ -194,8 +204,123 @@ describe('repo-defaults apply.mjs', () => {
     const files = Object.fromEntries(i.json.env.files.map((f) => [f.file, f]));
     assert.equal(files['.env.example'].keys, 2);
     assert.equal(files['.env.example'].tracked, true);
+    assert.equal(files['.env.example'].role, 'template');
     assert.equal(files['.env.local'].tracked, false);
+    assert.equal(files['.env.local'].role, 'generated');
     assert.doesNotMatch(JSON.stringify(i.json), /value/, 'no env values in the output');
+  });
+
+  test('env files: only real sources are suggested for import; templates and .env.local are not', () => {
+    const r = repo({ '.env.example': 'A=1\n' });
+    fs.writeFileSync(path.join(r.work, '.env.local'), 'A=1\n');
+    fs.writeFileSync(path.join(r.work, '.env.production'), 'A=1\n');
+    const out = run(r, '--inspect').out;
+    assert.match(out, /INFO {2}\.env\.production: 1 keys; migrate with agent-secret import/);
+    assert.doesNotMatch(out, /\.env\.example[^\n]*migrate/);
+    assert.doesNotMatch(out, /\.env\.local[^\n]*migrate/);
+  });
+
+  test('a dangling .env link is listed, not followed, and does not stop the report', (t) => {
+    const r = repo();
+    try { fs.symlinkSync(path.join(r.work, 'nowhere'), path.join(r.work, '.env.dev'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const i = run(r, '--inspect', '--json');
+    assert.equal(i.status, 0, i.err);
+    const f = i.json.env.files.find((x) => x.file === '.env.dev');
+    assert.equal(f.dangling, true);
+  });
+
+  test('an outdated block: only its span changes; blank lines elsewhere are kept', () => {
+    const old = '<!-- BEGIN agent-standard v0 (old) -->\nold\n<!-- END agent-standard -->';
+    const text = `# T\n\n\n\nIntro.\n\n${old}\n\n\n\nBelow.\n`;
+    const r = repo({ 'AGENTS.md': text });
+    assert.equal(run(r, '--apply').status, 0);
+    assert.equal(read(r, 'AGENTS.md'), text.replace(old, BLOCK));
+  });
+
+  test('two managed blocks are reported for a manual fix and left alone', () => {
+    const text = `${BLOCK}\n\nmiddle\n\n${BLOCK.replace('v1', 'v0')}\n`;
+    const r = repo({ 'AGENTS.md': text });
+    const a = run(r, '--apply');
+    assert.equal(a.status, 1);
+    assert.match(a.out, /DRIFT AGENTS\.md block: 2 managed blocks/);
+    assert.equal(read(r, 'AGENTS.md'), text);
+  });
+
+  test('CLAUDE.md that is the same file as AGENTS.md (a hard link) is ok and untouched', () => {
+    const r = repo({ 'AGENTS.md': `${BLOCK}\n` });
+    fs.linkSync(path.join(r.work, 'AGENTS.md'), path.join(r.work, 'CLAUDE.md'));
+    const c = run(r, '--inspect', '--json');
+    assert.equal(c.json.items.find((i) => i.name === 'CLAUDE.md').status, 'ok');
+    run(r, '--apply');
+    assert.equal(read(r, 'AGENTS.md').startsWith('@AGENTS.md'), false);
+  });
+
+  test('t3.json: an exact canonical copy is dropped; a custom engine script is kept and reported', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const custom = { name: 'Setup plus seed', command: `${want.scripts[0].command} && npm run seed`, runOnWorktreeCreate: true };
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [custom, { ...want.scripts[1], name: 'Old teardown' }] }) });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 0, a.out);
+    assert.match(a.json.actions.join('\n'), /1 custom script\(s\) that call agent-worktree kept/);
+    const t3 = JSON.parse(read(r, 't3.json'));
+    assert.deepEqual(t3.scripts.map((s) => s.name), ['Agent setup', 'Agent teardown', 'Setup plus seed']);
+    assert.equal(t3.scripts[2].runOnWorktreeCreate, false);
+  });
+
+  test('JSON null in t3.json or repo.json is invalid; nothing is changed', () => {
+    const r = repo({ 't3.json': 'null', '.agents/repo.json': 'null' });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    const st = Object.fromEntries(a.json.items.map((i) => [i.name, i.status]));
+    assert.equal(st['t3.json'], 'invalid');
+    assert.equal(st['.agents/repo.json'], 'invalid');
+    assert.equal(read(r, 't3.json'), 'null');
+    assert.equal(read(r, '.agents/repo.json'), 'null');
+  });
+
+  test('gitignore: lines covered only by a global excludes file are still drift', () => {
+    const r = repo({ '.gitignore': 'node_modules/\n' });
+    const global = path.join(path.dirname(r.work), 'global-ignore');
+    fs.writeFileSync(global, '.env.local\n.env.local.pre-op\n');
+    fs.writeFileSync(r.e.GIT_CONFIG_GLOBAL, `[core]\n\texcludesFile = ${global.replace(/\\/g, '/')}\n`);
+    const c = run(r, '--check');
+    assert.equal(c.status, 1);
+    assert.match(c.out, /DRIFT \.gitignore: not ignored: \.env\.local, \.env\.local\.pre-op/);
+    assert.equal(run(r, '--apply').status, 0);
+    assert.match(read(r, '.gitignore'), /^\.env\.local$/m);
+  });
+
+  test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
+    const r = repo();
+    git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');
+    const bin = path.join(path.dirname(r.work), 'fake bin');
+    const log = path.join(path.dirname(r.work), 'children.log');
+    fs.mkdirSync(bin);
+    const rec = path.join(bin, 'rec.mjs');
+    fs.writeFileSync(rec, [
+      "import fs from 'node:fs';",
+      "import { spawnSync } from 'node:child_process';",
+      'const [tool, ...args] = process.argv.slice(2);',
+      "fs.appendFileSync(process.env.REC_LOG, `${tool} ${process.env.OP_SERVICE_ACCOUNT_TOKEN ? 'LEAK' : 'clean'}\\n`);",
+      "if (tool === 'gh') { process.stdout.write('[]'); process.exit(0); }",
+      "const g = spawnSync(process.env.REC_REAL_GIT, args, { stdio: 'inherit' });",
+      'process.exit(g.status ?? 1);',
+    ].join('\n'));
+    for (const tool of ['git', 'gh']) {
+      if (process.platform === 'win32') fs.writeFileSync(path.join(bin, `${tool}.cmd`), `@"${process.execPath}" "${rec}" ${tool} %*\r\n`);
+      else { fs.writeFileSync(path.join(bin, tool), `#!/bin/sh\nexec "${process.execPath}" "${rec}" ${tool} "$@"\n`); fs.chmodSync(path.join(bin, tool), 0o755); }
+    }
+    const pk = Object.keys(r.e).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const e = { ...r.e, [pk]: `${bin}${path.delimiter}${r.e[pk]}`, OP_SERVICE_ACCOUNT_TOKEN: 'dummy-test-value', REC_LOG: log, REC_REAL_GIT: GIT };
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--json'], { env: e, encoding: 'utf8', shell: false });
+    assert.equal(p.status, 0, p.stderr);
+    const lines = fs.readFileSync(log, 'utf8').trim().split('\n');
+    assert.ok(lines.some((l) => l.startsWith('git ')), 'git ran through the shim');
+    assert.ok(lines.some((l) => l.startsWith('gh ')), 'gh ran through the shim');
+    assert.deepEqual(lines.filter((l) => l.endsWith('LEAK')), []);
   });
 
   test('BEGIN without END is reported and never touched', () => {

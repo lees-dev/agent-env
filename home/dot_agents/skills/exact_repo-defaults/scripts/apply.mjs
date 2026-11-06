@@ -12,18 +12,26 @@
 // Also reports, for a separate PR: PR-gating workflows and rulesets to remove, env files to
 // migrate into 1Password (`agent-secret import`), and TODO(repo-defaults) markers to fill in.
 // Node >= 22, no dependencies. Prints names and counts, never file values.
-import { spawnSync } from 'node:child_process';
+// Processes start through the lifecycle libs deployed next to the skills (~/.agents/bin/lib, the
+// same relative path in this repo's source): shell: false, Windows .cmd shims resolved, and no
+// child ever gets OP_SERVICE_ACCOUNT_TOKEN.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { stripToken } from '../../../bin/lib/op.mjs';
+import { run } from '../../../bin/lib/proc.mjs';
 
 const ASSETS = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'assets');
 const BLOCK_RE = /<!-- BEGIN agent-standard v(\d+)[^>]*-->[\s\S]*?<!-- END agent-standard -->/g;
 const GITIGNORE_LINES = ['.env.local', '.env.local.pre-op'];
 const TODO = 'TODO(repo-defaults)';
 
+function child(cmd, args, cwd, opts = {}) {
+  return run(cmd, args, { cwd, env: stripToken(process.env), ...opts });
+}
+
 function git(args, cwd) {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const r = child('git', args, cwd);
   return { ok: r.status === 0, out: (r.stdout || '').trim(), status: r.status };
 }
 
@@ -33,6 +41,22 @@ function withEol(text, eol) { return eol === '\n' ? text : text.replace(/\r?\n/g
 function asset(name) { return fs.readFileSync(path.join(ASSETS, name), 'utf8').replace(/\r\n/g, '\n'); }
 function writeFile(p, text) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); }
 function json(text) { try { return { ok: true, value: JSON.parse(text) }; } catch (e) { return { ok: false, error: e.message }; } }
+// A JSON object (not null, not an array, not a scalar).
+function jsonObject(text) {
+  const p = json(text);
+  return p.ok && p.value !== null && typeof p.value === 'object' && !Array.isArray(p.value) ? p.value : null;
+}
+// Same file on disk (links, junctions and hard links included).
+function sameFile(a, b) {
+  try {
+    if (fs.realpathSync.native(a) === fs.realpathSync.native(b)) return true;
+    const sa = fs.statSync(a);
+    const sb = fs.statSync(b);
+    return sa.ino !== 0 && sa.ino === sb.ino && sa.dev === sb.dev;
+  } catch {
+    return false;
+  }
+}
 
 export const BLOCK = asset('agents-block.md').trimEnd();
 export const BLOCK_VERSION = Number(BLOCK.match(/agent-standard v(\d+)/)[1]);
@@ -61,19 +85,18 @@ function agentsBlock(root) {
       fix: () => { fs.writeFileSync(p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
     };
   }
-  const current = blocks.length === 1 && blocks[0][0].replace(/\r\n/g, '\n') === BLOCK;
-  if (current) return { name: 'AGENTS.md block', status: 'ok', detail: `agent-standard v${BLOCK_VERSION}` };
   const found = blocks.map((b) => `v${b[1]}`).join(', ');
+  if (blocks.length > 1) {
+    // Which copy is the real one is the repo's call: report it, change nothing.
+    return { name: 'AGENTS.md block', status: 'invalid', detail: `${blocks.length} managed blocks (${found}): keep one by hand` };
+  }
+  if (blocks[0][0].replace(/\r\n/g, '\n') === BLOCK) return { name: 'AGENTS.md block', status: 'ok', detail: `agent-standard v${BLOCK_VERSION}` };
   return {
-    name: 'AGENTS.md block', status: 'outdated', detail: blocks.length > 1 ? `${blocks.length} blocks (${found})` : `${found}, want v${BLOCK_VERSION} text`,
+    name: 'AGENTS.md block', status: 'outdated', detail: `${found}, want v${BLOCK_VERSION} text`,
     fix: () => {
-      let first = true;
-      const out = text.replace(BLOCK_RE, () => {
-        if (!first) return '';
-        first = false;
-        return withEol(BLOCK, eol);
-      }).replace(new RegExp(`(${eol}){3,}`, 'g'), `${eol}${eol}`);
-      fs.writeFileSync(p, out);
+      // Replace exactly the block's span; every other byte of the file stays as it was.
+      const b = blocks[0];
+      fs.writeFileSync(p, `${text.slice(0, b.index)}${withEol(BLOCK, eol)}${text.slice(b.index + b[0].length)}`);
       return `refreshed the block in AGENTS.md (was ${found})`;
     },
   };
@@ -84,6 +107,8 @@ function claudeMd(root) {
   let st = null;
   try { st = fs.lstatSync(p); } catch { st = null; }
   if (!st) return { name: 'CLAUDE.md', status: 'missing', detail: 'no CLAUDE.md', fix: () => { writeFile(p, '@AGENTS.md\n'); return 'created CLAUDE.md (@AGENTS.md)'; } };
+  // One file under two names (a link to it, or a hard link): already the same rules.
+  if (sameFile(p, path.join(root, 'AGENTS.md'))) return { name: 'CLAUDE.md', status: 'ok', detail: 'same file as AGENTS.md' };
   if (st.isSymbolicLink()) {
     const target = path.basename(fs.readlinkSync(p));
     return target === 'AGENTS.md' ? { name: 'CLAUDE.md', status: 'ok', detail: 'link to AGENTS.md' } : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${target}: fix by hand` };
@@ -105,10 +130,12 @@ function t3Json(root) {
   const want = JSON.parse(asset('t3.json'));
   const text = readText(p);
   if (text === null) return { name: 't3.json', status: 'missing', detail: 'no t3.json', fix: () => { writeFile(p, `${JSON.stringify(want, null, 2)}\n`); return 'created t3.json'; } };
-  const parsed = json(text);
-  if (!parsed.ok || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) return { name: 't3.json', status: 'invalid', detail: 'does not parse: fix by hand' };
-  const cur = parsed.value;
-  const scripts = Array.isArray(cur.scripts) ? cur.scripts : [];
+  const cur = jsonObject(text);
+  if (!cur) return { name: 't3.json', status: 'invalid', detail: 'not a JSON object: fix by hand' };
+  if (cur.scripts !== undefined && (!Array.isArray(cur.scripts) || cur.scripts.some((s) => s === null || typeof s !== 'object' || Array.isArray(s)))) {
+    return { name: 't3.json', status: 'invalid', detail: 'scripts is not a list of objects: fix by hand' };
+  }
+  const scripts = cur.scripts || [];
   const problems = [];
   if (cur.defaultThreadEnvMode !== 'worktree') problems.push('defaultThreadEnvMode is not worktree');
   const setupIdx = scripts.findIndex(isSetup);
@@ -123,7 +150,9 @@ function t3Json(root) {
   return {
     name: 't3.json', status: 'outdated', detail: problems.join('; '),
     fix: () => {
-      const others = scripts.filter((s) => !isSetup(s) && !isTeardown(s)).map((s) => {
+      // Only an exact copy of a canonical engine script is dropped; anything else (including a
+      // custom script that calls the engine and does more) is kept, as a manual script.
+      const others = scripts.filter((s) => !isCanonical(s)).map((s) => {
         // Only the first create/settle script runs: ours. Keep the others as manual scripts.
         const c = { ...s };
         if (c.runOnWorktreeCreate) c.runOnWorktreeCreate = false;
@@ -133,10 +162,21 @@ function t3Json(root) {
       });
       const out = { ...cur, defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, ...others] };
       fs.writeFileSync(p, `${JSON.stringify(out, null, 2)}\n`);
-      const demoted = scripts.filter((s) => !isSetup(s) && !isTeardown(s) && (s?.runOnWorktreeCreate || s?.runOnSettle)).length;
-      return `updated t3.json${demoted ? ` (${demoted} other automatic script(s) made manual: move that work into .agents/repo.json setup or .agents/hooks.mjs)` : ''}`;
+      const kept = scripts.filter((s) => !isCanonical(s));
+      const demoted = kept.filter((s) => s.runOnWorktreeCreate || s.runOnSettle).length;
+      const custom = kept.filter((s) => isSetup(s) || isTeardown(s)).length;
+      const notes = [];
+      if (demoted) notes.push(`${demoted} other automatic script(s) made manual: move that work into .agents/repo.json setup or .agents/hooks.mjs`);
+      if (custom) notes.push(`${custom} custom script(s) that call agent-worktree kept: check them by hand`);
+      return `updated t3.json${notes.length ? ` (${notes.join('; ')})` : ''}`;
     },
   };
+}
+
+// An exact copy of one of the canonical engine scripts (whitespace aside).
+const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ');
+function isCanonical(s) {
+  return JSON.parse(asset('t3.json')).scripts.some((w) => norm(w.command) === norm(s?.command));
 }
 
 // ------------------------------------------------------------------ detection
@@ -191,9 +231,8 @@ function repoJson(root) {
       },
     };
   }
-  const parsed = json(text);
-  if (!parsed.ok || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) return { name: '.agents/repo.json', status: 'invalid', detail: 'does not parse: fix by hand' };
-  const cur = parsed.value;
+  const cur = jsonObject(text);
+  if (!cur) return { name: '.agents/repo.json', status: 'invalid', detail: 'not a JSON object: fix by hand' };
   const tmpl = repoJsonFromDetection(d);
   const missing = Object.keys(tmpl).filter((k) => !(k in cur));
   const bad = [];
@@ -215,9 +254,18 @@ function repoJson(root) {
   return { name: '.agents/repo.json', status: 'ok', detail: 'v1' };
 }
 
+// Ignored by the repo's own root .gitignore: a global excludes file or .git/info/exclude is
+// not shared with the next clone, so it does not count.
+function ignoredByRepo(root, file) {
+  const r = git(['check-ignore', '--no-index', '-v', '--', file], root);
+  if (!r.ok) return false;
+  const m = r.out.split('\t')[0].match(/^(.*?):(\d+):(.*)$/);
+  return Boolean(m) && m[1] === '.gitignore' && !m[3].startsWith('!');
+}
+
 function gitignore(root) {
   const p = path.join(root, '.gitignore');
-  const missing = GITIGNORE_LINES.filter((l) => !git(['check-ignore', '-q', '--no-index', l], root).ok);
+  const missing = GITIGNORE_LINES.filter((l) => !ignoredByRepo(root, l));
   if (!missing.length) return { name: '.gitignore', status: 'ok', detail: GITIGNORE_LINES.join(', ') };
   return {
     name: '.gitignore', status: 'missing', detail: `not ignored: ${missing.join(', ')}`,
@@ -250,13 +298,31 @@ function todos(root) {
   return n ? { name: 'TODO markers', status: 'warn', detail: `${n} to fill in: ${where.join(', ')}` } : null;
 }
 
+// What an env file is for. Only a `source` (real values, not yet in 1Password) is suggested for
+// `agent-secret import`: a template holds no values, `.env.local` is what worktree setup writes
+// from `.env.op`, and `.env.local.pre-op` is a source that import already retired.
+function envRole(f) {
+  if (/^\.env\.(example|sample|template|dist)$/.test(f)) return 'template';
+  if (f === '.env.local') return 'generated';
+  if (f === '.env.local.pre-op') return 'retired';
+  return 'source';
+}
+
 function envFiles(root) {
   const out = [];
-  const tracked = (f) => git(['ls-files', '--error-unmatch', f], root).ok;
+  const tracked = (f) => git(['ls-files', '--error-unmatch', '--', f], root).ok;
   for (const f of fs.readdirSync(root)) {
-    if (!/^\.env(\..+)?$/.test(f) || f === '.env.op' || !fs.statSync(path.join(root, f)).isFile()) continue;
-    const keys = (readText(path.join(root, f)) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
-    out.push({ file: f, keys, tracked: tracked(f) });
+    if (!/^\.env(\..+)?$/.test(f) || f === '.env.op') continue;
+    const p = path.join(root, f);
+    let st;
+    try { st = fs.lstatSync(p); } catch { continue; }
+    if (st.isSymbolicLink()) {
+      // A link: follow it only when its target is a file; a dangling one is listed as such.
+      try { st = fs.statSync(p); } catch { out.push({ file: f, keys: 0, tracked: tracked(f), role: envRole(f), dangling: true }); continue; }
+    }
+    if (!st.isFile()) continue;
+    const keys = (readText(p) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
+    out.push({ file: f, keys, tracked: tracked(f), role: envRole(f) });
   }
   const op = readText(path.join(root, '.env.op'));
   const refs = op ? op.split(/\r?\n/).filter((l) => /=\s*["']?op:\/\//.test(l)) : [];
@@ -285,9 +351,10 @@ function rulesets(root, offline) {
   const remote = git(['remote', 'get-url', 'origin'], root);
   const m = remote.ok ? remote.out.match(/github\.com[:/]+([^/\s]+)\/([^/\s]+?)(\.git)?\/?$/i) : null;
   if (!m) return { skipped: 'origin is not on GitHub' };
-  const r = spawnSync('gh', ['api', `repos/${m[1]}/${m[2]}/rulesets`], { encoding: 'utf8', shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000 });
+  const r = child('gh', ['api', `repos/${m[1]}/${m[2]}/rulesets`], root, { timeout: 30000 });
   if (r.status !== 0) return { skipped: 'gh api failed (no gh, no access, or no network)' };
-  const list = json(r.stdout).value || [];
+  const parsed = json(r.stdout).value;
+  const list = Array.isArray(parsed) ? parsed.filter((x) => x && typeof x === 'object') : [];
   return { list: list.map((x) => ({ name: x.name, enforcement: x.enforcement, target: x.target })) };
 }
 
@@ -341,7 +408,12 @@ function main() {
     for (const i of result.items) L.push(`${i.status === 'ok' ? 'OK   ' : 'DRIFT'} ${i.name}: ${i.detail}`);
     if (ev.todo) L.push(`WARN  ${ev.todo.name}: ${ev.todo.detail}`);
     if (mode !== 'check') {
-      for (const e of ev.env.files) L.push(`INFO  ${e.file}: ${e.keys} keys${e.tracked ? ' (TRACKED IN GIT: remove it and rotate)' : ''}; migrate with agent-secret import`);
+      for (const e of ev.env.files) {
+        const tracked = e.tracked && e.role !== 'template' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
+        if (e.dangling) L.push(`WARN  ${e.file}: a link to nothing`);
+        else if (e.role === 'source') L.push(`INFO  ${e.file}: ${e.keys} keys${tracked}; migrate with agent-secret import`);
+        else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);
+      }
       if (ev.env.envOp?.foreignVaultRefs) L.push(`WARN  .env.op: ${ev.env.envOp.foreignVaultRefs} reference(s) outside op://agent-repos/`);
       for (const w of ev.workflows) L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
       for (const r of ev.rulesets.list || []) L.push(`INFO  ruleset ${r.name} (${r.enforcement}): drop required checks and merge queue in the separate PR`);

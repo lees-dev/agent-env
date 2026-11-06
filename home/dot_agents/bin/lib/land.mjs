@@ -8,9 +8,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
-import { homeDir, stripToken } from './op.mjs';
+import { captureToken, homeDir, stripToken } from './op.mjs';
 import { prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
-import { baseBranch, gitIdentity, loadConfig } from './repo.mjs';
+import { baseBranch, canonKey, gitIdentity, loadConfig } from './repo.mjs';
+
+// Entry points call this first: OP_SERVICE_ACCOUNT_TOKEN leaves process.env, so no child (git
+// hooks, gates, gh) can inherit it, whichever env a call site builds.
+export { captureToken };
 
 export const LOCK_REF = 'agent-landing-lock';
 export const LABELS = {
@@ -94,7 +98,7 @@ export function runAsync(argv, { cwd, env = childEnv(), tailLines = 40, tickMs =
     };
     child.stdout.on('data', take);
     child.stderr.on('data', take);
-    const timer = tickMs > 0 && onTick ? setInterval(() => { try { onTick(); } catch { /* reported by the caller */ } }, tickMs) : null;
+    const timer = tickMs > 0 && onTick ? setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs) : null;
     child.on('error', (e) => { if (timer) clearInterval(timer); resolve({ status: 127, tail: [String(e.message)] }); });
     child.on('close', (code) => {
       if (timer) clearInterval(timer);
@@ -107,6 +111,14 @@ export function runAsync(argv, { cwd, env = childEnv(), tailLines = 40, tickMs =
 export function pollMs() {
   const v = Number(process.env.AGENT_LAND_POLL_MS);
   return Number.isFinite(v) && v >= 0 ? v : 3000;
+}
+
+// How often the lock is refreshed while a repo command runs: a third of its ttl, at least a
+// minute (AGENT_LAND_TICK_MS overrides it for tests).
+export function tickMs(ttlMin) {
+  const v = Number(process.env.AGENT_LAND_TICK_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return Math.max(60000, Math.floor((ttlMin * 60000) / 3));
 }
 
 // ---------------------------------------------------------------- redaction
@@ -181,9 +193,10 @@ export function rangeDiffChanges(out) {
 // ---------------------------------------------------------------- repo config
 
 // .agents/repo.json through the engine's loader (same defaults and validation), plus what
-// landing needs: a resolved base, affectedGate falling back to gate, numeric limits, and no
-// command left as a TODO(repo-defaults) placeholder.
-export function loadRepoConfig(root) {
+// landing needs: a resolved base, affectedGate falling back to gate, numeric limits, no command
+// left as a TODO(repo-defaults) placeholder, and (needGate) a gate: without one a rebase cannot be
+// validated, so nothing lands.
+export function loadRepoConfig(root, { needGate = true } = {}) {
   let cfg;
   try { cfg = { ...loadConfig(root) }; } catch (e) { throw new LandError(e.message, 2); }
   cfg.base = baseBranch(cfg, root, childEnv());
@@ -197,6 +210,9 @@ export function loadRepoConfig(root) {
     if (cfg[k].some((c) => typeof c !== 'string' || /TODO\(repo-defaults\)/.test(c))) {
       throw new LandError(`.agents/repo.json ${k} still has a TODO(repo-defaults) or a non-string entry`, 2);
     }
+  }
+  if (needGate && !cfg.affectedGate.some((c) => c.trim())) {
+    throw new LandError('.agents/repo.json has no gate or affectedGate command: nothing lands until the repo has one (repo-defaults)', 2);
   }
   return cfg;
 }
@@ -346,10 +362,14 @@ export function isStale(info, ttlDefault, now = Date.now()) {
 // The lock is the ref refs/heads/agent-landing-lock on GitHub. Creating a ref is atomic:
 // 201 means we hold it, 422 means someone else does. Refreshing and reclaiming move the ref
 // by fast-forward only (non-forced PATCH to a child commit), so two contenders cannot both win.
+// Releasing deletes it with `git push --force-with-lease=<ref>:<our commit>` from `cwd` (a
+// checkout whose origin is the repo): the delete happens only while the ref is still ours, in
+// one step, so a lock someone else took over is never removed.
 export class LandingLock {
-  constructor(gh, { ttlMin }) {
+  constructor(gh, { ttlMin, cwd }) {
     this.gh = gh;
     this.ttlMin = ttlMin;
+    this.cwd = cwd;
     this.commit = null;
   }
 
@@ -396,10 +416,22 @@ export class LandingLock {
     return true;
   }
 
+  // False (lost) when anyone moved the ref, or the refresh could not be made.
   refresh() {
     if (!this.commit) return false;
-    const c = this.gh.api('GET', this.route(`commits/${this.commit}`));
-    return c.ok && this.advance(this.commit, c.data.tree.sha);
+    try {
+      const c = this.gh.api('GET', this.route(`commits/${this.commit}`));
+      return c.ok && this.advance(this.commit, c.data.tree.sha);
+    } catch {
+      return false;
+    }
+  }
+
+  // The ref still points at our commit (checked after a gate and before every push and merge).
+  stillHeld() {
+    if (!this.commit) return false;
+    const r = this.gh.api('GET', this.route(`ref/heads/${LOCK_REF}`));
+    return r.ok && r.data?.object?.sha === this.commit;
   }
 
   reclaim(holder) {
@@ -409,12 +441,10 @@ export class LandingLock {
 
   release() {
     if (!this.commit) return false;
-    const cur = this.gh.api('GET', this.route(`ref/heads/${LOCK_REF}`));
-    const mine = cur.ok && cur.data?.object?.sha === this.commit;
+    const mine = this.commit;
     this.commit = null;
-    if (!mine) return false;
-    const r = this.gh.api('DELETE', this.route(`refs/heads/${LOCK_REF}`));
-    return r.ok;
+    const r = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${LOCK_REF}:${mine}`, 'origin', `:refs/heads/${LOCK_REF}`], { cwd: this.cwd });
+    return r.status === 0;
   }
 }
 
@@ -484,11 +514,13 @@ export function writeLanding(body, { gateSha, queuedAt }) {
 }
 
 // `Hold-By: <holder> <ISO time>` lines anywhere in the body record who set queue-hold.
-// <holder> is `--holder <id>`, else $T3CODE_THREAD_ID, else `<hostname>:<parent pid>`.
+// <holder> is `--holder <id>`, else $T3CODE_THREAD_ID. Nothing else is stable enough to release
+// the hold with later (a shell's parent pid changes between calls), so without either it refuses.
 const HOLD_LINE = /^[ \t]*(?:[-*][ \t]+)?Hold-By:[ \t]*(\S+)(?:[ \t]+(\S+))?[ \t]*$/i;
 
 export function holderId(explicit) {
-  const id = (explicit || process.env.T3CODE_THREAD_ID || `${os.hostname()}:${process.ppid}`).trim();
+  const id = String(explicit || process.env.T3CODE_THREAD_ID || '').trim();
+  if (!id) throw new LandError('pass --holder <id> (no $T3CODE_THREAD_ID here); use the same id for hold and --release-hold', 2);
   if (!/^\S+$/.test(id)) throw new LandError('a holder id has no spaces', 2);
   return id;
 }
@@ -534,12 +566,17 @@ export function orderQueue(prs) {
 }
 
 // Open PRs labelled queued or landing (landing = a lander run stopped mid-PR), each once.
-// These count toward the repo's capacity (maxQueued); queue-blocked, queue-hold and
-// queue-waiting do not.
+// All of them count for fairness (no merge-now while any is in line) and recovery.
 export function listQueue(gh) {
   const seen = new Map();
   for (const label of ['landing', 'queued']) for (const pr of gh.prList(label)) seen.set(pr.number, pr);
   return [...seen.values()];
+}
+
+// The PRs that use up capacity (maxQueued): queued or landing and not held. A queue-hold PR
+// cannot land, so it does not keep others waiting.
+export function capacityUsed(prs) {
+  return prs.filter((p) => !labelNames(p).includes('queue-hold')).length;
 }
 
 // PRs waiting for capacity, oldest first (time queued, then number).
@@ -594,12 +631,115 @@ export function mergeArgv(cfg, { pr, sha, repo }) {
   return [...gh, 'pr', 'merge', String(pr), '--repo', repo, `--${cfg.mergeMethod}`, '--delete-branch', '--match-head-commit', sha];
 }
 
-export function mergePinned(gh, cfg, { pr, sha }) {
-  const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env });
+// Runs from `cwd` (the repo's checkout), so a repo-relative mergeCmd or ghWrapper works from
+// wherever the tool was started (land-queue --all).
+export function mergePinned(gh, cfg, { pr, sha, cwd }) {
+  const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env, cwd });
   if (r.status !== 0) return { ok: false, message: firstLine(r.stderr || r.stdout) };
   const after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
   if (after.state !== 'MERGED') return { ok: false, message: `PR state is ${after.state} after the merge command` };
+  clearQueueLabels(gh, after);
   return { ok: true, mergeSha: after.mergeCommit?.oid || null };
+}
+
+// After a merge no queue label stays behind (best effort): the engine's teardown and the
+// queue counts read them.
+export function clearQueueLabels(gh, pr) {
+  try { setLabels(gh, pr, { remove: ['landing', 'queued', 'queue-waiting', 'queue-next'] }); return true; } catch { return false; }
+}
+
+// ---------------------------------------------------------------- the lander checkout
+
+// <main checkout>-lander: a detached worktree created once and locked, so a sweep's plain
+// `git worktree remove` (no --force) and `git worktree prune` both leave it alone. An existing
+// one is used only when it is exactly that: its own top level, a registered worktree of this
+// repository (same common git dir), and not a link or junction to the main checkout. Anything
+// else at that path is refused before any fetch, reset, clean or push touches it.
+export function landerCheckout(mainRoot, base) {
+  const dir = `${mainRoot}-lander`;
+  const mainCommon = canonKey(gitOk(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: mainRoot }));
+  let exists = true;
+  try { fs.lstatSync(dir); } catch { exists = false; }
+  if (!exists) gitOk(['worktree', 'add', '--detach', dir, `refs/remotes/origin/${base}`], { cwd: mainRoot });
+  verifyLander(dir, mainRoot, mainCommon);
+  const lock = git(['worktree', 'lock', '--reason', 'land-queue lander checkout', dir], { cwd: mainRoot });
+  if (lock.status !== 0 && !/already locked/i.test(lock.stderr)) throw new LandError(`git worktree lock failed: ${firstLine(lock.stderr)}`);
+  // Leave any earlier half-finished rebase.
+  if (fs.existsSync(path.join(gitOk(['rev-parse', '--absolute-git-dir'], { cwd: dir }), 'rebase-merge'))) git(['rebase', '--abort'], { cwd: dir });
+  return dir;
+}
+
+function verifyLander(dir, mainRoot, mainCommon) {
+  const refuse = (why) => { throw new LandError(`refusing to use ${dir} as the lander checkout: ${why}; move it away by hand`); };
+  if (canonKey(dir) === canonKey(mainRoot)) refuse('it is the main checkout (a link or junction to it)');
+  const top = git(['rev-parse', '--show-toplevel'], { cwd: dir });
+  if (top.status !== 0) refuse('it is not a git checkout');
+  if (canonKey(top.stdout.trim()) !== canonKey(dir)) refuse('it is inside another checkout');
+  const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: dir });
+  if (common.status !== 0 || canonKey(common.stdout.trim()) !== mainCommon) refuse('it belongs to another repository');
+  const list = gitOk(['worktree', 'list', '--porcelain'], { cwd: mainRoot });
+  const registered = list.split(/\r?\n/).filter((l) => l.startsWith('worktree ')).some((l) => canonKey(l.slice('worktree '.length)) === canonKey(dir));
+  if (!registered) refuse('it is not a registered worktree of this repository');
+}
+
+export function resetTo(dir, ref) {
+  gitOk(['checkout', '--quiet', '--detach', '--force', ref], { cwd: dir });
+  gitOk(['clean', '-fdq'], { cwd: dir });
+}
+
+// Repo commands (setup, gates, sweeps) never see the 1Password service-account token.
+export const commandEnv = () => childEnv({ AGENT_LANDER: '1' });
+
+// Run repo commands in order while refreshing the lock. Stops at the first failure; a refresh
+// that fails means another lander may own the lock now: { ok: false, lost: true }.
+export async function runCommands(cmds, dir, lock, ttlMin) {
+  let lost = false;
+  const onTick = () => { if (lock && !lock.refresh()) lost = true; };
+  for (const c of cmds) {
+    const r = await runAsync(splitArgv(c), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(ttlMin) : 0, onTick });
+    if (lost) return { ok: false, lost: true, cmd: c, status: r.status, tail: r.tail };
+    if (r.status !== 0) return { ok: false, cmd: c, status: r.status, tail: r.tail };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------- wide sweep
+
+export function sweepState(repo) {
+  return readJson(path.join(stateDir(), 'land-queue.json'), {})?.[repo] || {};
+}
+
+export function sweepDue(repo, cfg) {
+  return Boolean(cfg.wideSweep) && (sweepState(repo).sinceSweep || 0) >= cfg.sweepEveryMerges;
+}
+
+// Run the repo's wide sweep on its base in the lander checkout. The caller holds the landing
+// lock. Red sets the repo pause. Returns { ok, cmd, status, lost }.
+export async function runSweep({ cfg, mainRoot, lock }) {
+  const dir = landerCheckout(mainRoot, cfg.base);
+  fetchBranch(dir, cfg.base);
+  resetTo(dir, `refs/remotes/origin/${cfg.base}`);
+  const cmds = Array.isArray(cfg.wideSweep) ? cfg.wideSweep : [cfg.wideSweep];
+  const r = await runCommands([...cfg.setup, ...cmds], dir, lock, cfg.lockTtlMin);
+  resetTo(dir, `refs/remotes/origin/${cfg.base}`);
+  return r;
+}
+
+// The sweep that is due after `sinceSweep` merges (call while holding the lock). Returns null
+// when none is due, else { ran, ok, afterMerges, alert? }; a red sweep pauses the repo.
+export async function dueSweep(ctx) {
+  const { gh, cfg } = ctx;
+  if (!sweepDue(gh.repo, cfg)) return null;
+  const afterMerges = sweepState(gh.repo).sinceSweep || 0;
+  markSwept(gh.repo);
+  const r = await runSweep(ctx);
+  const out = { ran: true, ok: r.ok, afterMerges };
+  if (r.ok) return out;
+  if (r.lost) { out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost`; return out; }
+  gh.setPaused(true);
+  out.paused = true;
+  out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (\`${r.cmd}\` exit ${r.status}); the repo is paused (AGENT_LANDING_PAUSED=1). Open a ticket, fix ${cfg.base}, then run land-queue unpause.`;
+  return out;
 }
 
 // ---------------------------------------------------------------- state (merge counts)

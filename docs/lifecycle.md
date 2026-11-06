@@ -71,7 +71,7 @@ Teardown is idempotent. Exit 0 means T3 may remove the worktree; exit 1 means ke
 
 | State | Result |
 |---|---|
-| Any PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` | Keep, exit 1 |
+| An open PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` (a label left on a merged or closed PR is stale and ignored) | Keep, exit 1 |
 | Uncommitted or untracked files (ignored files and an untracked env output are fine), whatever the PR state | Keep, exit 1 |
 | No PR, or an open PR | Nothing removed, exit 0 |
 | An open PR uses this branch as its base | Keep, exit 1 |

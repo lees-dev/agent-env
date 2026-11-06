@@ -7,38 +7,40 @@
 //   node land-queue.mjs unpause [--repo owner/name] [--root <checkout>] [--json]
 //
 // Repos: --root (default: the current checkout); --all reads ~/.agents/state/repos.json.
-// Each round: stop if the repo is paused (repo variable AGENT_LANDING_PAUSED=1); admit the oldest
-// `queue-waiting` PRs while queued + landing < maxQueued; take the landing lock; reset any leftover
-// `landing` label (a crashed run) to `queued`; land the first PR in order (queue-next,
+// A run first recovers a crashed run: under the landing lock, every leftover `landing` label goes
+// back to `queued` (queue-hold kept). Then each round: stop if the repo is paused (repo variable
+// AGENT_LANDING_PAUSED=1); admit the oldest `queue-waiting` PRs while the unheld queued + landing
+// PRs are fewer than maxQueued; take the lock; land the first PR in order (queue-next,
 // Linear-Priority 1..4 with 0/missing = 3, time queued, number):
 //   head == gated sha -> rebase in <main checkout>-lander -> unchanged? -> setup + affectedGate
-//   (one retry) -> re-check -> push --force-with-lease -> re-check -> final base check -> merge
-//   pinned -> release.
+//   (one retry) -> re-check -> push --force-with-lease -> re-check -> final base check -> final
+//   label/head/pause/lock check -> merge pinned -> clear queue labels -> release.
 // "Unchanged" = no conflict, every commit `=` in `git range-diff <old base>..<gated>
 // <new base>..<rebased>`, and the rebased diff touches no path the gated diff did not.
-// The re-checks re-read the PR's labels and head and the pause flag right before the push and
-// right before the merge: queue-hold or a pause aborts without a merge (the PR goes back to
-// `queued`, keeping queue-hold), a changed head bounces. The final base check refetches the base
-// immediately before the merge; if it moved, the rebase and validation run again (at most 3
-// times, then a bounce). An error mid-landing also puts the PR back to `queued`: `landing` is
-// never left behind. Anything else that fails bounces the PR: queued/landing -> queue-blocked,
-// one comment with the reason, and a `Bounced:` line in its `## Landing` section. The third bounce
-// (after two automatic fix attempts) parks it: the comment starts with `PARKED:`.
-// A red wide sweep (every sweepEveryMerges merges) sets AGENT_LANDING_PAUSED=1; `unpause` reruns
-// the sweep on the base and clears the flag only when it is green.
+// The re-checks re-read the PR: a changed base or head branch, an unmerged Depends-on,
+// queue-hold, a pause, a changed head or a lost lock aborts without a merge and puts the PR back
+// to `queued` (queue-hold kept); the next round starts its validation again. The final base check
+// refetches the base right before the merge; if it moved, the rebase and validation run again
+// (at most 3 times, then a bounce). An error mid-landing also puts the PR back to `queued`:
+// `landing` is never left behind. Anything else that fails bounces the PR: queued/landing ->
+// queue-blocked, one comment with the reason, and a `Bounced:` line in its `## Landing` section.
+// The third bounce (after two automatic fix attempts) parks it: the comment starts with `PARKED:`.
+// A red wide sweep (every sweepEveryMerges merges, or overdue when the lander is idle) sets
+// AGENT_LANDING_PAUSED=1; `unpause` takes the landing lock, reruns the sweep on the base and
+// clears the flag only when it is green.
 // A stale lock (older than its ttl) is reported, and reclaimed only with --reclaim-stale.
 // Output (--json): one report per repo
 //   {repo, merged:[{pr,sha,mergeSha,rebased}], bounced:[{pr,reason,attempt,parked}], admitted:[n],
 //    aborted:[{pr,reason}], reset:[n], queued, held:[n], waiting:[{pr,dependsOn}], queueWaiting:[n],
 //    stale:[{host,pid,ageMin}], busy, paused, alerts:[...], sweep}
 // Exit: 0 when every repo was processed (bounces included), 1 on an error, 2 on bad usage.
-import fs from 'node:fs';
 import path from 'node:path';
 import {
   BOUNCE_MARKER, Gh, LandError, LandingLock,
-  appendLanding, childEnv, baseTreeOf, bumpMergeCount, classifyQueue, fetchBranch, firstLine, git, gitOk,
-  isAncestor, isStale, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, markSwept, mergePinned, parseArgs,
-  parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, runAsync, scrub, setLabels, slugFromRemote, splitArgv, waitForPr,
+  appendLanding, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
+  firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
+  mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
+  runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
 } from './lib/land.mjs';
 
 const USAGE = 'usage: node land-queue.mjs <run|status|unpause> [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]';
@@ -46,42 +48,8 @@ const MAX_PRS_PER_RUN = 50;
 const MAX_BASE_RETRIES = 3;
 const MAX_AUTO_FIXES = 2;
 
-// ---------------------------------------------------------------- lander checkout
-
-// <main checkout>-lander: a detached worktree created once and locked, so a sweep's plain
-// `git worktree remove` (no --force) and `git worktree prune` both leave it alone.
-function landerCheckout(mainRoot, base) {
-  const dir = `${mainRoot}-lander`;
-  if (!fs.existsSync(dir)) {
-    gitOk(['worktree', 'add', '--detach', dir, `refs/remotes/origin/${base}`], { cwd: mainRoot });
-    gitOk(['worktree', 'lock', '--reason', 'land-queue lander checkout', dir], { cwd: mainRoot });
-  } else if (git(['rev-parse', '--git-dir'], { cwd: dir }).status !== 0) {
-    throw new LandError(`${dir} exists but is not a git checkout`);
-  }
-  // Leave any earlier half-finished rebase.
-  if (fs.existsSync(path.join(gitOk(['rev-parse', '--absolute-git-dir'], { cwd: dir }), 'rebase-merge'))) git(['rebase', '--abort'], { cwd: dir });
-  return dir;
-}
-
-function resetTo(dir, ref) {
-  gitOk(['checkout', '--quiet', '--detach', '--force', ref], { cwd: dir });
-  gitOk(['clean', '-fdq'], { cwd: dir });
-}
-
 function changedPaths(dir, from, to) {
   return new Set(gitOk(['diff', '--name-only', '--no-renames', from, to], { cwd: dir }).split(/\r?\n/).filter(Boolean));
-}
-
-// Repo commands never see the 1Password service-account token.
-const commandEnv = () => childEnv({ AGENT_LANDER: '1' });
-
-async function runCommands(cmds, dir, lock, ttlMin) {
-  const tickMs = Math.max(60000, Math.floor((ttlMin * 60000) / 3));
-  for (const c of cmds) {
-    const r = await runAsync(splitArgv(c), { cwd: dir, env: commandEnv(), tickMs, onTick: () => lock?.refresh() });
-    if (r.status !== 0) return { ok: false, cmd: c, status: r.status, tail: r.tail };
-  }
-  return { ok: true };
 }
 
 // ---------------------------------------------------------------- bounce
@@ -113,35 +81,54 @@ function bounce(gh, pr, reason, tail = []) {
   return { pr: pr.number, reason: scrub(reason), attempt, parked };
 }
 
-// ---------------------------------------------------------------- one PR
+// ---------------------------------------------------------------- re-checks
 
-// Re-read the PR and the pause flag. Returns null when landing may continue.
-function recheck(gh, pr, expectHead) {
+// The PR still targets the same base from the same branch, and every Depends-on is merged.
+function recheckShape(gh, pr, want) {
   const p = gh.prView(pr.number);
   if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
   pr.labels = p.labels;
   pr.body = p.body;
-  if (labelNames(p).includes('queue-hold')) return { hold: 'queue-hold appeared' };
-  if (gh.isPaused()) return { hold: 'repo paused', paused: true };
-  if (p.headRefOid !== expectHead) return { headChanged: p.headRefOid };
+  if (p.baseRefName && p.baseRefName !== want.base) return { requeue: `base changed to ${p.baseRefName}` };
+  if (p.headRefName !== want.headRef) return { requeue: `head branch changed to ${p.headRefName}` };
+  const deps = unmetDeps(gh, p);
+  if (deps.length) return { requeue: `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged` };
   return null;
 }
 
-// Handle a failed re-check: queue-hold or pause -> back to queued, no merge; head -> bounce.
-function onRecheck(gh, pr, r, stage) {
+// The last step before a push or a merge: labels, head, pause flag and lock ownership.
+function recheckFinal(gh, pr, expectHead, lock) {
+  const p = gh.prView(pr.number);
+  if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
+  pr.labels = p.labels;
+  pr.body = p.body;
+  if (labelNames(p).includes('queue-hold')) return { requeue: 'queue-hold appeared' };
+  if (gh.isPaused()) return { requeue: 'repo paused', paused: true };
+  if (p.headRefOid !== expectHead) return { requeue: `head changed to ${p.headRefOid.slice(0, 12)}` };
+  if (!lock.stillHeld()) return { requeue: 'the landing lock was lost', lost: true };
+  return null;
+}
+
+// A failed re-check never merges: the PR goes back to `queued` (queue-hold kept) and the next
+// round starts its validation again; a closed PR just loses `landing`.
+function abort(gh, pr, r, stage) {
   if (r.stop) {
     setLabels(gh, pr, { remove: ['landing'] });
     return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}` } };
   }
-  if (r.hold) {
-    setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
-    return { aborted: { pr: pr.number, reason: `${r.hold} before ${stage}` }, paused: Boolean(r.paused) };
-  }
-  return { bounced: bounce(gh, pr, `head changed while landing (now ${r.headChanged.slice(0, 12)}, before ${stage})`) };
+  setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
+  return { aborted: { pr: pr.number, reason: `${r.requeue} before ${stage}` }, paused: Boolean(r.paused), lost: Boolean(r.lost) };
 }
 
+// Both re-checks, shape first; null when the push or merge may go ahead.
+function recheck(gh, pr, want, expectHead, lock) {
+  return recheckShape(gh, pr, want) || recheckFinal(gh, pr, expectHead, lock);
+}
+
+// ---------------------------------------------------------------- one PR
+
 async function landOne(ctx, pr) {
-  const { gh, cfg, mainRoot, lock } = ctx;
+  const { gh, cfg, mainRoot, lock, root } = ctx;
   setLabels(gh, pr, { add: ['landing'], remove: ['queued'] });
   const gated = parseLanding(pr.body).gatedSha;
   if (!gated) return { bounced: bounce(gh, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section') };
@@ -150,6 +137,7 @@ async function landOne(ctx, pr) {
   }
   const head = pr.headRefOid;
   const base = pr.baseRefName || cfg.base;
+  const want = { base, headRef: pr.headRefName };
   const dir = landerCheckout(mainRoot, base);
   fetchBranch(dir, base);
   const f = git(['fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${pr.headRefName}:refs/remotes/origin/${pr.headRefName}`], { cwd: dir });
@@ -165,8 +153,9 @@ async function landOne(ctx, pr) {
     const forkPoint = gitOk(['merge-base', baseRef, head], { cwd: dir });
     const newBase = gitOk(['rev-parse', baseRef], { cwd: dir });
     resetTo(dir, head);
+    // Repo hooks (pre-rebase, post-rewrite) run here: without the token, like every child.
     const rb = git(['-c', 'rebase.autoSquash=false', '-c', 'rebase.updateRefs=false', 'rebase', '--no-autostash', newBase], {
-      cwd: dir, env: { ...process.env, GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' },
+      cwd: dir, env: childEnv({ GIT_EDITOR: 'true', GIT_SEQUENCE_EDITOR: 'true' }),
     });
     if (rb.status !== 0) {
       const files = git(['diff', '--name-only', '--diff-filter=U'], { cwd: dir }).stdout.split(/\r?\n/).filter(Boolean);
@@ -195,14 +184,15 @@ async function landOne(ctx, pr) {
     }
     // Same patches on a newer base: rerun the affected gate only.
     let g = await runCommands([...cfg.setup, ...cfg.affectedGate], dir, lock, cfg.lockTtlMin);
-    if (!g.ok) g = await runCommands(cfg.affectedGate, dir, lock, cfg.lockTtlMin);
+    if (!g.ok && !g.lost) g = await runCommands(cfg.affectedGate, dir, lock, cfg.lockTtlMin);
+    if (g.lost) { resetTo(dir, baseRef); return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push'); }
     if (!g.ok) {
       resetTo(dir, baseRef);
       return { bounced: bounce(gh, pr, `affected gate failed after the rebase (\`${g.cmd}\` exit ${g.status}, retried once)`, g.tail) };
     }
     landSha = rebasedSha;
-    const pre = recheck(gh, pr, head);
-    if (pre) { resetTo(dir, baseRef); return onRecheck(gh, pr, pre, 'the push'); }
+    const pre = recheck(gh, pr, want, head, lock);
+    if (pre) { resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
     const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
     resetTo(dir, baseRef);
     if (push.status !== 0) return { bounced: bounce(gh, pr, `push of the rebased head was rejected: ${firstLine(push.stderr || push.stdout)}`) };
@@ -213,23 +203,27 @@ async function landOne(ctx, pr) {
     if (seen.headRefOid !== landSha) return { retry: true, note: 'GitHub has not seen the pushed head yet' };
   }
 
-  // Right before the merge: nothing held, paused or pushed; then the final base check (a moved
-  // base means the caller redoes the rebase and validation).
-  const pre = recheck(gh, pr, landSha);
-  if (pre) return onRecheck(gh, pr, pre, 'the merge');
+  // Right before the merge: same base and branch, dependencies merged; then the final base
+  // check (a moved base means the caller redoes the rebase and validation); then, last, the
+  // labels, head, pause flag and lock.
+  const shape = recheckShape(gh, pr, want);
+  if (shape) return abort(gh, pr, shape, 'the merge');
   fetchBranch(dir, base);
   if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
-  const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha });
+  const last = recheckFinal(gh, pr, landSha, lock);
+  if (last) return abort(gh, pr, last, 'the merge');
+  const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root });
   if (!m.ok) return { bounced: bounce(gh, pr, `merge failed: ${m.message}`) };
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
 }
 
 // ---------------------------------------------------------------- capacity
 
-// Move the oldest queue-waiting PRs to queued while queued + landing < maxQueued.
+// Move the oldest queue-waiting PRs to queued while the unheld queued + landing PRs are fewer
+// than maxQueued.
 function admitWaiting(ctx, report) {
   const { gh, cfg } = ctx;
-  let free = cfg.maxQueued - listQueue(gh).length;
+  let free = cfg.maxQueued - capacityUsed(listQueue(gh));
   if (free <= 0) return;
   for (const w of listWaiting(gh)) {
     if (free <= 0) break;
@@ -245,30 +239,6 @@ function admitWaiting(ctx, report) {
   }
 }
 
-// ---------------------------------------------------------------- wide sweep
-
-async function runSweep(ctx, base) {
-  const { cfg, mainRoot, lock } = ctx;
-  const dir = landerCheckout(mainRoot, base);
-  fetchBranch(dir, base);
-  resetTo(dir, `refs/remotes/origin/${base}`);
-  const cmds = Array.isArray(cfg.wideSweep) ? cfg.wideSweep : [cfg.wideSweep];
-  return runCommands([...cfg.setup, ...cmds], dir, lock, cfg.lockTtlMin);
-}
-
-async function wideSweep(ctx, report, base) {
-  const { gh, cfg } = ctx;
-  const count = bumpMergeCount(gh.repo);
-  if (!cfg.wideSweep || count.sinceSweep < cfg.sweepEveryMerges) return;
-  markSwept(gh.repo);
-  const r = await runSweep(ctx, base);
-  report.sweep = { ran: true, ok: r.ok, afterMerges: count.sinceSweep };
-  if (r.ok) return;
-  gh.setPaused(true);
-  report.paused = true;
-  report.alerts.push(`wide sweep on ${base} failed after ${count.sinceSweep} merges (\`${r.cmd}\` exit ${r.status}); the repo is paused (AGENT_LANDING_PAUSED=1). File a ticket, fix ${base}, then run land-queue unpause.`);
-}
-
 // ---------------------------------------------------------------- per repo
 
 function target(root, slug) {
@@ -277,10 +247,10 @@ function target(root, slug) {
   return { root, repo };
 }
 
-function context(t) {
-  const cfg = loadRepoConfig(t.root);
+function context(t, opts = {}) {
+  const cfg = loadRepoConfig(t.root, opts);
   const gh = new Gh({ repo: t.repo });
-  return { gh, cfg, root: t.root, mainRoot: mainCheckout(t.root), lock: new LandingLock(gh, { ttlMin: cfg.lockTtlMin }) };
+  return { gh, cfg, root: t.root, mainRoot: mainCheckout(t.root), lock: new LandingLock(gh, { ttlMin: cfg.lockTtlMin, cwd: t.root }) };
 }
 
 function fillQueueState(gh, report) {
@@ -292,65 +262,108 @@ function fillQueueState(gh, report) {
   return q;
 }
 
+// Take the lock, or record why not (busy, or stale and not reclaimed). True when held.
+function takeLock(ctx, report, opts) {
+  fetchBranch(ctx.root, ctx.cfg.base);
+  const got = ctx.lock.acquire(baseTreeOf(ctx.root, `refs/remotes/origin/${ctx.cfg.base}`));
+  if (got.held) return true;
+  const h = got.holder ? { host: got.holder.host, pid: got.holder.pid, ageMin: got.holder.ageMin } : null;
+  if (got.stale && opts.reclaimStale && ctx.lock.reclaim(got.holder)) {
+    report.alerts.push(`reclaimed a stale landing lock (${h?.ageMin} min old)`);
+    return true;
+  }
+  if (got.stale) report.stale.push(h); else report.busy = true;
+  return false;
+}
+
+// Holding the lock, nothing can be landing: a `landing` label is left over from a crash.
+function resetLeftovers(gh, report) {
+  for (const p of listQueue(gh)) {
+    if (!labelNames(p).includes('landing')) continue;
+    setLabels(gh, p, { add: ['queued'], remove: ['landing'] });
+    if (!report.reset.includes(p.number)) report.reset.push(p.number);
+  }
+}
+
+// A due sweep, caught on its own: a sweep that throws never touches a merged PR.
+async function sweepAfter(ctx, report) {
+  try {
+    const s = await dueSweep(ctx);
+    if (!s) return;
+    report.sweep = { ran: true, ok: s.ok, afterMerges: s.afterMerges };
+    if (s.alert) report.alerts.push(s.alert);
+    if (s.paused) report.paused = true;
+  } catch (e) {
+    report.sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
+    report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}`);
+  }
+}
+
 async function runRepo(t, opts) {
   const ctx = context(t);
-  const { gh, cfg } = ctx;
+  const { gh } = ctx;
   const report = {
     repo: t.repo, merged: [], bounced: [], admitted: [], aborted: [], reset: [], queued: 0, held: [], waiting: [], queueWaiting: [],
     stale: [], busy: false, paused: false, alerts: [], sweep: null,
   };
-  if (!opts.dryRun) gh.ensureLabels();
+  if (!opts.dryRun) {
+    gh.ensureLabels();
+    // Recover a crashed run first, whatever else stops this one (a pause, nothing eligible).
+    if (listQueue(gh).some((p) => labelNames(p).includes('landing'))) {
+      if (!takeLock(ctx, report, opts)) { fillQueueState(gh, report); return report; }
+      try { resetLeftovers(gh, report); } finally { ctx.lock.release(); }
+    }
+  }
+  let lost = false;
   for (let i = 0; i < MAX_PRS_PER_RUN; i++) {
     if (gh.isPaused()) { report.paused = true; break; }
     if (!opts.dryRun) admitWaiting(ctx, report);
     let q = fillQueueState(gh, report);
     if (!q.eligible.length) break;
     if (opts.dryRun) { report.plan = q.eligible.map((p) => p.number); break; }
-
-    fetchBranch(ctx.root, cfg.base);
-    const got = ctx.lock.acquire(baseTreeOf(ctx.root, `refs/remotes/origin/${cfg.base}`));
-    if (!got.held) {
-      const h = got.holder ? { host: got.holder.host, pid: got.holder.pid, ageMin: got.holder.ageMin } : null;
-      if (got.stale && opts.reclaimStale && ctx.lock.reclaim(got.holder)) {
-        report.alerts.push(`reclaimed a stale landing lock (${h?.ageMin} min old)`);
-      } else {
-        if (got.stale) report.stale.push(h); else report.busy = true;
-        break;
-      }
-    }
-    let res;
+    if (!takeLock(ctx, report, opts)) break;
+    let res = null;
     let pr = null;
     try {
-      // Holding the lock, nothing can be landing: a `landing` label is left over from a crash.
-      for (const p of listQueue(gh)) {
-        if (labelNames(p).includes('landing')) { setLabels(gh, p, { add: ['queued'], remove: ['landing'] }); report.reset.push(p.number); }
-      }
+      resetLeftovers(gh, report);
       q = fillQueueState(gh, report);
-      if (!q.eligible.length) break;
-      pr = q.eligible[0];
-      const base = pr.baseRefName || cfg.base;
-      // If the base moves before the merge, redo the rebase and validation (bounded).
-      for (let k = 1; ; k++) {
-        res = await landOne(ctx, pr);
-        if (!res.retry) break;
-        if (k >= MAX_BASE_RETRIES) { res = { bounced: bounce(gh, pr, `could not land after ${k} tries: ${res.note}`) }; break; }
-        pr = gh.prView(pr.number);
+      if (q.eligible.length) {
+        pr = q.eligible[0];
+        // If the base moves before the merge, redo the rebase and validation (bounded).
+        for (let k = 1; ; k++) {
+          res = await landOne(ctx, pr);
+          if (!res.retry) break;
+          if (k >= MAX_BASE_RETRIES) { res = { bounced: bounce(gh, pr, `could not land after ${k} tries: ${res.note}`) }; break; }
+          pr = gh.prView(pr.number);
+        }
       }
-      if (res.merged) await wideSweep(ctx, report, base);
+      if (res?.merged) {
+        report.merged.push(res.merged);
+        bumpMergeCount(gh.repo);
+        await sweepAfter(ctx, report);
+      }
     } catch (e) {
-      // Never leave `landing` behind.
-      if (pr) { try { setLabels(gh, gh.prView(pr.number), { add: ['queued'], remove: ['landing'] }); } catch { /* reported below */ } }
+      // Never leave `landing` behind; a merged PR is never put back in line.
+      if (pr && !res?.merged) { try { setLabels(gh, gh.prView(pr.number), { add: ['queued'], remove: ['landing'] }); } catch { /* reported below */ } }
       throw e;
     } finally {
       ctx.lock.release();
     }
-    if (res.merged) report.merged.push(res.merged);
-    else if (res.bounced) report.bounced.push(res.bounced);
+    if (!res) break;
+    if (res.bounced) report.bounced.push(res.bounced);
     else if (res.aborted) {
       report.aborted.push(res.aborted);
-      if (res.paused) { report.paused = true; break; }
+      if (res.paused) report.paused = true;
+      if (res.lost) { lost = true; report.alerts.push(`the landing lock was lost while landing #${res.aborted.pr}; stopped`); }
     }
-    if (report.paused) break;
+    if (report.paused || lost) break;
+  }
+  // A sweep that is overdue (merges by land-pr, or a run that stopped before its sweep) runs when
+  // nothing else is in the way.
+  if (!opts.dryRun && !report.paused && !report.busy && !report.stale.length && !lost && sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
+    if (takeLock(ctx, report, opts)) {
+      try { await sweepAfter(ctx, report); } finally { ctx.lock.release(); }
+    }
   }
   fillQueueState(gh, report);
   return report;
@@ -362,16 +375,25 @@ async function unpauseRepo(t) {
   if (!gh.isPaused()) return { repo: t.repo, paused: false, sweep: null, note: 'not paused' };
   let sweep = null;
   if (cfg.wideSweep) {
-    const r = await runSweep(ctx, cfg.base);
-    sweep = { ok: r.ok, cmd: r.cmd, status: r.status };
-    if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red` };
+    // The sweep runs in the lander checkout: only while holding the landing lock.
+    const probe = { stale: [], busy: false, alerts: [] };
+    if (!takeLock(ctx, probe, {})) {
+      return { repo: t.repo, paused: true, sweep: null, busy: true, note: probe.stale.length ? 'the landing lock is stale; the lander reclaims it' : 'the landing lock is busy; try again after the lander finishes' };
+    }
+    try {
+      const r = await runSweep(ctx);
+      sweep = { ok: r.ok, cmd: r.cmd, status: r.status };
+      if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red` };
+    } finally {
+      ctx.lock.release();
+    }
   }
   gh.setPaused(false);
   return { repo: t.repo, paused: false, sweep, note: 'cleared AGENT_LANDING_PAUSED' };
 }
 
 function statusRepo(t) {
-  const ctx = context(t);
+  const ctx = context(t, { needGate: false });
   const { gh } = ctx;
   const q = classifyQueue(gh, listQueue(gh));
   const holder = ctx.lock.read();
@@ -414,6 +436,7 @@ function runText(r) {
 // ---------------------------------------------------------------- main
 
 async function main() {
+  captureToken();
   const args = parseArgs(process.argv.slice(2), {
     flags: new Set(['all', 'json', 'dry-run', 'reclaim-stale', 'help']),
     options: new Set(['repo', 'root']),

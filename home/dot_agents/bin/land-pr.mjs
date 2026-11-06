@@ -6,25 +6,28 @@
 //   node land-pr.mjs hold <pr> [--holder <id>] [--repo owner/name] [--json]
 //
 // Merge now: only when the gated head already contains origin/<base> AND no other PR in the repo
-// is `queued`, `queue-waiting` or `landing` (fairness). The landing lock
-// (refs/heads/agent-landing-lock) is taken first; then the base, the PR's labels and head, the
-// rest of the queue and the repo pause flag are checked again; then the merge is pinned to the
-// gated head; the lock is released only if it is still ours. A busy lock, a moved base or anyone
-// else in line queues the PR instead.
-// Queue: label `queued`, write a `## Landing` section (`Gate: pass @ <sha>`). `queued` + `landing`
-// PRs count toward the repo's capacity (maxQueued, default 5). When it is full, or older PRs are
-// already waiting, the PR gets `queue-waiting`; the lander admits it when a slot frees. A PR
-// already `queued` only gets its gated sha refreshed. A `queue-waiting` PR stays waiting unless it
-// is the oldest waiting PR and a slot is free. A `queue-blocked` PR (bounced, then fixed, re-gated
-// and re-reviewed) goes back in line: queue-blocked -> queued (or queue-waiting). None of these
-// is ever merged now.
+// is `queued`, `queue-waiting` or `landing` (fairness; held PRs count too). The landing lock
+// (refs/heads/agent-landing-lock) is taken first; then the PR (state, head, base, branch), the
+// refusals, the rest of the queue and the base are checked again, and last the labels, head,
+// pause flag and lock ownership; then the merge is pinned to the gated head, the queue labels
+// are cleared, a wide sweep that is due runs under the lock, and the lock is released only if it
+// is still ours. A busy lock, a moved base or anyone else in line queues the PR instead.
+// Queue: label `queued`, write a `## Landing` section (`Gate: pass @ <sha>`). Unheld `queued` +
+// `landing` PRs count toward the repo's capacity (maxQueued, default 5). When it is full, or
+// older PRs are already waiting, the PR gets `queue-waiting`; the lander admits it when a slot
+// frees. A PR already `queued` only gets its gated sha refreshed. A `queue-waiting` PR stays
+// waiting unless it is the oldest waiting PR and a slot is free. A `queue-blocked` PR (bounced,
+// then fixed, re-gated and re-reviewed) goes back in line: queue-blocked -> queued (or
+// queue-waiting). None of these is ever merged now.
 // Editing a queued PR (pr-workflow section 4): `hold` adds `queue-hold` and a PR-body line
-// `Hold-By: <holder> <ISO time>` in one edit. <holder> is --holder, else $T3CODE_THREAD_ID, else
-// `<hostname>:<parent pid>`. It refuses (exit 2) when `queue-hold` is already there or the PR is
-// `landing`, and backs its hold out again if `landing` appears meanwhile. After the push, gate and
-// review, `--release-hold` records the new gated sha and removes `queue-hold` and this holder's
-// line in one edit, then continues as above. A hold whose line names another holder is refused.
-// Only whoever set a hold clears it (the owner may clear any by hand).
+// `Hold-By: <holder> <ISO time>` in one edit. <holder> is --holder, else $T3CODE_THREAD_ID; with
+// neither it refuses (exit 2), because the same id must release the hold. `hold` refuses when the
+// PR is `landing` or `queue-hold` is already there, and backs its hold out again if `landing`
+// appears meanwhile. After the push, gate and review, `--release-hold` (same holder) first runs
+// the read-only checks (only its own queue-hold excepted), then records the new gated sha and
+// removes `queue-hold` and this holder's line in one edit, then continues as above on a fresh
+// read. A hold whose line names another holder is refused. Only whoever set a hold clears it
+// (the owner may clear any by hand).
 //
 //   HELD <holder>           hold: queue-hold and the Hold-By line added                exit 0
 //
@@ -33,14 +36,15 @@
 //   QUEUED <position>       the lander will land it; kick the lander schedule        exit 0
 //   QUEUE-FULL <position>   labelled queue-waiting; kick the lander schedule         exit 3
 //   REFUSED <reason>        queue-hold, landing, unmerged Depends-on, the repo is paused
-//                           (AGENT_LANDING_PAUSED=1), or a hold this caller did not set:
-//                           no merge, no label change                                exit 2
-// Errors (head is not the gated sha, draft, closed, merge failed) exit 1; bad usage exits 2.
+//                           (AGENT_LANDING_PAUSED=1), no holder id, or a hold this caller
+//                           did not set: no merge, no label change                   exit 2
+// Errors (head is not the gated sha, draft, closed, retargeted, merge failed, no gate in
+// .agents/repo.json) exit 1 (a config error exits 2); bad usage exits 2.
 import {
   Gh, LandError, LandingLock,
-  addHold, baseTreeOf, bumpMergeCount, classifyQueue, fetchBranch, gitOk, holderId, isAncestor, labelNames, listQueue,
-  listWaiting, loadRepoConfig, mergePinned, parseArgs, parseHolds, parseLanding, print, removeHold, repoTop, setLabels,
-  slugFromRemote, unmetDeps, writeLanding,
+  addHold, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
+  holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
+  parseLanding, print, removeHold, repoTop, setLabels, slugFromRemote, unmetDeps, writeLanding,
 } from './lib/land.mjs';
 
 const USAGE = [
@@ -48,18 +52,19 @@ const USAGE = [
   '       node land-pr.mjs hold <pr> [--holder <id>] [--repo owner/name] [--json]',
 ].join('\n');
 
-// Why land-pr must not merge or queue this PR; empty when it may proceed.
-function refusal(gh, pr) {
+// Why land-pr must not merge or queue this PR; empty when it may proceed. ignoreHold: the
+// caller is releasing its own (only) hold.
+function refusal(gh, pr, { ignoreHold = false } = {}) {
   const labels = labelNames(pr);
-  if (labels.includes('queue-hold')) return 'queue-hold (held by the owner, a full stop or an agent editing it)';
   if (labels.includes('landing')) return 'landing (the lander is landing it now)';
+  if (!ignoreHold && labels.includes('queue-hold')) return 'queue-hold (held by the owner, a full stop or an agent editing it)';
   const deps = unmetDeps(gh, pr);
   if (deps.length) return `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged`;
   if (gh.isPaused()) return 'repo paused (AGENT_LANDING_PAUSED=1)';
   return '';
 }
 
-// Other PRs in line: queued, landing or queue-waiting.
+// Other PRs in line: queued, landing or queue-waiting (held ones included: fairness).
 function othersInLine(gh, n) {
   const active = listQueue(gh).filter((p) => p.number !== n);
   const waiting = listWaiting(gh).filter((p) => p.number !== n);
@@ -75,11 +80,12 @@ function hold(args, n) {
   const gh = new Gh({ repo });
   const out = (o, code) => { if (args.json) print(o, true); else print(o.line, false); return code; };
   const refuse = (reason) => out({ result: 'REFUSED', pr: n, reason, line: `REFUSED ${reason}` }, 2);
+  // Read-only checks first, then the edit, then a re-check.
   const pr = gh.prView(n);
   if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
   const labels = labelNames(pr);
-  if (labels.includes('queue-hold')) return refuse('queue-hold already set (leave it, push nothing that lands, report it)');
   if (labels.includes('landing')) return refuse('landing (the lander has it; wait for its merge or bounce)');
+  if (labels.includes('queue-hold')) return refuse('queue-hold already set (leave it, push nothing that lands, report it)');
   gh.ensureLabels();
   const body = addHold(pr.body, holder);
   gh.prEdit(n, { body, add: ['queue-hold'] });
@@ -92,7 +98,8 @@ function hold(args, n) {
   return out({ result: 'HELD', pr: n, holder, line: `HELD ${holder}` }, 0);
 }
 
-function main() {
+async function main() {
+  captureToken();
   const args = parseArgs(process.argv.slice(2), { flags: new Set(['json', 'dry-run', 'help', 'release-hold']), options: new Set(['sha', 'repo', 'holder']) });
   if (args.help) { print(USAGE, false); return 0; }
   if (args._[0] === 'hold') {
@@ -121,25 +128,34 @@ function main() {
     throw new LandError(`PR #${n} head is ${pr.headRefOid}, the gated sha is ${sha}: push the gated commit or re-run the gate on the PR head`);
   }
 
-  // Release the caller's own hold and record the new gated sha in one edit.
+  // Release the caller's own hold and record the new gated sha in one edit. Read-only checks
+  // first (only the caller's own queue-hold is excepted; `landing` refuses outright), then the
+  // edit, then the normal checks again on a fresh read.
   let released = false;
   if (args['release-hold']) {
     const holder = holderId(args.holder);
-    if (!parseHolds(pr.body).some((h) => h.holder === holder)) return refuse(`queue-hold was not set by ${holder} (no "Hold-By: ${holder} ..." line)`);
+    const holds = parseHolds(pr.body);
+    if (!holds.some((h) => h.holder === holder)) return refuse(`queue-hold was not set by ${holder} (no "Hold-By: ${holder} ..." line)`);
+    const others = holds.filter((h) => h.holder !== holder);
+    if (labelNames(pr).includes('landing')) return refuse('landing (the lander is landing it now)');
+    if (!others.length) {
+      const why = refusal(gh, pr, { ignoreHold: true });
+      if (why) return refuse(why);
+    }
     if (args['dry-run']) return out({ result: 'WOULD-RELEASE', pr: n, sha, line: 'WOULD-RELEASE' }, 0);
     const prev = parseLanding(pr.body);
     const inLine = labelNames(pr).some((l) => l === 'queued' || l === 'queue-waiting');
     const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString() });
-    const others = parseHolds(body);
     if (others.length) {
       gh.prEdit(n, { body });
       return refuse(`queue-hold is still set by ${others.length} other holder(s)`);
     }
-    const hold = labelNames(pr).includes('queue-hold');
-    gh.prEdit(n, { body, remove: hold ? ['queue-hold'] : [] });
-    pr.body = body;
-    pr.labels = labelNames(pr).filter((l) => l !== 'queue-hold').map((name) => ({ name }));
+    const held = labelNames(pr).includes('queue-hold');
+    gh.prEdit(n, { body, remove: held ? ['queue-hold'] : [] });
     released = true;
+    pr = gh.prView(n);
+    if (pr.state === 'MERGED') return mergedOut(pr);
+    if (pr.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${pr.headRefOid} while releasing the hold; re-run the gate`);
   }
 
   const refused = refusal(gh, pr);
@@ -150,6 +166,7 @@ function main() {
   const waitingNow = labels.includes('queue-waiting');
   const blocked = labels.includes('queue-blocked');
   const base = pr.baseRefName || cfg.base;
+  const headRef = pr.headRefName;
   fetchBranch(root, base);
   const current = isAncestor(`refs/remotes/origin/${base}`, sha, root);
   let line = othersInLine(gh, n);
@@ -158,24 +175,43 @@ function main() {
   let lockInfo = null;
   if (current && !queued && !waitingNow && !blocked && line.count === 0) {
     if (args['dry-run']) return out({ result: 'WOULD-MERGE', pr: n, sha, line: 'WOULD-MERGE' }, 0);
-    const lock = new LandingLock(gh, { ttlMin: cfg.lockTtlMin });
+    const lock = new LandingLock(gh, { ttlMin: cfg.lockTtlMin, cwd: root });
     const got = lock.acquire(baseTreeOf(root, `refs/remotes/origin/${base}`));
     if (got.held) {
       try {
-        fetchBranch(root, base);
-        const stillCurrent = isAncestor(`refs/remotes/origin/${base}`, sha, root);
+        // Under the lock: the same PR (state, head, base, branch), nothing refusing it, nobody
+        // else in line; then the base; then, last, labels, head, pause and the lock itself.
         pr = gh.prView(n);
         if (pr.state === 'MERGED') return mergedOut(pr);
         if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
         if (pr.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${pr.headRefOid} while landing; re-run the gate`);
+        if ((pr.baseRefName || base) !== base || pr.headRefName !== headRef) {
+          throw new LandError(`PR #${n} now targets ${pr.baseRefName} from ${pr.headRefName}; re-run the gate and land-pr`);
+        }
         const again = refusal(gh, pr);
         if (again) return refuse(again);
         line = othersInLine(gh, n);
+        fetchBranch(root, base);
+        const stillCurrent = isAncestor(`refs/remotes/origin/${base}`, sha, root);
         if (stillCurrent && line.count === 0) {
-          const m = mergePinned(gh, cfg, { pr: n, sha });
+          const last = gh.prView(n);
+          if (last.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${last.headRefOid} while landing; re-run the gate`);
+          const why = refusal(gh, last);
+          if (why) return refuse(why);
+          if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
+          const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root });
           if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);
           bumpMergeCount(repo);
-          return out({ result: 'MERGED', pr: n, sha, mergeSha: m.mergeSha, released, line: `MERGED ${m.mergeSha || ''}`.trim() }, 0);
+          // A wide sweep that is due runs now, still under the lock.
+          let sweep = null;
+          try {
+            sweep = await dueSweep({ gh, cfg, mainRoot: mainCheckout(root), lock });
+            if (sweep?.alert) process.stderr.write(`warning: ${sweep.alert}\n`);
+          } catch (e) {
+            sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
+            process.stderr.write(`warning: the wide sweep could not run: ${sweep.error}\n`);
+          }
+          return out({ result: 'MERGED', pr: n, sha, mergeSha: m.mergeSha, released, sweep, line: `MERGED ${m.mergeSha || ''}`.trim() }, 0);
         }
       } finally {
         lock.release();
@@ -185,8 +221,8 @@ function main() {
     }
   }
 
-  // Queue it, or refresh the gated sha of a PR already in line.
-  const room = line.active.length < cfg.maxQueued;
+  // Queue it, or refresh the gated sha of a PR already in line. Held PRs do not use capacity.
+  const room = capacityUsed(line.active) < cfg.maxQueued;
   const olderWaiting = line.waiting.length > 0;
   let full;
   if (queued) full = false;
@@ -217,14 +253,7 @@ function main() {
   return out({ result: 'QUEUED', ...common, position, line: `QUEUED ${position}` }, 0);
 }
 
-try {
-  process.exitCode = main();
-} catch (e) {
-  if (e instanceof LandError) {
-    process.stderr.write(`land-pr: ${e.message}\n`);
-    process.exitCode = e.code;
-  } else {
-    process.stderr.write(`land-pr: ${e?.stack || e}\n`);
-    process.exitCode = 1;
-  }
-}
+main().then((code) => { process.exitCode = code; }, (e) => {
+  process.stderr.write(`land-pr: ${e instanceof LandError ? e.message : e?.stack || e}\n`);
+  process.exitCode = e instanceof LandError ? e.code : 1;
+});
