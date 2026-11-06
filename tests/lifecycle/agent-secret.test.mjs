@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { after, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { DUMMY_TOKEN, SECRET, makeRepo, scratch, secret, write } from './helpers.mjs';
+import { DUMMY_TOKEN, SECRET, isWin, makeRepo, scratch, secret, write } from './helpers.mjs';
 
 const { parseEnvFile, mergeFields, appendRef } = await import(pathToFileURL(SECRET).href);
 
@@ -41,6 +41,9 @@ describe('units', () => {
     assert.equal(appendRef(f, 'B', 'op://agent-repos/demo-x-dev/B'), 'present');
     assert.equal(appendRef(f, 'A', 'op://agent-repos/demo-y-dev/A'), 'conflict');
     assert.equal(fs.readFileSync(f, 'utf8'), 'A=op://agent-repos/demo-x-dev/A\nB=op://agent-repos/demo-x-dev/B\n');
+    // The key is matched literally: a regex-special name never matches another line.
+    fs.writeFileSync(f, 'AXB=op://x\n');
+    assert.equal(appendRef(f, 'A.B', 'op://agent-repos/demo-x-dev/A.B'), 'added');
   });
 });
 
@@ -69,14 +72,24 @@ describe('put', () => {
     assert.equal(fs.existsSync(path.join(repo.wt, '.env.op')), false);
   });
 
-  test('refuses --env prod and -prod items', () => {
+  test('refuses --env prod and -prod items (no override with --env dev)', () => {
     const { s, repo } = fixture();
-    for (const args of [['put', 'demo-api-dev', 'K', '--env', 'prod'], ['put', 'demo-api-prod', 'K']]) {
+    for (const args of [['put', 'demo-api-dev', 'K', '--env', 'prod'], ['put', 'demo-api-prod', 'K'], ['put', 'demo-api-prod', 'K', '--env', 'dev']]) {
       const r = secret(s, args, repo.wt, 'v', T);
       assert.equal(r.status, 2, r.out);
       assert.match(r.stderr, /production values never go into agent-repos/);
     }
     assert.equal(s.calls('op').length, 0);
+  });
+
+  test('itemPrefix in repo.json sets the required prefix', () => {
+    const s = scratch();
+    cleanups.push(s.cleanup);
+    const repo = makeRepo(s, { config: { itemPrefix: 'dm' } });
+    assert.equal(secret(s, ['put', 'demo-api-dev', 'K', '--repo', 'demo'], repo.wt, 'v', T).status, 2);
+    const r = secret(s, ['put', 'dm-api-dev', 'K', '--repo', 'demo'], repo.wt, 'v', T);
+    assert.equal(r.status, 0, r.out);
+    assert.equal(fs.readFileSync(path.join(repo.wt, '.env.op'), 'utf8'), 'K=op://agent-repos/dm-api-dev/K\n');
   });
 
   test('refuses item names outside <repo>- when --repo is given', () => {
@@ -150,6 +163,33 @@ describe('import, ref, check', () => {
     assert.match(tpl, /^DB_URL=op:\/\/agent-repos\/demo-db-dev\/DB_URL$/m);
     assert.equal(fs.existsSync(env), false);
     assert.ok(fs.existsSync(`${env}.pre-op`));
+  });
+
+  test('--retire-source never overwrites an existing .pre-op file', () => {
+    const { s, repo } = fixture();
+    const { env, mapFile } = files(repo, { API_KEY: 'demo-api-dev' });
+    write(`${env}.pre-op`, 'EARLIER=keep\n');
+    const r = secret(s, ['import', '--env', env, '--map', mapFile, '--retire-source'], repo.wt, undefined, T);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /old\.env\.pre-op already exists/);
+    assert.equal(fs.readFileSync(`${env}.pre-op`, 'utf8'), 'EARLIER=keep\n');
+    assert.ok(fs.existsSync(env));
+  });
+
+  test('--retire-source requires a git-ignored destination and makes it private', () => {
+    const { s, repo } = fixture();
+    const env = path.join(repo.wt, 'old.env');
+    write(env, 'API_KEY=a-1\n');
+    const mapFile = path.join(repo.wt, 'scratch', 'map.json');
+    write(mapFile, JSON.stringify({ API_KEY: 'demo-api-dev' }));
+    const r = secret(s, ['import', '--env', env, '--map', mapFile, '--retire-source'], repo.wt, undefined, T);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /would not be git-ignored/);
+    assert.ok(fs.existsSync(env));
+    const ok = files(repo, { API_KEY: 'demo-api-dev' });
+    const r2 = secret(s, ['import', '--env', ok.env, '--map', ok.mapFile, '--retire-source', '--replace'], repo.wt, undefined, T);
+    assert.equal(r2.status, 0, r2.out);
+    if (!isWin) assert.equal(fs.statSync(`${ok.env}.pre-op`).mode & 0o777, 0o600);
   });
 
   test('refuses prod map entries before calling op', () => {

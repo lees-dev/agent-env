@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { captureToken, opStatus, runOp } from './lib/op.mjs';
-import { gitOut } from './lib/proc.mjs';
+import { git, gitOut } from './lib/proc.mjs';
 import { loadConfig, repoName, samePath } from './lib/repo.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -223,12 +223,42 @@ function verify(ref, value) {
 /** Add NAME=ref to a template file unless NAME is already defined there. */
 export function appendRef(file, name, ref) {
   const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-  const re = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*(.*)$`, 'm');
+  const key = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=\\s*(.*)$`, 'm');
   const m = text.match(re);
   if (m) return m[1].trim() === ref ? 'present' : 'conflict';
   const prefix = text && !text.endsWith('\n') ? '\n' : '';
   fs.appendFileSync(file, `${prefix}${name}=${ref}\n`);
   return 'added';
+}
+
+/**
+ * Move <src> to <src>.pre-op: never over an existing file, only when git ignores the
+ * destination, and with mode 0600. Returns the refusal reason or null.
+ */
+function retireSource(src) {
+  const dest = `${src}.pre-op`;
+  if (fs.existsSync(dest) || isLink(dest)) return `${path.basename(dest)} already exists`;
+  const dir = path.dirname(src);
+  if (!gitOut(['rev-parse', '--show-toplevel'], { cwd: dir })) return 'the source is not inside a git checkout';
+  if (git(['check-ignore', '-q', '--', dest], { cwd: dir }).status !== 0) return `${path.basename(dest)} would not be git-ignored`;
+  try {
+    fs.copyFileSync(src, dest, fs.constants.COPYFILE_EXCL);
+  } catch (e) { return `could not create ${path.basename(dest)} (${e.code || e.message})`; }
+  try { fs.chmodSync(dest, 0o600); } catch { /* Windows */ }
+  fs.unlinkSync(src);
+  return null;
+}
+
+function isLink(p) {
+  try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; }
+}
+
+/** Item-name prefix for a repo: the cwd repo's itemPrefix when it is that repo, else the name. */
+function prefixFor(name, repo) {
+  const n = String(name).toLowerCase();
+  if (repo && repo.name === n && repo.cfg.itemPrefix) return String(repo.cfg.itemPrefix).toLowerCase();
+  return n;
 }
 
 function templateFile(repo) {
@@ -243,10 +273,10 @@ function cmdPut(opts) {
   if (!ITEM_RE.test(item)) throw new UsageError('item names are lowercase <repo>-<service>-<env>');
   if (!FIELD_RE.test(field)) throw new UsageError('FIELD must be an env var name');
   if (opts.env && !ENVS.includes(opts.env)) throw new UsageError('--env is dev or test');
-  const env = opts.env || envOfItem(item);
-  if (env === 'prod') throw new UsageError(PROD_REFUSED);
-  if (opts.repo && !item.startsWith(`${opts.repo.toLowerCase()}-`)) throw new UsageError(`item names for --repo ${opts.repo} start with ${opts.repo.toLowerCase()}-`);
+  if (opts.env === 'prod' || envOfItem(item) === 'prod') throw new UsageError(PROD_REFUSED);
   const repo = cwdRepo();
+  const prefix = opts.repo ? prefixFor(opts.repo, repo) : null;
+  if (prefix && !item.startsWith(`${prefix}-`)) throw new UsageError(`item names for --repo ${opts.repo} start with ${prefix}-`);
   const vault = vaultOf(opts, repo);
   const value = readStdin();
   requireOp();
@@ -277,6 +307,7 @@ function cmdImport(opts) {
   const values = parseEnvFile(fs.readFileSync(src, 'utf8'));
   const repo = cwdRepo();
   const vault = vaultOf(opts, repo);
+  const importPrefix = opts.repo ? prefixFor(opts.repo, repo) : null;
 
   const groups = new Map();
   let skipped = 0;
@@ -289,8 +320,8 @@ function cmdImport(opts) {
     if (!FIELD_RE.test(field)) throw new UsageError(`map entry for ${key}: invalid field name`);
     const env = (typeof m === 'object' && m.env) || envOfItem(item);
     if (env && !ENVS.includes(env)) throw new UsageError(`map entry for ${key}: env is dev or test`);
-    if (env === 'prod') throw new UsageError(`map entry for ${key}: ${PROD_REFUSED}`);
-    if (opts.repo && !item.startsWith(`${opts.repo.toLowerCase()}-`)) throw new UsageError(`map entry for ${key}: item names for --repo ${opts.repo} start with ${opts.repo.toLowerCase()}-`);
+    if (env === 'prod' || envOfItem(item) === 'prod') throw new UsageError(`map entry for ${key}: ${PROD_REFUSED}`);
+    if (importPrefix && !item.startsWith(`${importPrefix}-`)) throw new UsageError(`map entry for ${key}: item names for --repo ${opts.repo} start with ${importPrefix}-`);
     if (!groups.has(item)) groups.set(item, []);
     groups.get(item).push({ key, name: field, value, env });
   }
@@ -309,7 +340,7 @@ function cmdImport(opts) {
     const tagRepo = opts.repo ? opts.repo.toLowerCase() : repo ? repo.name : null;
     const res = storeItem(vault, item, entries, { replace: opts.replace, repo: tagRepo });
     refused += res.refused.length;
-    const inTemplate = vault === 'agent-repos' && repo && item.startsWith(`${repo.name}-`);
+    const inTemplate = vault === 'agent-repos' && repo && item.startsWith(`${prefixFor(repo.name, repo)}-`);
     for (const e of entries) {
       if (!res.written.includes(e.name)) continue;
       const ref = reference(vault, item, e.name);
@@ -333,14 +364,16 @@ function cmdImport(opts) {
   }
   log(`migrated ${migrated}, skipped ${skipped}, mismatches ${mismatches}`);
   if (missing) warn(`${missing} mapped keys were not in the env file`);
+  let retired = true;
   if (opts.retireSource) {
-    if (mismatches || refused) warn('source not retired: fix the mismatches or refusals first');
+    if (mismatches || refused) { warn('source not retired: fix the mismatches or refusals first'); retired = false; }
     else {
-      fs.renameSync(src, `${src}.pre-op`);
-      log(`source renamed to ${path.basename(src)}.pre-op`);
+      const why = retireSource(src);
+      if (why) { warn(`source not retired: ${why}`); retired = false; }
+      else log(`source renamed to ${path.basename(src)}.pre-op`);
     }
   }
-  return mismatches ? 1 : 0;
+  return mismatches || !retired ? 1 : 0;
 }
 
 function cmdRef(opts) {

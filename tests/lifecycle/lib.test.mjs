@@ -76,34 +76,107 @@ describe('op', () => {
     assert.equal(op.resolveOp(env), onPath);
   });
 
-  test('opEnv / stripToken: test mode uses the process env only', () => {
+  test('no export hands out the token; stripToken removes it; test mode uses the process env only', () => {
+    for (const name of ['readToken', 'opEnv', 'readTokenFile', 'lookupToken']) assert.equal(op[name], undefined, name);
     const env = { AGENT_ENV_NO_SECRETS: '1', OP_SERVICE_ACCOUNT_TOKEN: 't1', X: '1' };
-    assert.equal(op.opEnv(env).OP_SERVICE_ACCOUNT_TOKEN, 't1');
+    assert.equal(op.opStatus(env).hasToken, true);
     assert.equal('OP_SERVICE_ACCOUNT_TOKEN' in op.stripToken(env), false);
-    assert.equal(op.readToken({ AGENT_ENV_NO_SECRETS: '1' }), null);
+    assert.equal(op.opStatus({ AGENT_ENV_NO_SECRETS: '1' }).hasToken, false);
   });
 
-  test('readTokenFile requires a private regular file', { skip: isWin }, () => {
+  test('the Unix token file must be a private regular file', { skip: isWin }, () => {
     const s = tmp();
-    const f = path.join(s.dir, 'token');
+    const dir = path.join(s.home, '.config', 'op');
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, 'agent-env-token');
+    const env = { HOME: s.home, PATH: process.env.PATH };
     fs.writeFileSync(f, 'tok\n', { mode: 0o644 });
     fs.chmodSync(f, 0o644);
-    assert.equal(op.readTokenFile(f), null);
+    assert.equal(op.opStatus(env).hasToken, false);
     fs.chmodSync(f, 0o600);
-    assert.equal(op.readTokenFile(f), 'tok');
-    const link = path.join(s.dir, 'link');
-    fs.symlinkSync(f, link);
-    assert.equal(op.readTokenFile(link), null);
+    assert.equal(op.opStatus(env).hasToken, true);
+    fs.renameSync(f, path.join(dir, 'real'));
+    fs.symlinkSync(path.join(dir, 'real'), f);
+    assert.equal(op.opStatus(env).hasToken, false);
+  });
+});
+
+describe('processes', () => {
+  const root = isWin ? 'C:\\project' : '/project';
+  const sep = isWin ? '\\' : '/';
+  const wt = `${root}${sep}wt`;
+  const node = isWin ? '"C:\\Program Files\\nodejs\\node.exe"' : '/usr/bin/node';
+  const proc1 = (pid, ppid, cmd, extra = {}) => ({
+    pid, ppid, name: 'node', exe: '', cmd, cwd: '', start: 's',
+    args: isWin ? procs.splitWindowsArgs(cmd) : cmd.split(' '), ...extra,
+  });
+
+  test('splitWindowsArgs follows CommandLineToArgvW', () => {
+    assert.deepEqual(procs.splitWindowsArgs('"C:\\a b\\n.exe" "C:\\x y\\s.js" plain a\\\\"b c" d\\"e'), ['C:\\a b\\n.exe', 'C:\\x y\\s.js', 'plain', 'a\\b c', 'd"e']);
+  });
+
+  test('"wt copy" does not match "wt"; quoted paths with spaces and --flag=path do', () => {
+    const list = [
+      proc1(10, 1, `${node} "${root}${sep}wt copy${sep}server.js"`),
+      proc1(11, 1, `${node} "${wt}${sep}dir with space${sep}server.js"`),
+      proc1(12, 1, `${node} --require=${wt}${sep}hook.js app.js`),
+      proc1(13, 1, `${node} ${root}${sep}wt2${sep}x.js`),
+    ];
+    if (!isWin) {
+      list[0].args = ['/usr/bin/node', '/project/wt copy/server.js'];
+      list[1].args = ['/usr/bin/node', '/project/wt/dir with space/server.js'];
+    }
+    assert.deepEqual(procs.processesUnder(wt, list).map((p) => p.pid).sort(), [11, 12]);
+  });
+
+  test('descendants of a match are included; the lifecycle tools and protected IDEs are not', () => {
+    const list = [
+      proc1(20, 1, `${node} ${wt}${sep}parent.js`),
+      proc1(21, 20, `${node} child.js`),
+      proc1(22, 21, `${node} grandchild.js`),
+      proc1(23, 1, `${node} ${wt}${sep}x.js agent-worktree.mjs sweep`),
+      proc1(24, 1, `idea64 ${wt}`, { name: 'idea64.exe', exe: isWin ? 'C:\\JetBrains\\idea64.exe' : '/opt/jetbrains/idea64' }),
+    ];
+    list[3].cmd = `${node} ${root}${sep}bin${sep}agent-worktree.mjs teardown --repo ${wt}`;
+    list[3].args = isWin ? procs.splitWindowsArgs(list[3].cmd) : list[3].cmd.split(' ');
+    assert.deepEqual(procs.processesUnder(wt, list).map((p) => p.pid).sort(), [20, 21, 22]);
   });
 });
 
 describe('repo and ledger', () => {
-  test('makeWtId sanitises and bounds the id', () => {
-    assert.equal(repo.makeWtId('Demo', '/x/Agent LEE-1 Feature'), 'demo-agent-lee-1-feature');
+  test('makeWtId: <repo>-<basename>-<path hash>, sanitised, at most 40 characters', () => {
+    assert.match(repo.makeWtId('Demo', '/x/Agent LEE-1 Feature'), /^demo-agent-lee-1-feature-[0-9a-f]{6}$/);
+    assert.notEqual(repo.makeWtId('demo', '/a/wt'), repo.makeWtId('demo', '/b/wt'));
+    assert.equal(repo.makeWtId('demo', '/a/wt'), repo.makeWtId('demo', '/a/wt/'));
     const long = repo.makeWtId('a-very-long-repository-name', '/x/agent-lee-12345-an-extremely-long-worktree-name');
     assert.ok(long.length <= 40);
     assert.match(long, /^[a-z0-9-]+$/);
-    assert.notEqual(long, repo.makeWtId('a-very-long-repository-name', '/x/agent-lee-12345-an-extremely-long-worktree-other'));
+  });
+
+  test('canonical resolves links and the \\\\?\\ prefix', () => {
+    const s = tmp();
+    const real = path.join(s.dir, 'real');
+    fs.mkdirSync(real);
+    const link = path.join(s.dir, 'link');
+    fs.symlinkSync(real, link, isWin ? 'junction' : 'dir');
+    assert.equal(repo.canonKey(path.join(link, 'not-yet', 'f')), repo.canonKey(path.join(real, 'not-yet', 'f')));
+    if (isWin) assert.equal(repo.canonKey(`\\\\?\\${real}`), repo.canonKey(real));
+  });
+
+  test('tryLock: owner token, busy while the holder lives, broken when it is dead', () => {
+    const s = tmp();
+    const lock = path.join(s.dir, 'x.lock');
+    const release = ledger.tryLock(lock);
+    assert.ok(release);
+    assert.equal(ledger.tryLock(lock), null);
+    fs.writeFileSync(lock, `${process.pid} someone-else`);
+    release();
+    assert.ok(fs.existsSync(lock), 'release never removes a lock it does not own');
+    fs.writeFileSync(lock, '2147480000 dead');
+    const again = ledger.tryLock(lock);
+    assert.ok(again);
+    again();
+    assert.equal(fs.existsSync(lock), false);
   });
 
   test('loadConfig merges defaults and rejects other versions', () => {
@@ -124,11 +197,5 @@ describe('repo and ledger', () => {
     const l = ledger.readLedger(common, 'w');
     assert.equal(l.resources.length, 5);
     assert.deepEqual(fs.readdirSync(ledger.ledgerDir(common)), ['w.json']);
-  });
-
-  test('mentionsPath does not match a sibling with a longer name', () => {
-    const base = isWin ? 'C:\\x\\wt-1' : '/x/wt-1';
-    assert.equal(procs.mentionsPath(`node ${base}${isWin ? '\\' : '/'}server.js`, base), true);
-    assert.equal(procs.mentionsPath(`node ${base}0${isWin ? '\\' : '/'}server.js`, base), false);
   });
 });

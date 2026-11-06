@@ -1,6 +1,7 @@
 // Per-worktree resource ledger and the per-user repo registry (~/.agents/bin).
 // Ledger: <git-common-dir>/agent-resources/<wtId>.json, outside the worktree so it survives
 // the worktree's removal. Writes are atomic (temp file + rename) under a per-ledger lock file.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { homeDir } from './op.mjs';
@@ -8,7 +9,7 @@ import { sleepMs } from './proc.mjs';
 import { normPath } from './repo.mjs';
 
 const LOCK_WAIT_MS = 15000;
-const LOCK_STALE_MS = 120000;
+const LOCK_EMPTY_GRACE_MS = 5000;
 
 export function ledgerDir(commonDir) { return path.join(commonDir, 'agent-resources'); }
 export function ledgerFile(commonDir, wtId) { return path.join(ledgerDir(commonDir), `${wtId}.json`); }
@@ -41,34 +42,67 @@ export function readJson(file, fallback = null) {
   }
 }
 
-/** Run fn while holding <file>.lock (exclusive create; a lock older than 2 minutes is broken). */
-export function withLock(file, fn) {
-  const lock = `${file}.lock`;
+export function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/**
+ * Take a lock file without waiting. The file holds "<pid> <random token>"; a lock whose pid
+ * is dead is broken, a live holder means busy (null). Returns a release function that removes
+ * the file only while it still holds our token.
+ */
+export function tryLock(lock) {
   fs.mkdirSync(path.dirname(lock), { recursive: true });
-  const start = Date.now();
-  let fd = null;
-  while (fd === null) {
+  const token = `${process.pid} ${crypto.randomBytes(8).toString('hex')}`;
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      fd = fs.openSync(lock, 'wx');
-      fs.writeSync(fd, `${process.pid}\n`);
+      fs.writeFileSync(lock, token, { flag: 'wx', mode: 0o600 });
+      return () => {
+        try { if (fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock); } catch { /* gone */ }
+      };
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS) {
-          fs.unlinkSync(lock);
-          continue;
-        }
-      } catch { continue; }
-      if (Date.now() - start > LOCK_WAIT_MS) throw new Error(`lock busy: ${path.basename(lock)}`);
-      sleepMs(50);
+      let held;
+      let st;
+      try { held = fs.readFileSync(lock, 'utf8'); st = fs.statSync(lock); } catch { continue; }
+      // A holder between create and write leaves an empty file for a moment.
+      if (!held && Date.now() - st.mtimeMs < LOCK_EMPTY_GRACE_MS) return null;
+      if (pidAlive(Number(held.split(' ')[0]))) return null;
+      try { if (fs.readFileSync(lock, 'utf8') === held) fs.unlinkSync(lock); } catch { /* raced */ }
     }
   }
-  try {
-    return fn();
-  } finally {
-    try { fs.closeSync(fd); } catch { /* closed */ }
-    try { fs.unlinkSync(lock); } catch { /* removed */ }
+  return null;
+}
+
+/** Run fn while holding <file>.lock, waiting up to 15 s for a live holder. */
+export function withLock(file, fn) {
+  const release = waitLock(`${file}.lock`);
+  try { return fn(); } finally { release(); }
+}
+
+/** Async variant of withLock (the wait itself is synchronous and short). */
+export async function withLockAsync(file, fn) {
+  const release = waitLock(`${file}.lock`);
+  try { return await fn(); } finally { release(); }
+}
+
+function waitLock(lock) {
+  const start = Date.now();
+  for (;;) {
+    const release = tryLock(lock);
+    if (release) return release;
+    if (Date.now() - start > LOCK_WAIT_MS) throw new Error(`lock busy: ${path.basename(lock)}`);
+    sleepMs(50);
   }
+}
+
+const PATH_KINDS = new Set(['file', 'dir', 'cache', 'path']);
+export function isPathKind(kind) { return PATH_KINDS.has(String(kind)); }
+
+/** Path resources are stored absolute: a relative id is resolved against the worktree. */
+export function normalizeTrack(kind, id, worktreePath) {
+  return isPathKind(kind) && !path.isAbsolute(String(id)) ? path.resolve(worktreePath, String(id)) : String(id);
 }
 
 export function readLedger(commonDir, wtId) {

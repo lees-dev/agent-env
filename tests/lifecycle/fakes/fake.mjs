@@ -1,10 +1,20 @@
 // One fake for gh, docker and op, selected by argv[2]. State lives in the JSON file named by
 // FAKE_STATE; every call is appended to FAKE_LOG as {tool, args, hasToken}. Test data only.
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const [tool, ...args] = process.argv.slice(2);
 const stateFile = process.env.FAKE_STATE;
 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+if (tool === 'git') {
+  // Forwards to the real git, except a failing `worktree list` when the state asks for one.
+  if ((state.git || {}).failWorktreeList && args[0] === 'worktree' && args[1] === 'list') {
+    process.stderr.write('fatal: fake worktree list failure\n');
+    process.exit(128);
+  }
+  const r = spawnSync(process.env.FAKE_REAL_GIT, args, { stdio: 'inherit' });
+  process.exit(r.status ?? 1);
+}
 const save = () => fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({ tool, args, hasToken: Boolean(process.env.OP_SERVICE_ACCOUNT_TOKEN) }) + '\n');
 
@@ -27,8 +37,17 @@ function gh() {
     if (head) prs = prs.filter((p) => p.headRefName === head);
     if (base) prs = prs.filter((p) => p.baseRefName === base);
     if (st === 'open') prs = prs.filter((p) => p.state === 'OPEN');
+    if (flag('--limit')) prs = prs.slice(0, Number(flag('--limit')));
     const fields = (flag('--json') || '').split(',').filter(Boolean);
     out(JSON.stringify(prs.map((p) => Object.fromEntries(fields.map((f) => [f, p[f]])))));
+    return;
+  }
+  if (args[0] === 'api' && args.length === 2) {
+    const m = args[1].match(/git\/ref\/heads\/(.+)$/);
+    const branch = m ? m[1].split('/').map(decodeURIComponent).join('/') : null;
+    const sha = branch && (g.remoteRefs || {})[branch];
+    if (!sha) fail('gh: Not Found (HTTP 404)');
+    out(JSON.stringify({ ref: `refs/heads/${branch}`, object: { sha } }));
     return;
   }
   if (args[0] === 'api' && args[1] === '-X' && args[2] === 'DELETE') {
@@ -43,6 +62,7 @@ function gh() {
 
 function docker() {
   const d = state.docker || { containers: [], volumes: [], networks: [] };
+  if (d.fail) fail('Cannot connect to the Docker daemon');
   const filter = (list) => {
     const f = flag('--filter');
     if (!f) return list;

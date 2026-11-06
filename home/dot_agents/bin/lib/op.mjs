@@ -48,7 +48,7 @@ export function parseRegQuery(output) {
  * The Unix token file, read only when it is a regular file owned by this user with mode
  * 0600 (the same rule as scripts/lib/load-token.sh). Returns null otherwise.
  */
-export function readTokenFile(file) {
+function readTokenFile(file) {
   let st;
   try { st = fs.lstatSync(file); } catch { return null; }
   if (!st.isFile()) return null;
@@ -58,14 +58,19 @@ export function readTokenFile(file) {
   return v || null;
 }
 
+// Kept private to this module: no export returns the token. A hook or setup step runs as the
+// same user and could read the persisted token itself; the tools only guarantee that they
+// never hand it over (docs/lifecycle.md).
 let captured = null;
+let cached;
 
 /**
  * Move OP_SERVICE_ACCOUNT_TOKEN out of process.env into this module, so nothing but the op
- * child process ever sees it: repo setup commands, hooks (which run in this process), gates
+ * child process ever sees it: repo setup commands, hooks, gates
  * and every other child inherit an environment without it. Call once at startup.
  */
 export function captureToken() {
+  cached = undefined;
   for (const k of Object.keys(process.env)) {
     if (k.toUpperCase() !== 'OP_SERVICE_ACCOUNT_TOKEN') continue;
     if (process.env[k]) captured = process.env[k];
@@ -85,8 +90,15 @@ export function stripToken(env = process.env) {
  * Windows user environment (HKCU\Environment) or the Unix token file. Test mode
  * (AGENT_ENV_NO_SECRETS=1) only ever uses the process env.
  */
-export function readToken(env = process.env) {
-  if (captured && env === process.env) return captured;
+function readToken(env = process.env) {
+  if (env === process.env) {
+    if (cached === undefined) cached = captured || lookupToken(env);
+    return cached;
+  }
+  return lookupToken(env);
+}
+
+function lookupToken(env) {
   const own = envGet(env, 'OP_SERVICE_ACCOUNT_TOKEN');
   if (own) return own;
   if (envGet(env, 'AGENT_ENV_NO_SECRETS') === '1') return null;
@@ -98,8 +110,8 @@ export function readToken(env = process.env) {
   return readTokenFile(path.join(homeDir(env), '.config', 'op', 'agent-env-token'));
 }
 
-/** env plus OP_SERVICE_ACCOUNT_TOKEN when one can be found. */
-export function opEnv(env = process.env) {
+/** env plus OP_SERVICE_ACCOUNT_TOKEN when one can be found (only ever given to op). */
+function opEnv(env = process.env) {
   const token = readToken(env);
   const out = stripToken(env);
   if (token) out.OP_SERVICE_ACCOUNT_TOKEN = token;

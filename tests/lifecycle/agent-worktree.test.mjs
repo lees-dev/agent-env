@@ -1,4 +1,4 @@
-// node --test tests/lifecycle/
+// node --test "tests/lifecycle/*.test.mjs"
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -6,7 +6,7 @@ import path from 'node:path';
 import { after, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import {
-  DUMMY_TOKEN, ENGINE, engine, gitIn, isWin, ledgerOf, makeRepo, pr, scratch, write,
+  DUMMY_TOKEN, ENGINE, engine, gitIn, installFake, isWin, ledgerOf, makeRepo, makeWtId, pr, scratch, write,
 } from './helpers.mjs';
 
 const { foreignRefs, gatedShas, writeFooter, allocatePorts, parseArgs } = await import(pathToFileURL(ENGINE).href);
@@ -23,9 +23,32 @@ const containers = (wtId) => [
   { id: 'c1', labels: { 'agent.wt': wtId } },
   { id: 'c2', labels: { 'agent.wt': 'other-wt' } },
 ];
+/** A directory link: a junction on Windows, a symlink elsewhere. */
+const dirLink = (target, link) => fs.symlinkSync(target, link, isWin ? 'junction' : 'dir');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pidAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function waitDead(pid, ms = 5000) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { if (!pidAlive(pid)) return true; await sleep(100); }
+  return !pidAlive(pid);
+}
+function merged(s, repo, over = {}) {
+  s.writeState((st) => {
+    st.gh.prs = [pr({ headRefOid: repo.head, ...over })];
+    st.gh.remoteRefs = { [repo.branch]: repo.head };
+    st.docker.containers = containers(repo.wtId);
+    st.docker.volumes = [{ id: 'v1', labels: { 'agent.wt': repo.wtId } }];
+  });
+}
+function commit(s, dir, file, text = 'x\n') {
+  write(path.join(dir, file), text);
+  gitIn(s, dir, 'add', '-A');
+  gitIn(s, dir, 'commit', '-q', '-m', file);
+  return gitIn(s, dir, 'rev-parse', 'HEAD');
+}
 
 describe('units', () => {
-  test('foreignRefs accepts only op://agent-repos/<repo>-...', () => {
+  test('foreignRefs accepts only op://agent-repos/<prefix>-...', () => {
     const ok = 'A=op://agent-repos/demo-api-dev/A\nB="op://agent-repos/demo-db-test/B"\n';
     assert.equal(foreignRefs(ok, 'demo'), 0);
     assert.equal(foreignRefs('A=op://other-vault/demo-api-dev/A\n', 'demo'), 1);
@@ -82,11 +105,11 @@ describe('setup', () => {
       },
       files: {
         '.env.op': 'API_KEY=op://agent-repos/demo-api-dev/API_KEY\nLITERAL=1\n',
-        'scratch/.keep': '',
         '.agents/hooks.mjs': [
           "import fs from 'node:fs';",
           "export async function setup(ctx) {",
           "  ctx.track('neon-branch', 'br-' + ctx.wtId, 'neon');",
+          "  ctx.track('cache', 'scratch/cache');",
           "  const child = ctx.run(['node', '-e', 'process.stdout.write(String(process.env.OP_SERVICE_ACCOUNT_TOKEN || null))']);",
           "  fs.writeFileSync('scratch/hook.json', JSON.stringify({ inProcess: process.env.OP_SERVICE_ACCOUNT_TOKEN || null, child: child.stdout, ticket: ctx.ticket, ports: ctx.ports }));",
           "}",
@@ -100,7 +123,7 @@ describe('setup', () => {
     assert.ok(!r.out.includes(DUMMY_TOKEN) && !r.out.includes('dummy-api-value'));
     const env = fs.readFileSync(path.join(repo.wt, '.env.local'), 'utf8');
     assert.match(env, /API_KEY=dummy-api-value/);
-    assert.match(env, /AGENT_WT_ID=demo-wt-one/);
+    assert.match(env, new RegExp(`AGENT_WT_ID=${repo.wtId}`));
     const port = Number(env.match(/PORT=(\d+)/)[1]);
     assert.ok(port >= 42000 && port < 42900);
     const op = s.calls('op');
@@ -115,14 +138,13 @@ describe('setup', () => {
     assert.equal(l.ports.PORT, port);
     assert.equal(l.branch, 'agent/LEE-1-feature');
     assert.ok(l.resources.some((x) => x.kind === 'neon-branch' && x.where === 'neon'));
+    assert.ok(l.resources.some((x) => x.kind === 'cache' && x.id === path.join(repo.wt, 'scratch', 'cache')), 'relative tracked paths are stored absolute');
     assert.ok(l.resources.some((x) => x.kind === 'env-file'));
     const reg = JSON.parse(fs.readFileSync(path.join(s.home, '.agents', 'state', 'repos.json'), 'utf8'));
     assert.equal(reg.repos.length, 1);
-    // The gate gets the ports but never the token.
     const g = engine(s, ['gate'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
     assert.equal(g.status, 0, g.out);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(repo.wt, 'scratch', 'gate.json'), 'utf8')), { t: null });
-    // A second setup keeps the port.
     const again = engine(s, ['setup'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
     assert.equal(again.status, 0, again.out);
     assert.equal(ledgerOf(repo).ports.PORT, port);
@@ -137,17 +159,45 @@ describe('setup', () => {
     assert.match(r.stderr, /SECRETS NOT INJECTED/);
     const env = fs.readFileSync(path.join(repo.wt, '.env.local'), 'utf8');
     assert.doesNotMatch(env, /stale-value/);
-    assert.match(env, /AGENT_WT_ID=demo-wt-one/);
+    assert.match(env, new RegExp(`AGENT_WT_ID=${repo.wtId}`));
   });
 
   test('refuses .env.op references outside op://agent-repos/<repo>-', () => {
-    const { s, repo } = fixture({ files: { '.env.op': 'A=op://agent-repos/demo-api-dev/A\nB=op://Private/bank/password\n' } });
+    const { s, repo } = fixture({ files: { '.env.op': 'A=op://agent-repos/demo-api-dev/A\nB=op://other-vault/other-item/FIELD\n' } });
     write(path.join(repo.wt, '.env.local'), 'A=stale\n');
     const r = engine(s, ['setup'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
     assert.equal(r.status, 0, r.out);
     assert.match(r.stderr, /SECRETS NOT INJECTED: \.env\.op has 1 reference outside op:\/\/agent-repos\/demo-/);
     assert.equal(s.calls('op').length, 0);
     assert.equal(fs.existsSync(path.join(repo.wt, '.env.local')), false);
+  });
+
+  test('itemPrefix replaces the repo name in the reference check', () => {
+    const { s, repo } = fixture({ config: { itemPrefix: 'dm' }, files: { '.env.op': 'A=op://agent-repos/dm-api-dev/A\n' } });
+    s.writeState((st) => { st.op.items.push({ id: 'i1', vault: 'agent-repos', title: 'dm-api-dev', fields: [{ id: 'A', label: 'A', value: 'v' }] }); });
+    const r = engine(s, ['setup'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stdout, /secrets injected/);
+  });
+
+  test('refuses an env output that is not git-ignored, tracked, or a link', () => {
+    for (const kind of ['unignored', 'tracked', 'symlink']) {
+      const files = { '.env.op': 'A=op://agent-repos/demo-api-dev/A\n' };
+      const config = kind === 'unignored' ? { env: { output: '.env.dev' } } : {};
+      if (kind === 'tracked') files['.env.tracked'] = 'X=1\n';
+      const { s, repo } = fixture({ files, config: kind === 'tracked' ? { env: { output: '.env.tracked' } } : config });
+      if (kind === 'symlink') {
+        const target = path.join(s.dir, 'elsewhere.txt');
+        fs.writeFileSync(target, 'keep\n');
+        try { fs.symlinkSync(target, path.join(repo.wt, '.env.local'), 'file'); } catch (e) { if (e.code === 'EPERM') continue; throw e; }
+      }
+      const r = engine(s, ['setup'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
+      assert.equal(r.status, 0, r.out);
+      assert.match(r.stderr, kind === 'symlink' ? /is a symlink/ : kind === 'tracked' ? /is tracked by git/ : /is not git-ignored/, kind);
+      assert.equal(s.calls('op').length, 0, kind);
+      if (kind === 'tracked') assert.equal(fs.readFileSync(path.join(repo.wt, '.env.tracked'), 'utf8'), 'X=1\n');
+      if (kind === 'symlink') assert.equal(fs.readFileSync(path.join(s.dir, 'elsewhere.txt'), 'utf8'), 'keep\n');
+    }
   });
 
   test('a failing setup step fails setup', () => {
@@ -163,17 +213,40 @@ describe('setup', () => {
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /shell syntax is not supported/);
   });
+
+  test('two same-named worktrees get separate ids, ledgers and ports', () => {
+    const { s, repo } = fixture({ config: { ports: { PORT: 44000 } } });
+    const a = path.join(s.dir, 'a', 'wt');
+    const b = path.join(s.dir, 'b', 'wt');
+    gitIn(s, repo.main, 'worktree', 'add', '-q', '-b', 'agent/LEE-7-a', a);
+    gitIn(s, repo.main, 'worktree', 'add', '-q', '-b', 'agent/LEE-8-b', b);
+    const ida = makeWtId('demo', a);
+    const idb = makeWtId('demo', b);
+    assert.notEqual(ida, idb);
+    assert.ok(ida.length <= 40 && idb.length <= 40);
+    assert.equal(engine(s, ['setup'], a).status, 0);
+    assert.equal(engine(s, ['setup'], b).status, 0);
+    const la = ledgerOf(repo, ida);
+    const lb = ledgerOf(repo, idb);
+    assert.equal(la.branch, 'agent/LEE-7-a');
+    assert.equal(lb.branch, 'agent/LEE-8-b');
+    assert.notEqual(la.ports.PORT, lb.ports.PORT);
+  });
+
+  test('refuses a ledger that records another existing worktree', () => {
+    const { s, repo } = fixture();
+    const other = path.join(s.dir, 'other');
+    fs.mkdirSync(other);
+    write(path.join(repo.commonDir, 'agent-resources', `${repo.wtId}.json`), JSON.stringify({ worktreePath: other, resources: [], ports: {} }));
+    for (const cmd of [['setup'], ['teardown'], ['track', 'dir', 'x']]) {
+      const r = engine(s, cmd, repo.wt);
+      assert.equal(r.status, 1, r.out);
+      assert.match(r.stderr, /belongs to another worktree/);
+    }
+  });
 });
 
 describe('teardown', () => {
-  function merged(s, repo, over = {}) {
-    s.writeState((st) => {
-      st.gh.prs = [pr({ headRefOid: repo.head, ...over })];
-      st.docker.containers = containers(repo.wtId);
-      st.docker.volumes = [{ id: 'v1', labels: { 'agent.wt': repo.wtId } }];
-    });
-  }
-
   test('open PR: nothing removed, exit 0', () => {
     const { s, repo } = fixture();
     write(path.join(repo.wt, '.env.local'), 'X=1\n');
@@ -199,6 +272,16 @@ describe('teardown', () => {
     const r = engine(s, ['teardown'], repo.wt);
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /cannot read PR state/);
+  });
+
+  test('ghWrapper from repo.json is used for gh calls', () => {
+    const fakeGh = path.resolve(path.dirname(ENGINE), '..', '..', '..', 'tests', 'lifecycle', 'fakes', 'fake.mjs');
+    const { s, repo } = fixture({ config: { ghWrapper: `node "${fakeGh}" gh` } });
+    fs.rmSync(path.join(s.bin, isWin ? 'gh.cmd' : 'gh'));
+    merged(s, repo);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 0, r.out);
+    assert.ok(s.calls('gh').length >= 3);
   });
 
   test('merged but dirty: keep with counts, exit 1', () => {
@@ -233,6 +316,25 @@ describe('teardown', () => {
     assert.equal(ledgerOf(repo).state, 'torn-down');
   });
 
+  test('remote branch moved after the merge: not deleted', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    s.writeState((st) => { st.gh.remoteRefs[repo.branch] = 'f'.repeat(40); });
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stderr, /remote branch moved/);
+    assert.equal(s.readState().gh.deleted, undefined);
+  });
+
+  test('branch names are percent-encoded per segment in the API path', () => {
+    const { s, repo } = fixture({ branch: 'agent/LEE-9-a#b' });
+    merged(s, repo, { headRefName: 'agent/LEE-9-a#b' });
+    s.writeState((st) => { st.gh.remoteRefs = { 'agent/LEE-9-a#b': repo.head }; });
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 0, r.out);
+    assert.deepEqual(s.readState().gh.deleted, ['repos/{owner}/{repo}/git/refs/heads/agent/LEE-9-a%23b']);
+  });
+
   test('closed (not merged): resources removed, remote branch kept', () => {
     const { s, repo } = fixture();
     merged(s, repo, { state: 'CLOSED' });
@@ -240,6 +342,16 @@ describe('teardown', () => {
     assert.equal(r.status, 0, r.out);
     assert.equal(s.readState().gh.deleted, undefined);
     assert.equal(s.readState().docker.containers.length, 1);
+  });
+
+  test('docker present but failing: kept, exit 1', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    s.writeState((st) => { st.docker.fail = true; });
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /docker containers list failed/);
+    assert.equal(ledgerOf(repo).state, 'kept');
   });
 
   test('open PR based on this branch (stacked): keep, exit 1', () => {
@@ -252,16 +364,26 @@ describe('teardown', () => {
     assert.match(r.stderr, /open PR #8 is based on this branch/);
   });
 
-  for (const label of ['queued', 'landing', 'queue-blocked', 'queue-waiting']) {
-    test(`PR labelled ${label}: keep`, () => {
+  for (const [state, label] of [['CLOSED', 'queued'], ['CLOSED', 'landing'], ['CLOSED', 'queue-blocked'], ['CLOSED', 'queue-waiting'], ['OPEN', 'queued'], ['MERGED', 'queue-hold']]) {
+    test(`${state} PR labelled ${label}: keep, exit 1`, () => {
       const { s, repo } = fixture();
-      merged(s, repo, { state: 'CLOSED', labels: [{ name: label }] });
+      merged(s, repo, { state, labels: [{ name: label }] });
       const r = engine(s, ['teardown'], repo.wt);
       assert.equal(r.status, 1, r.out);
       assert.match(r.stderr, new RegExp(`land queue \\(${label}\\)`));
       assert.equal(s.readState().docker.containers.length, 2);
     });
   }
+
+  test('detached HEAD: kept when it has commits on no branch, remote or tag', () => {
+    const { s, repo } = fixture();
+    gitIn(s, repo.wt, 'checkout', '-q', '--detach');
+    assert.equal(engine(s, ['teardown'], repo.wt).status, 0);
+    commit(s, repo.wt, 'detached.txt');
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /detached HEAD with 1 commit on no branch, remote or tag/);
+  });
 
   test('squash merged: HEAD equals the PR head but is on no remote branch: eligible', () => {
     const { s, repo } = fixture({ push: false });
@@ -273,9 +395,7 @@ describe('teardown', () => {
   test('extra unpublished commit: keep, exit 1', () => {
     const { s, repo } = fixture();
     merged(s, repo);
-    write(path.join(repo.wt, 'more.txt'), 'more\n');
-    gitIn(s, repo.wt, 'add', '-A');
-    gitIn(s, repo.wt, 'commit', '-q', '-m', 'more');
+    commit(s, repo.wt, 'more.txt');
     const r = engine(s, ['teardown'], repo.wt);
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /1 commit not on any remote/);
@@ -283,10 +403,7 @@ describe('teardown', () => {
 
   test('extra commit named by a Gate: pass line (lander rebase) counts as pushed', () => {
     const { s, repo } = fixture();
-    write(path.join(repo.wt, 'more.txt'), 'more\n');
-    gitIn(s, repo.wt, 'add', '-A');
-    gitIn(s, repo.wt, 'commit', '-q', '-m', 'more');
-    const local = gitIn(s, repo.wt, 'rev-parse', 'HEAD');
+    const local = commit(s, repo.wt, 'more.txt');
     merged(s, repo, { body: `## Landing\nGate: pass @ ${repo.head}\nGate: pass @ ${local.slice(0, 12)} (lander rebase)\n` });
     const r = engine(s, ['teardown'], repo.wt);
     assert.equal(r.status, 0, r.out);
@@ -311,7 +428,7 @@ describe('teardown', () => {
     assert.match(r.stderr, /not on any remote/);
   });
 
-  test('stops processes under the worktree, runs hooks.teardown, deletes tracked paths', async () => {
+  test('stops processes under the worktree and their children; leaves "wt one copy" alone; runs hooks.teardown', async () => {
     const { s, repo } = fixture({
       files: {
         '.agents/hooks.mjs': [
@@ -325,23 +442,85 @@ describe('teardown', () => {
       },
     });
     merged(s, repo);
-    const cache = path.join(s.dir, 'cache dir');
+    const cache = path.join(s.tmp, 'cache dir');
     fs.mkdirSync(cache);
     assert.equal(engine(s, ['track', 'dir', cache], repo.wt).status, 0);
     assert.equal(engine(s, ['track', 'neon-branch', 'b1', '--where', 'neon'], repo.wt).status, 0);
-    const script = path.join(repo.wt, 'scratch', 'server.js');
-    write(script, 'setInterval(() => {}, 1000);\n');
-    const child = spawn(process.execPath, [script], { stdio: 'ignore', windowsHide: true });
-    await new Promise((r) => setTimeout(r, 300));
-    const exited = new Promise((r) => child.once('exit', () => r(true)));
+    // Parent inside the worktree starts a child with a relative command line.
+    const scratchDir = path.join(repo.wt, 'scratch');
+    write(path.join(scratchDir, 'child.js'), 'setInterval(() => {}, 1000);\n');
+    write(path.join(scratchDir, 'parent.js'), [
+      "const { spawn } = require('child_process');",
+      "const c = spawn(process.execPath, ['child.js'], { cwd: __dirname, stdio: 'ignore' });",
+      "require('fs').writeFileSync(require('path').join(__dirname, 'child.pid'), String(c.pid));",
+      'setInterval(() => {}, 1000);',
+    ].join('\n'));
+    const parent = spawn(process.execPath, [path.join(scratchDir, 'parent.js')], { stdio: 'ignore', windowsHide: true });
+    // A sibling folder whose name starts with the worktree's name.
+    const copy = `${repo.wt} copy`;
+    write(path.join(copy, 'server.js'), 'setInterval(() => {}, 1000);\n');
+    const sibling = spawn(process.execPath, [path.join(copy, 'server.js')], { stdio: 'ignore', windowsHide: true });
+    cleanups.unshift(() => { try { sibling.kill(); } catch { /* gone */ } });
+    const pidFile = path.join(scratchDir, 'child.pid');
+    for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await sleep(100);
+    const childPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    await sleep(200);
     const r = engine(s, ['teardown'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
     assert.equal(r.status, 0, r.out);
-    assert.match(r.stdout, /1 process stopped/);
-    assert.equal(await Promise.race([exited, new Promise((res) => setTimeout(() => res(false), 5000))]), true);
+    assert.ok(Number(r.stdout.match(/(\d+) process(es)? stopped/)[1]) >= 2, r.stdout);
+    assert.equal(await waitDead(parent.pid), true, 'parent stopped');
+    assert.equal(await waitDead(childPid), true, 'child with a relative command line stopped');
+    assert.equal(pidAlive(sibling.pid), true, 'process in "wt one copy" untouched');
     assert.equal(fs.existsSync(cache), false);
     const hook = JSON.parse(fs.readFileSync(path.join(s.dir, 'hook-teardown.json'), 'utf8'));
-    assert.deepEqual(hook, { wtId: 'demo-wt-one', branch: 'agent/LEE-1-feature', gone: false, token: null });
+    assert.deepEqual(hook, { wtId: repo.wtId, branch: 'agent/LEE-1-feature', gone: false, token: null });
     assert.equal(ledgerOf(repo).resources.some((x) => x.kind === 'neon-branch'), false);
+  });
+
+  test('a failed process listing keeps the worktree', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const r = engine(s, ['teardown'], repo.wt, { AGENT_WORKTREE_TEST_PROCLIST_FAIL: '1' });
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /process list failed/);
+    assert.equal(s.readState().docker.containers.length, 2);
+  });
+
+  test('tracked paths outside the allowlist or inside other checkouts are refused', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const sib = path.join(s.dir, 'sibling wt');
+    gitIn(s, repo.main, 'worktree', 'add', '-q', '-b', 'agent/LEE-5-sib', sib);
+    const ssh = path.join(s.home, '.ssh');
+    write(path.join(ssh, 'id_test'), 'k\n');
+    const link = path.join(s.tmp, 'link-to-main');
+    dirLink(repo.main, link);
+    const okDir = path.join(s.tmp, 'ok cache');
+    fs.mkdirSync(okDir);
+    const targets = [path.join(sib, 'README.md'), path.join(repo.main, 'README.md'), path.join(link, 'README.md'), ssh, repo.wt, okDir];
+    for (const t of targets) assert.equal(engine(s, ['track', 'path', t], repo.wt).status, 0);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /inside another worktree/);
+    assert.match(r.stderr, /inside the main checkout or git dir/);
+    assert.match(r.stderr, /outside the worktree, the temp folder and ~\/\.cache/);
+    assert.match(r.stderr, /is the worktree/);
+    for (const t of targets.slice(0, 5)) assert.ok(fs.existsSync(t), `kept ${t}`);
+    assert.equal(fs.existsSync(okDir), false, 'allowed path deleted');
+    assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
+  test('a second teardown while one runs exits 1; a dead holder is ignored', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const lock = path.join(repo.commonDir, 'agent-resources', `${repo.wtId}.teardown.lock`);
+    write(lock, `${process.pid} held`);
+    const busy = engine(s, ['teardown'], repo.wt);
+    assert.equal(busy.status, 1, busy.out);
+    assert.match(busy.stderr, /another teardown of this worktree is running/);
+    write(lock, '2147480000 dead');
+    const ok = engine(s, ['teardown'], repo.wt);
+    assert.equal(ok.status, 0, ok.out);
   });
 
   test('dry run changes nothing', () => {
@@ -359,7 +538,7 @@ describe('sweep, status, track, gate', () => {
   test('worktree gone: sweep finishes the teardown, then forgets the ledger', () => {
     const { s, repo } = fixture();
     assert.equal(engine(s, ['setup'], repo.wt).status, 0);
-    s.writeState((st) => { st.gh.prs = [pr({ headRefOid: repo.head })]; st.docker.containers = containers(repo.wtId); });
+    merged(s, repo);
     gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
     const r = engine(s, ['sweep', '--quick'], repo.main);
     assert.equal(r.status, 0, r.out);
@@ -370,30 +549,114 @@ describe('sweep, status, track, gate', () => {
     const again = engine(s, ['sweep', '--quick'], repo.main);
     assert.equal(again.status, 0, again.out);
     assert.equal(ledgerOf(repo), null);
-    // The merged branch has no worktree any more and is fully pushed: deleted.
     assert.equal(gitIn(s, repo.main, 'branch', '--list', repo.branch), '');
+  });
+
+  test('a truncated PR index is re-queried per branch', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    s.writeState((st) => { st.gh.prs.unshift(pr({ number: 99, headRefName: 'agent/LEE-99-other', state: 'OPEN' })); });
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    const r = engine(s, ['sweep', '--quick'], repo.main, { AGENT_WORKTREE_PR_LIMIT: '1' });
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stdout, /1 finished/);
+    assert.ok(s.calls('gh').some((c) => c.args.includes('--head')), 're-queried with --head');
+  });
+
+  test('gone worktree with an unpushed branch keeps its resources', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    commit(s, repo.wt, 'unpushed.txt');
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    const r = engine(s, ['sweep', '--quick'], repo.main);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stdout, /kept .*1 commit not on any remote/);
+    assert.equal(s.readState().docker.containers.length, 2);
+    assert.equal(ledgerOf(repo).state, 'active');
+  });
+
+  test('gone worktree with no PR keeps its resources', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    s.writeState((st) => { st.docker.containers = containers(repo.wtId); });
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    const r = engine(s, ['sweep', '--quick'], repo.main);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stdout, /no PR for this branch/);
+    assert.equal(s.readState().docker.containers.length, 2);
+  });
+
+  test('a live worktree recorded through a link (or \\\\?\\ prefix) is not treated as gone', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    const alias = path.join(s.tmp, 'alias');
+    dirLink(s.dir, alias);
+    const variants = [path.join(alias, path.basename(repo.wt))];
+    if (isWin) variants.push(`\\\\?\\${repo.wt}`);
+    for (const v of variants) {
+      const f = path.join(repo.commonDir, 'agent-resources', `${repo.wtId}.json`);
+      const l = JSON.parse(fs.readFileSync(f, 'utf8'));
+      l.worktreePath = v;
+      fs.writeFileSync(f, JSON.stringify(l));
+      const r = engine(s, ['sweep', '--quick'], repo.main);
+      assert.equal(r.status, 0, r.out);
+      assert.match(r.stdout, /0 finished/);
+      assert.equal(s.readState().docker.containers.length, 2, v);
+    }
+  });
+
+  test('a failing git worktree list deletes nothing', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    installFake(s.bin, 'git');
+    s.writeState((st) => { st.git = { failWorktreeList: true }; });
+    const r = engine(s, ['sweep'], repo.main);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /git worktree list failed/);
+    assert.equal(s.readState().docker.containers.length, 2);
+    assert.ok(fs.existsSync(repo.wt));
+    assert.ok(ledgerOf(repo));
   });
 
   test('worktree gone but PR queued: kept', () => {
     const { s, repo } = fixture();
     assert.equal(engine(s, ['setup'], repo.wt).status, 0);
-    s.writeState((st) => { st.gh.prs = [pr({ headRefOid: repo.head, state: 'CLOSED', labels: [{ name: 'queue-blocked' }] })]; st.docker.containers = containers(repo.wtId); });
+    merged(s, repo, { state: 'CLOSED', labels: [{ name: 'queue-blocked' }] });
     gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
     const r = engine(s, ['sweep'], repo.main);
     assert.equal(r.status, 0, r.out);
-    assert.match(r.stdout, /kept demo-wt-one: PR #7 is in the land queue/);
+    assert.match(r.stdout, new RegExp(`kept ${repo.wtId}: PR #7 is in the land queue`));
     assert.equal(s.readState().docker.containers.length, 2);
   });
 
-  test('hand-made worktree outside the T3 root: removed when eligible; T3 worktrees left to T3', () => {
+  test('torn-down ledger is forgotten only after its Docker cleanup succeeds', () => {
     const { s, repo } = fixture();
-    // A second worktree inside the (fake) T3 root, also merged.
-    const t3wt = path.join(s.home, '.t3', 'worktrees', 'demo', 'agent-t3');
+    merged(s, repo);
+    assert.equal(engine(s, ['teardown'], repo.wt).status, 0);
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    s.writeState((st) => { st.docker.fail = true; });
+    assert.equal(engine(s, ['sweep', '--quick'], repo.main).status, 1);
+    assert.ok(ledgerOf(repo));
+    s.writeState((st) => { st.docker.fail = false; });
+    assert.equal(engine(s, ['sweep', '--quick'], repo.main).status, 0);
+    assert.equal(ledgerOf(repo), null);
+  });
+
+  test('hand-made worktree outside the T3 root: removed when eligible; T3 worktrees (also via a link) left to T3', () => {
+    const { s, repo } = fixture();
+    const realT3 = path.join(s.dir, 't3 real');
+    const t3wt = path.join(realT3, 'demo', 'agent-t3');
     gitIn(s, repo.main, 'worktree', 'add', '-q', '-b', 'agent/LEE-3-t3', t3wt);
+    const t3alias = path.join(s.tmp, 't3 alias');
+    dirLink(realT3, t3alias);
     s.writeState((st) => {
       st.gh.prs = [pr({ headRefOid: repo.head }), pr({ number: 9, headRefName: 'agent/LEE-3-t3', headRefOid: gitIn(s, t3wt, 'rev-parse', 'HEAD') })];
     });
-    const r = engine(s, ['sweep'], repo.main);
+    const r = engine(s, ['sweep'], repo.main, { AGENT_WORKTREE_T3_ROOT: t3alias });
     assert.equal(r.status, 0, r.out);
     assert.match(r.stdout, /1 worktrees removed/);
     assert.equal(fs.existsSync(repo.wt), false);
@@ -403,9 +666,7 @@ describe('sweep, status, track, gate', () => {
 
   test('sweep keeps open-PR, queued and unpushed worktrees and branches', () => {
     const { s, repo } = fixture();
-    write(path.join(repo.wt, 'more.txt'), 'more\n');
-    gitIn(s, repo.wt, 'add', '-A');
-    gitIn(s, repo.wt, 'commit', '-q', '-m', 'more');
+    commit(s, repo.wt, 'more.txt');
     gitIn(s, repo.main, 'branch', 'agent/LEE-4-open');
     gitIn(s, repo.main, 'branch', 'agent/LEE-5-queued');
     s.writeState((st) => {
@@ -424,6 +685,14 @@ describe('sweep, status, track, gate', () => {
     assert.notEqual(gitIn(s, repo.main, 'branch', '--list', 'agent/LEE-4-open'), '');
   });
 
+  test('a running sweep makes a second one skip the repo', () => {
+    const { s, repo } = fixture();
+    write(path.join(repo.commonDir, 'agent-resources', 'sweep.lock'), `${process.pid} held`);
+    const r = engine(s, ['sweep'], repo.main);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stdout, /skipped \(another sweep of this repo is running\)/);
+  });
+
   test('sweep runs hooks.sweep once per repo with the ledgers, without the token', () => {
     const { s, repo } = fixture({
       files: {
@@ -436,7 +705,7 @@ describe('sweep, status, track, gate', () => {
         ].join('\n'),
       },
     });
-    assert.equal(engine(s, ['track', 'dir', path.join(s.dir, 'c')], repo.wt).status, 0);
+    assert.equal(engine(s, ['track', 'dir', 'c'], repo.wt).status, 0);
     const r = engine(s, ['sweep', '--quick'], repo.main, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
     assert.equal(r.status, 0, r.out);
     const lines = fs.readFileSync(path.join(s.dir, 'hook-sweep.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -450,7 +719,7 @@ describe('sweep, status, track, gate', () => {
     assert.equal(st.status, 0, st.out);
     const rows = JSON.parse(st.stdout);
     assert.equal(rows.length, 1);
-    assert.equal(rows[0].wtId, 'demo-wt-one');
+    assert.equal(rows[0].wtId, repo.wtId);
     assert.equal(rows[0].resources, 1);
     assert.equal(engine(s, ['untrack', 'neon-branch', 'b1'], repo.wt).status, 0);
     assert.equal(ledgerOf(repo).resources.length, 0);

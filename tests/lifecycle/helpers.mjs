@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const BIN = path.resolve(here, '..', '..', 'home', 'dot_agents', 'bin');
@@ -25,7 +25,9 @@ function realWhich(cmd) {
   return first || null;
 }
 
-const GIT = realWhich('git');
+export const GIT = realWhich('git');
+const { makeWtId } = await import(pathToFileURL(path.join(BIN, 'lib', 'repo.mjs')).href);
+export { makeWtId };
 
 /** Scratch area: {dir, bin, home, state, logFile, env, cleanup}. */
 export function scratch(tools = ['gh', 'docker', 'op']) {
@@ -33,9 +35,11 @@ export function scratch(tools = ['gh', 'docker', 'op']) {
   const bin = path.join(dir, 'fake bin');
   const home = path.join(dir, 'home');
   const tooldir = path.join(dir, 'tools');
+  const tmp = path.join(dir, 'tmp');
   fs.mkdirSync(bin);
   fs.mkdirSync(home);
   fs.mkdirSync(tooldir);
+  fs.mkdirSync(tmp);
   for (const t of tools) installFake(bin, t);
   const pathDirs = [bin];
   if (isWin) {
@@ -53,7 +57,7 @@ export function scratch(tools = ['gh', 'docker', 'op']) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (/^(PATH|OP_|T3CODE_|GH_|GITHUB_|GIT_|AGENT_|DOCKER_)/i.test(k)) continue;
-    if (/^(HOME|USERPROFILE|LOCALAPPDATA|APPDATA|XDG_)/i.test(k)) continue;
+    if (/^(HOME|USERPROFILE|LOCALAPPDATA|APPDATA|XDG_|TEMP$|TMP$|TMPDIR$)/i.test(k)) continue;
     env[k] = v;
   }
   Object.assign(env, {
@@ -67,12 +71,14 @@ export function scratch(tools = ['gh', 'docker', 'op']) {
     AGENT_WORKTREE_T3_ROOT: path.join(home, '.t3', 'worktrees'),
     FAKE_STATE: state,
     FAKE_LOG: logFile,
+    FAKE_REAL_GIT: GIT,
+    TEMP: tmp, TMP: tmp, TMPDIR: tmp,
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
     GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
     GIT_CONFIG_NOSYSTEM: '1',
   });
   return {
-    dir, bin, home, env,
+    dir, bin, home, env, tmp,
     readState: () => JSON.parse(fs.readFileSync(state, 'utf8')),
     writeState: (fn) => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); fn(s); fs.writeFileSync(state, JSON.stringify(s, null, 2)); },
     calls: (tool) => fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((c) => !tool || c.tool === tool),
@@ -130,7 +136,7 @@ export function makeRepo(s, opts = {}) {
   if (opts.push !== false) gitIn(s, wt, 'push', '-q', '-u', 'origin', branch);
   const head = gitIn(s, wt, 'rev-parse', 'HEAD');
   const commonDir = path.join(main, '.git');
-  return { remote, main, wt, branch, head, commonDir, wtId: 'demo-wt-one' };
+  return { remote, main, wt, branch, head, commonDir, wtId: makeWtId('demo', wt) };
 }
 
 export function pr(over) {

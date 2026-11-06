@@ -20,70 +20,80 @@ A repo describes itself in `.agents/repo.json` (version 1). Every key is optiona
 
 | Key | Default | Use |
 |---|---|---|
-| `repo` | origin URL name | Lower-case name; prefixes ids, items and Docker labels |
+| `repo` | origin URL name | Lower-case name; prefixes ids and Docker labels |
+| `itemPrefix` | `repo` | Required prefix of 1Password item names (`op://agent-repos/<itemPrefix>-...`) |
 | `base` | `origin/HEAD`, else `main` | Base branch |
-| `env.template`, `env.output` | `.env.op`, `.env.local` | 1Password references in, injected file out (gitignored) |
+| `env.template`, `env.output` | `.env.op`, `.env.local` | 1Password references in, injected file out (must be git-ignored and untracked) |
 | `ports` | `{}` | `{"PORT": 3000}`: each name gets `base + hash % 900`, probed free, stable per worktree |
 | `setup`, `gate`, `affectedGate` | `[]` | Commands, split into argv without a shell. Use a script for pipes or `&&` |
+| `ghWrapper` | none | Command that replaces `gh` (for example an identity wrapper), split like `setup` |
 | `branchPattern` | `^agent/([A-Z]+-\d+)` | Group 1 is the ticket id |
 | `remoteBranchDelete` | `^(agent\|revert)/` | Merged branches matching this lose their remote head at teardown |
 
-Other keys (`vault`, `mergeMethod`, `mergeCmd`, `ghWrapper`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`) belong to the landing tools.
+Other keys (`vault`, `mergeMethod`, `mergeCmd`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`) belong to the landing tools.
 
-An optional `.agents/hooks.mjs` exports `setup(ctx)`, `teardown(ctx)` and `sweep(ctx)`. Each must be idempotent. `ctx` holds `repo, repoRoot, worktreePath, wtId, branch, ticket, ports, dryRun, worktreeGone` and the functions `track(kind, id, where)`, `untrack(kind, id)`, `log(msg)` and `run(argv, opts)`. Hooks create and remove what the engine cannot see, such as preview databases or remote checkouts. Record each resource with `track` before you create it.
+## Hooks
+
+An optional `.agents/hooks.mjs` exports `setup(ctx)`, `teardown(ctx)` and `sweep(ctx)`. Each must be idempotent. Hooks create and remove what the engine cannot see, such as preview databases or remote checkouts. Record each resource with `track` before you create it.
+
+`ctx` holds `repo, repoRoot, worktreePath, wtId, branch, ticket, ports, dryRun, worktreeGone` and the functions `track(kind, id, where)`, `untrack(kind, id)`, `log(msg)` and `run(argv, opts)`. In `sweep`, `ctx.ledgers` lists the repo's ledgers, and `track` and `untrack` are not available.
+
+Each hook runs in its own `node` process, in the worktree (or the main checkout once the worktree is gone), without `OP_SERVICE_ACCOUNT_TOKEN` in its environment. The engine never hands the token to a hook, a setup step or a gate. A hook still runs as the same user, so it could read a persisted token itself; only trusted repo code belongs in `hooks.mjs`.
 
 ## The ledger
 
-Each worktree has a ledger at `<git-common-dir>/agent-resources/<wtId>.json`. It lives outside the worktree, so it survives the worktree's removal. `wtId` is `<repo>-<worktree folder>`, reduced to `[a-z0-9-]` and at most 40 characters. Scripts that create resources mid-task record them:
+Each worktree has a ledger at `<git-common-dir>/agent-resources/<wtId>.json`. It lives outside the worktree, so it survives the worktree's removal. `wtId` is `<repo>-<worktree folder>-<6 hex of the canonical worktree path>`, reduced to `[a-z0-9-]` and at most 40 characters, so two worktrees with the same folder name never share a ledger, ports or Docker label. Every command refuses to change a ledger that records another worktree that still exists.
+
+Scripts that create resources mid-task record them:
 
 ```sh
 node ~/.agents/bin/agent-worktree.mjs track docker-container <id>
-node ~/.agents/bin/agent-worktree.mjs track dir /abs/path/to/cache
+node ~/.agents/bin/agent-worktree.mjs track dir .cache/build          # relative: resolved against the worktree
 node ~/.agents/bin/agent-worktree.mjs track neon-branch <id> --where neon   # left to hooks.teardown
 ```
 
-The engine removes `docker-container`, `docker-volume`, `docker-network`, and local `file`, `dir`, `cache` and `path` entries itself. It also removes every Docker object labelled `agent.wt=<wtId>`, so label containers you start. Hooks remove any other kind.
+The engine removes `docker-container`, `docker-volume` and `docker-network` ids, every Docker object labelled `agent.wt=<wtId>` (so label containers you start), and local `file`, `dir`, `cache` and `path` entries. A tracked path is deleted only when, after resolving links and junctions, it lies inside this worktree, the temp folder or `~/.cache`. It is never the worktree itself, never inside the main checkout, the git dir or another worktree, and never contains any of those or the home folder. A refused path keeps the worktree (exit 1). Hooks remove any other kind.
+
+Locks: one lock per ledger (with an owner token; a lock is broken only when its holder's pid is dead), one repo-wide lock around port allocation, one per worktree around teardown (a second teardown exits 1), and one per repo around sweep (a second sweep skips the repo).
 
 ## Setup
 
-1. Records the worktree in its ledger and in `~/.agents/state/repos.json`.
+1. Records the worktree in its ledger (reactivating a torn-down one) and in `~/.agents/state/repos.json`.
 2. Allocates the ports.
-3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<repo>-<item>/<field>`; any other reference stops the injection. When `op` or the service token is missing, or a reference is refused, setup warns loudly and deletes the output file, so a stale secret is never left behind.
+3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<itemPrefix>-<item>/<field>`. The output must be untracked, git-ignored and not a link. When any of that fails, or `op` or the service token is missing, setup warns loudly, writes nothing and removes a stale untracked output, so a stale secret is never left behind.
 4. Writes a managed footer (`AGENT_WT_ID` and the ports) into the output file.
 5. Runs the `setup` commands. A failing command is the only failure that makes setup exit non-zero.
 6. Runs `hooks.setup` and the `repo-defaults` drift check (warnings only), then starts `sweep --quick` in the background.
-
-The service-account token reaches only the `op` process. Setup commands, hooks and gates run without it.
 
 ## Teardown
 
 Teardown is idempotent. Exit 0 means T3 may remove the worktree; exit 1 means keep it, with the reason printed. It never deletes the worktree folder itself.
 
-| State of the branch's newest PR | Result |
+| State | Result |
 |---|---|
-| No PR, or open | Nothing removed, exit 0 |
-| Labelled `queued`, `landing`, `queue-blocked` or `queue-waiting` | Keep, exit 1 |
+| Any PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` | Keep, exit 1 |
+| No PR, or an open PR | Nothing removed, exit 0 |
 | An open PR uses this branch as its base | Keep, exit 1 |
 | Uncommitted or untracked files (ignored files are fine) | Keep, exit 1 |
 | Unpushed work | Keep, exit 1 |
+| Detached HEAD with commits on no branch, remote or tag | Keep, exit 1 |
 | Merged or closed, clean, pushed | Clean up, exit 0 |
 
 HEAD counts as pushed when any of these is true: it equals the PR head; a `Gate: pass @ <sha>` line in the PR body names it; no commit on it is outside the remotes; or `git range-diff` pairs every commit with the PR head's as identical. A squash merge therefore never looks unpushed.
 
-Clean-up stops processes running inside the worktree (never this process, its parents, JetBrains IDEs or T3), runs `hooks.teardown` and `cr-review --cleanup <ticket>` when present, removes labelled and tracked Docker objects and tracked paths, deletes the env output file, and deletes the remote branch of a merged PR that matches `remoteBranchDelete`. If GitHub cannot be read, teardown keeps everything and exits 1.
+Clean-up first lists processes. If the listing fails, nothing is removed and the worktree is kept. Otherwise it stops processes whose working directory, executable or a complete path argument is inside the worktree, and their descendants. It never stops this process, its parents, the lifecycle tools, JetBrains IDEs or T3, and re-checks each pid's start time before stopping it. It then runs `hooks.teardown` and `cr-review --cleanup <ticket>` when present, removes Docker objects and tracked paths, and deletes the env output file. For a merged PR whose branch matches `remoteBranchDelete`, it deletes the remote branch only while it still points at the PR head. Any failure (GitHub unreadable, Docker erroring, a hook or `cr-review` failing, a refused path) keeps the worktree and exits 1.
 
 ## Sweep
 
 `sweep` runs from an OS scheduler (daily, `--all`) and in the background after each setup (`--quick`). It:
 
-- prunes stale worktree entries;
-- finishes the teardown of ledgers whose worktree is gone, then forgets them on the next run;
-- removes hand-made worktrees outside `~/.t3/worktrees` by the teardown rules, with `git worktree remove` and never `--force` (T3 removes its own worktrees; `--quick` skips this step);
+- prunes stale worktree entries, and stops if `git worktree list` fails;
+- finishes ledgers whose worktree is gone: not listed by git and not on disk (compared after resolving links). The local branch must still exist and pass the same rules as teardown (eligible PR, nothing unpushed); otherwise the ledger and its resources stay. A torn-down ledger is forgotten once its labelled Docker objects are gone;
+- removes hand-made worktrees outside `~/.t3/worktrees` (compared after resolving links) by the teardown rules, with `git worktree remove` and never `--force` (T3 removes its own worktrees; `--quick` skips this step);
 - deletes local branches whose PR merged or closed and that have nothing unpushed;
-- removes labelled Docker leftovers of torn-down ledgers;
-- runs the repo's `hooks.sweep(ctx)` once, with `ctx.ledgers` listing the ledgers (`track` and `untrack` are not available there).
+- runs the repo's `hooks.sweep(ctx)` once.
 
-It never touches the lander checkout `<repoRoot>-lander`. `status [--all] [--json]` lists the ledgers and why each was kept. `gate [--affected]` runs the repo's gate commands.
+It reads every PR in one `gh` call. When that list fills its limit (1000, or `AGENT_WORKTREE_PR_LIMIT`), each branch is re-queried on its own. Sweep never touches the lander checkout `<repoRoot>-lander`. `status [--all] [--json]` lists the ledgers and why each was kept. `gate [--affected]` runs the repo's gate commands.
 
 ## Credentials
 
@@ -96,11 +106,11 @@ node ~/.agents/bin/agent-secret.mjs ref demo-api-dev API_KEY
 node ~/.agents/bin/agent-secret.mjs check
 ```
 
-- `put` reads the value from stdin, never from arguments. It creates or edits the item through a JSON template on stdin, reads the value back and compares hashes, and prints the reference. With `--repo`, the item name must start with `<repo>-`, and the reference is added to that repo's `.env.op` when you run it inside the repo. It refuses `--env prod` and `-prod` items. It refuses to overwrite a field it did not create (fields it creates sit in the item's `agent-secret` section) unless you pass `--replace`.
-- `import` parses an env file as data and stores each mapped key. The map is `{"ENV_NAME": "<item>" | {"item": "...", "field": "..."} | "skip"}`. It prints `migrated N, skipped M, mismatches K` and renames the source to `<file>.pre-op` only with `--retire-source` and no mismatches.
+- `put` reads the value from stdin, never from arguments. It creates or edits the item through a JSON template on stdin, reads the value back and compares hashes, and prints the reference. With `--repo`, the item name must start with `<itemPrefix>-`, and the reference is added to that repo's `.env.op` when you run it inside the repo. It refuses `--env prod` and any `-prod` item, whatever `--env` says. It refuses to overwrite a field it did not create (fields it creates sit in the item's `agent-secret` section) unless you pass `--replace`.
+- `import` parses an env file as data and stores each mapped key. The map is `{"ENV_NAME": "<item>" | {"item": "...", "field": "..."} | "skip"}`, with the same prod and prefix rules. It prints `migrated N, skipped M, mismatches K`. With `--retire-source` and no mismatches, it moves the source to `<file>.pre-op` (mode 0600). It refuses when that file already exists or would not be git-ignored.
 - `check` prints the account type and whether the vault is visible.
 
-`op` is found on PATH, then (on Windows) in the WinGet package and links folders. The token comes from the process environment, then the Windows user environment or the mode-0600 `~/.config/op/agent-env-token` file.
+`op` is found on PATH, then (on Windows) in the WinGet package and links folders. The token comes from the process environment, then the Windows user environment or the mode-0600 `~/.config/op/agent-env-token` file. It is read once per process and given only to `op`.
 
 ## Tests
 
@@ -108,4 +118,4 @@ node ~/.agents/bin/agent-secret.mjs check
 node --test "tests/lifecycle/*.test.mjs"
 ```
 
-The tests use a real git with a local bare remote, and fake `gh`, `docker` and `op` on PATH. They need no network or credentials, and never touch the real home.
+The tests use a real git with a local bare remote, and fake `gh`, `docker` and `op` (and a forwarding `git` for one failure case) on PATH. They need no network or credentials, and never touch the real home. In test mode (`AGENT_ENV_NO_SECRETS=1`), `AGENT_WORKTREE_TEST_PROCLIST_FAIL=1` simulates a failed process listing. `scripts/check.sh` belongs to the foundation area, so a follow-up PR wires `node --test` into it; until then run the command above before every commit that touches `home/dot_agents/bin/`.

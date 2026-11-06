@@ -7,26 +7,29 @@
 // 2 usage or configuration error. Output carries counts, ids and references, never secrets.
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import {
-  addResource, deleteLedger, listLedgers, readLedger, readRegistry, registerRepo,
-  removeResource, updateLedger,
+  addResource, deleteLedger, isPathKind, ledgerDir, listLedgers, normalizeTrack, readLedger,
+  readRegistry, registerRepo, removeResource, tryLock, updateLedger, withLockAsync,
 } from './lib/ledger.mjs';
 import { captureToken, homeDir, opStatus, runOp, stripToken } from './lib/op.mjs';
-import { envGet, git, gitOut, gh, ghJson, run, spawnDetached, splitArgv, which } from './lib/proc.mjs';
-import { processesUnder, listProcesses, stopProcesses } from './lib/processes.mjs';
+import { envGet, git, gitOut, gh, run, spawnDetached, splitArgv, which } from './lib/proc.mjs';
+import { listProcesses, processesUnder, stopProcesses } from './lib/processes.mjs';
 import {
-  baseBranch, fnv1a, gitIdentity, isUnder, loadConfig, makeWtId, normPath, repoName,
-  resolveContext, samePath, ticketOf,
+  baseBranch, canonical, canonKey, fnv1a, gitIdentity, isUnder, loadConfig, makeWtId, normPath,
+  repoName, resolveContext, samePath, ticketOf,
 } from './lib/repo.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
+const HOOK_RUNNER = path.join(path.dirname(SELF), 'lib', 'hook-runner.mjs');
 const NAME = 'agent-worktree';
 const BEGIN = '# BEGIN agent-worktree';
 const END = '# END agent-worktree';
 const PR_FIELDS = 'number,state,headRefName,headRefOid,baseRefName,createdAt,url,body,labels';
-export const QUEUE_LABELS = ['queued', 'landing', 'queue-blocked', 'queue-waiting'];
+export const QUEUE_LABELS = ['queued', 'landing', 'queue-blocked', 'queue-waiting', 'queue-hold'];
+const DOCKER_ID = /^[A-Za-z0-9][\w.-]*$/;
 
 const USAGE = `usage: node agent-worktree.mjs <command> [options]
   setup                 prepare this worktree (ledger, ports, env file, repo setup steps)
@@ -44,7 +47,7 @@ let jsonMode = false;
 function log(msg) { if (!jsonMode) process.stdout.write(`${NAME}: ${msg}\n`); }
 function warn(msg) { process.stderr.write(`${NAME}: WARNING: ${msg}\n`); }
 function firstLine(s) { return String(s || '').trim().split(/\r?\n/)[0].slice(0, 200); }
-function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
+function plural(n, word) { return `${n} ${word}${n === 1 ? '' : word.endsWith('s') ? 'es' : 's'}`; }
 
 // ---------------------------------------------------------------- args
 
@@ -73,6 +76,27 @@ function startDir(opts) {
 
 function t3Root() {
   return path.resolve(envGet(process.env, 'AGENT_WORKTREE_T3_ROOT') || path.join(homeDir(), '.t3', 'worktrees'));
+}
+
+function prLimit() {
+  const n = Number(envGet(process.env, 'AGENT_WORKTREE_PR_LIMIT'));
+  return Number.isInteger(n) && n > 0 ? n : 1000;
+}
+
+// ---------------------------------------------------------------- gh (with the repo's wrapper)
+
+function ghRun(cfg, args, opts = {}) {
+  if (cfg && cfg.ghWrapper) {
+    const w = splitArgv(cfg.ghWrapper);
+    return run(w[0], [...w.slice(1), ...args], opts);
+  }
+  return gh(args, opts);
+}
+
+function ghJsonC(cfg, args, opts = {}) {
+  const r = ghRun(cfg, args, opts);
+  if (r.status !== 0) throw new Error(`gh ${args.slice(0, 2).join(' ')} failed (exit ${r.status})`);
+  try { return JSON.parse(r.stdout || 'null'); } catch { throw new Error(`gh ${args.slice(0, 2).join(' ')}: output is not JSON`); }
 }
 
 // ---------------------------------------------------------------- ports and env file
@@ -125,6 +149,15 @@ export function writeFooter(file, values) {
   try { fs.chmodSync(file, 0o600); } catch { /* Windows */ }
 }
 
+/** Number of op:// references that are not op://agent-repos/<prefix>-<item>/<field>. */
+export function foreignRefs(text, prefix) {
+  const refs = String(text).match(/op:\/\/[^\s"'`#]+/g) || [];
+  const ok = new RegExp(`^op://agent-repos/${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[^/]+/[^/]+`);
+  return refs.filter((r) => !ok.test(r)).length;
+}
+
+function itemPrefix(ctx) { return String(ctx.cfg.itemPrefix || ctx.repo).toLowerCase(); }
+
 function envPaths(ctx, worktreePath = ctx.worktreePath) {
   const tpl = path.resolve(worktreePath, ctx.cfg.env.template || '.env.op');
   const out = path.resolve(worktreePath, ctx.cfg.env.output || '.env.local');
@@ -132,55 +165,64 @@ function envPaths(ctx, worktreePath = ctx.worktreePath) {
   return { tpl, out };
 }
 
-/** Number of op:// references that are not op://agent-repos/<repo>-<item>/<field>. */
-export function foreignRefs(text, repo) {
-  const refs = String(text).match(/op:\/\/[^\s"'`#]+/g) || [];
-  const ok = new RegExp(`^op://agent-repos/${repo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-[^/]+/[^/]+`);
-  return refs.filter((r) => !ok.test(r)).length;
+function isSymlink(p) {
+  try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; }
+}
+
+function isTracked(dir, file) {
+  return git(['ls-files', '--error-unmatch', '--', file], { cwd: dir }).status === 0;
+}
+
+/** Why the env output file is unsafe to write secrets into, or null. */
+function envOutputProblem(dir, out) {
+  if (isSymlink(out)) return 'is a symlink or junction';
+  if (isTracked(dir, out)) return 'is tracked by git';
+  if (git(['check-ignore', '-q', '--', out], { cwd: dir }).status !== 0) return 'is not git-ignored';
+  return null;
 }
 
 function removeFile(file) {
   try { fs.unlinkSync(file); return true; } catch { return false; }
 }
 
-// ---------------------------------------------------------------- hooks
-
-async function loadHooks(dir) {
-  const file = path.join(dir, '.agents', 'hooks.mjs');
-  if (!fs.existsSync(file)) return null;
-  return import(`${pathToFileURL(file).href}?t=${Date.now()}`);
+function loud(lines) {
+  warn('*****************************************************************');
+  for (const l of lines) warn(l);
+  warn('*****************************************************************');
 }
 
-function hookCtx(ctx, ledger, { dryRun, worktreeGone }) {
-  const cwd = worktreeGone ? ctx.repoRoot : ctx.worktreePath;
+// ---------------------------------------------------------------- hooks (in a child process)
+
+/**
+ * Run hooks.<fn>(ctx) from <dir>/.agents/hooks.mjs in a separate node process whose
+ * environment has no 1Password token. Returns null (no hook), 'ok', or throws on failure.
+ */
+function runHook(fn, dir, data, commonDir) {
+  const hookFile = path.join(dir, '.agents', 'hooks.mjs');
+  if (!fs.existsSync(hookFile)) return null;
+  const cwd = fs.existsSync(data.worktreePath || '') && !data.worktreeGone ? data.worktreePath : data.repoRoot;
+  const r = run(process.execPath, [HOOK_RUNNER], {
+    cwd, env: stripToken(process.env), input: JSON.stringify({ hookFile, fn, ctx: data, commonDir }), inherit: true,
+  });
+  if (r.status === 3) return null;
+  if (r.status !== 0) throw new Error(`hooks.${fn} failed (exit ${r.status})`);
+  return 'ok';
+}
+
+function hookData(ctx, ledger, { dryRun, worktreeGone }) {
   return {
-    repo: ctx.repo,
-    repoRoot: ctx.repoRoot,
-    worktreePath: ctx.worktreePath,
-    wtId: ctx.wtId,
-    branch: ctx.branch,
-    ticket: ctx.ticket,
-    ports: { ...(ledger.ports || {}) },
-    dryRun: Boolean(dryRun),
-    worktreeGone: Boolean(worktreeGone),
-    track(kind, id, where) {
-      if (dryRun) return log(`would track ${kind} ${id}`);
-      updateLedger(ctx.commonDir, ctx.wtId, (l) => addResource(l, kind, id, where));
-    },
-    untrack(kind, id) {
-      if (dryRun) return log(`would untrack ${kind} ${id}`);
-      updateLedger(ctx.commonDir, ctx.wtId, (l) => removeResource(l, kind, id));
-    },
-    log(msg) { log(`[hook] ${msg}`); },
-    run(argv, o = {}) {
-      const a = splitArgv(argv);
-      if (dryRun && !o.readOnly) {
-        log(`[hook] would run: ${a[0]} (${a.length - 1} args)`);
-        return { status: 0, stdout: '', stderr: '', dryRun: true };
-      }
-      return run(a[0], a.slice(1), { cwd: o.cwd || cwd, env: stripToken(o.env || process.env), input: o.input, inherit: o.inherit });
-    },
+    repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, wtId: ctx.wtId,
+    branch: ctx.branch, ticket: ctx.ticket, ports: { ...((ledger && ledger.ports) || {}) },
+    dryRun: Boolean(dryRun), worktreeGone: Boolean(worktreeGone),
   };
+}
+
+/** Refuse when this wtId's ledger records another worktree that still exists. */
+function identityConflict(ctx) {
+  const l = readLedger(ctx.commonDir, ctx.wtId);
+  if (!l || !l.worktreePath || canonKey(l.worktreePath) === canonKey(ctx.worktreePath)) return null;
+  if (!fs.existsSync(l.worktreePath)) return null;
+  return `ledger ${ctx.wtId} belongs to another worktree (${path.basename(l.worktreePath)}); nothing changed`;
 }
 
 // ---------------------------------------------------------------- setup
@@ -189,45 +231,55 @@ async function cmdSetup(opts) {
   const ctx = resolveContext(startDir(opts));
   if (!ctx) { log('not inside a git checkout: nothing to do'); return 0; }
   if (ctx.isMain) { log('main checkout: nothing to do'); return 0; }
+  const conflict = identityConflict(ctx);
+  if (conflict) { warn(conflict); return 1; }
   const { dryRun } = opts;
-  const others = listLedgers(ctx.commonDir).filter((l) => l.wtId !== ctx.wtId && l.data.state !== 'torn-down');
-  const taken = new Set(others.flatMap((l) => Object.values(l.data.ports || {})));
-  const prev = readLedger(ctx.commonDir, ctx.wtId);
-  const ports = await allocatePorts(ctx.cfg.ports, ctx.wtId, (prev && prev.ports) || {}, taken);
   const { tpl, out } = envPaths(ctx);
 
   if (dryRun) {
-    log(`would set up ${ctx.wtId} (${plural(Object.keys(ports).length, 'port')}, ${plural(ctx.cfg.setup.length, 'setup step')}${fs.existsSync(tpl) ? ', env file from template' : ''})`);
+    log(`would set up ${ctx.wtId} (${plural(Object.keys(ctx.cfg.ports).length, 'port')}, ${plural(ctx.cfg.setup.length, 'setup step')}${fs.existsSync(tpl) ? ', env file from template' : ''})`);
     return 0;
   }
 
-  updateLedger(ctx.commonDir, ctx.wtId, (l) => {
-    Object.assign(l, {
-      repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, branch: ctx.branch,
-      ticket: ctx.ticket, ports, state: l.state === 'torn-down' ? 'active' : (l.state || 'active'),
+  // Ports: read, allocate and record under one repo-wide lock.
+  const ports = await withLockAsync(path.join(ledgerDir(ctx.commonDir), 'ports'), async () => {
+    const others = listLedgers(ctx.commonDir).filter((l) => l.wtId !== ctx.wtId && l.data.state !== 'torn-down');
+    const taken = new Set(others.flatMap((l) => Object.values(l.data.ports || {})));
+    const prev = readLedger(ctx.commonDir, ctx.wtId);
+    const p = await allocatePorts(ctx.cfg.ports, ctx.wtId, (prev && prev.ports) || {}, taken);
+    updateLedger(ctx.commonDir, ctx.wtId, (l) => {
+      Object.assign(l, {
+        repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, branch: ctx.branch,
+        ticket: ctx.ticket, ports: p,
+      });
+      if (l.state === 'torn-down' || !l.state) Object.assign(l, { state: 'active', remoteBranchDeleted: false, tornDownAt: null, keptReason: null });
+      return l;
     });
-    return l;
+    return p;
   });
   try { registerRepo(ctx.repoRoot, ctx.repo); } catch (e) { warn(`repo registry not updated: ${e.message}`); }
 
   // Secrets: op inject into the env file, or no env file at all (never a stale one).
   let envNote = 'no env template';
-  const badRefs = fs.existsSync(tpl) ? foreignRefs(fs.readFileSync(tpl, 'utf8'), ctx.repo) : 0;
-  if (badRefs) {
+  const problem = envOutputProblem(ctx.worktreePath, out);
+  const prefix = itemPrefix(ctx);
+  const badRefs = fs.existsSync(tpl) ? foreignRefs(fs.readFileSync(tpl, 'utf8'), prefix) : 0;
+  const outputUsable = !problem;
+  if (problem) {
+    if (isSymlink(out) || !isTracked(ctx.worktreePath, out)) removeFile(out);
+    loud([`${path.basename(out)} ${problem}: nothing written to it.`, 'Make it a plain, git-ignored, untracked file, then rerun setup.']);
+    envNote = `env file refused (${problem})`;
+  } else if (badRefs) {
     removeFile(out);
-    warn('*****************************************************************');
-    warn(`SECRETS NOT INJECTED: ${path.basename(tpl)} has ${plural(badRefs, 'reference')} outside op://agent-repos/${ctx.repo}-...`);
-    warn('Only this repo\'s items in the agent-repos vault may be injected; fix the template.');
-    warn('*****************************************************************');
+    loud([`SECRETS NOT INJECTED: ${path.basename(tpl)} has ${plural(badRefs, 'reference')} outside op://agent-repos/${prefix}-...`,
+      'Only this repo\'s items in the agent-repos vault may be injected; fix the template.']);
     envNote = 'secrets NOT injected (template refused)';
   } else if (fs.existsSync(tpl)) {
     const st = opStatus();
     if (!st.op || !st.hasToken) {
       removeFile(out);
-      warn('*****************************************************************');
-      warn(`SECRETS NOT INJECTED: ${!st.op ? 'op (1Password CLI) not found' : 'no OP_SERVICE_ACCOUNT_TOKEN'}.`);
-      warn(`${path.basename(out)} holds no secrets; fix op, then rerun setup.`);
-      warn('*****************************************************************');
+      loud([`SECRETS NOT INJECTED: ${!st.op ? 'op (1Password CLI) not found' : 'no OP_SERVICE_ACCOUNT_TOKEN'}.`,
+        `${path.basename(out)} holds no secrets; fix op, then rerun setup.`]);
       envNote = 'secrets NOT injected';
     } else {
       const r = runOp(['inject', '-i', tpl, '-o', out, '--file-mode', '0600', '-f'], { cwd: ctx.worktreePath });
@@ -239,7 +291,7 @@ async function cmdSetup(opts) {
     }
   }
   const footer = { AGENT_WT_ID: ctx.wtId, ...ports };
-  if (fs.existsSync(out) || Object.keys(ports).length) {
+  if (outputUsable && (fs.existsSync(out) || Object.keys(ports).length)) {
     writeFooter(out, footer);
     updateLedger(ctx.commonDir, ctx.wtId, (l) => addResource(l, 'env-file', out, 'local'));
   }
@@ -257,21 +309,19 @@ async function cmdSetup(opts) {
     }
   }
 
-  const hooks = await loadHooks(ctx.worktreePath).catch((e) => { warn(`.agents/hooks.mjs failed to load: ${e.message}`); return null; });
-  if (hooks && typeof hooks.setup === 'function') {
-    const ledger = readLedger(ctx.commonDir, ctx.wtId);
-    try { await hooks.setup(hookCtx(ctx, ledger, { dryRun: false })); } catch (e) { warn(`hooks.setup failed: ${e.message}`); }
-  }
+  try {
+    runHook('setup', ctx.worktreePath, hookData(ctx, readLedger(ctx.commonDir, ctx.wtId), { dryRun: false }), ctx.commonDir);
+  } catch (e) { warn(e.message); }
 
   const drift = path.join(homeDir(), '.agents', 'skills', 'repo-defaults', 'scripts', 'apply.mjs');
   if (fs.existsSync(drift)) {
-    const r = run(process.execPath, [drift, '--check'], { cwd: ctx.worktreePath });
+    const r = run(process.execPath, [drift, '--check'], { cwd: ctx.worktreePath, env: stripToken(process.env) });
     if (r.status !== 0) warn('repo-defaults drift: run repo-defaults apply.mjs --check for details');
   }
 
   if (envGet(process.env, 'AGENT_WORKTREE_NO_SWEEP') !== '1') {
     try {
-      spawnDetached(process.execPath, [SELF, 'sweep', '--quick', '--repo', ctx.repoRoot], { cwd: ctx.repoRoot });
+      spawnDetached(process.execPath, [SELF, 'sweep', '--quick', '--repo', ctx.repoRoot], { cwd: ctx.repoRoot, env: stripToken(process.env) });
     } catch (e) { warn(`background sweep not started: ${e.message}`); }
   }
   log(`setup done: ${ctx.wtId}, ${plural(Object.keys(ports).length, 'port')}, ${envNote}, ${plural(ctx.cfg.setup.length, 'setup step')}`);
@@ -285,15 +335,20 @@ function newest(prs) {
 }
 
 /** PRs for one head branch plus open PRs based on it. Throws when gh fails. */
-function prsForBranch(dir, branch) {
-  const head = ghJson(['pr', 'list', '--head', branch, '--state', 'all', '--limit', '50', '--json', PR_FIELDS], { cwd: dir });
-  const stacked = ghJson(['pr', 'list', '--base', branch, '--state', 'open', '--limit', '50', '--json', 'number'], { cwd: dir });
+function prsForBranch(cfg, dir, branch) {
+  const head = ghJsonC(cfg, ['pr', 'list', '--head', branch, '--state', 'all', '--limit', '100', '--json', PR_FIELDS], { cwd: dir });
+  const stacked = ghJsonC(cfg, ['pr', 'list', '--base', branch, '--state', 'open', '--limit', '100', '--json', 'number'], { cwd: dir });
   return { head: head || [], stacked: stacked || [] };
 }
 
-/** Index of every PR in the repo by head and base branch (one gh call; for sweeps). */
-function prIndex(dir) {
-  const all = ghJson(['pr', 'list', '--state', 'all', '--limit', '1000', '--json', PR_FIELDS], { cwd: dir }) || [];
+/**
+ * Index of every PR in the repo by head and base branch (one gh call). When the result fills
+ * the limit it may be truncated, so forBranch re-queries the branch itself.
+ */
+function prIndex(cfg, dir) {
+  const limit = prLimit();
+  const all = ghJsonC(cfg, ['pr', 'list', '--state', 'all', '--limit', String(limit), '--json', PR_FIELDS], { cwd: dir }) || [];
+  const complete = all.length < limit;
   const byHead = new Map();
   const openBase = new Map();
   for (const pr of all) {
@@ -305,7 +360,9 @@ function prIndex(dir) {
     }
   }
   return {
-    forBranch: (b) => ({ head: byHead.get(b) || [], stacked: openBase.get(b) || [] }),
+    complete,
+    known: (b) => byHead.has(b),
+    forBranch: (b) => (complete ? { head: byHead.get(b) || [], stacked: openBase.get(b) || [] } : prsForBranch(cfg, dir, b)),
   };
 }
 
@@ -345,36 +402,36 @@ export function unpushedReason(dir, tip, pr) {
 
 /**
  * The teardown predicate. Returns {verdict, pr, detail} where verdict is one of
- * no-pr | open | queued | stacked | dirty | unpushed | eligible. Worktree checks run only
- * when worktreePath is given (it is gone for sweeps of removed worktrees).
+ * no-pr | queued | open | stacked | dirty | unpushed | eligible. Worktree checks run only
+ * when worktreePath is given; tip checks run when tip and dir are given.
  */
-export function assess({ prs, worktreePath, ignore = [], tip }) {
+export function assess({ prs, worktreePath, ignore = [], tip, dir }) {
   const pr = newest(prs.head);
   if (!pr) return { verdict: 'no-pr', pr: null, detail: 'no PR for this branch' };
-  if (pr.state === 'OPEN' || prs.head.some((p) => p.state === 'OPEN')) {
-    const open = prs.head.find((p) => p.state === 'OPEN') || pr;
-    return { verdict: 'open', pr: open, detail: `PR #${open.number} is open` };
-  }
   const inQueue = prs.head.find((p) => labelNames(p).some((n) => QUEUE_LABELS.includes(n)));
   if (inQueue) {
     return { verdict: 'queued', pr: inQueue, detail: `PR #${inQueue.number} is in the land queue (${labelNames(inQueue).filter((n) => QUEUE_LABELS.includes(n)).join(', ')})` };
   }
+  if (pr.state === 'OPEN' || prs.head.some((p) => p.state === 'OPEN')) {
+    const open = prs.head.find((p) => p.state === 'OPEN') || pr;
+    return { verdict: 'open', pr: open, detail: `PR #${open.number} is open` };
+  }
   if (prs.stacked.length) {
     return { verdict: 'stacked', pr, detail: `open PR ${prs.stacked.map((p) => `#${p.number}`).join(', ')} is based on this branch` };
   }
-  const dir = worktreePath;
-  if (dir) {
-    const st = gitOut(['status', '--porcelain', '--untracked-files=all'], { cwd: dir });
+  if (worktreePath) {
+    const st = gitOut(['status', '--porcelain', '--untracked-files=all'], { cwd: worktreePath });
     if (st === null) return { verdict: 'dirty', pr, detail: 'git status failed' };
     const skip = ignore.map((p) => normPath(p));
     const dirty = st.split(/\r?\n/).filter(Boolean).filter((line) => {
       const rel = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop();
-      return !skip.includes(normPath(path.resolve(dir, rel)));
+      return !skip.includes(normPath(path.resolve(worktreePath, rel)));
     });
     if (dirty.length) return { verdict: 'dirty', pr, detail: `${plural(dirty.length, 'changed or untracked file')}` };
   }
-  if (dir) {
-    const why = unpushedReason(dir, tip || gitOut(['rev-parse', 'HEAD'], { cwd: dir }), pr);
+  const where = worktreePath || dir;
+  if (where) {
+    const why = unpushedReason(where, tip || gitOut(['rev-parse', 'HEAD'], { cwd: where }), pr);
     if (why) return { verdict: 'unpushed', pr, detail: why };
   }
   return { verdict: 'eligible', pr, detail: `PR #${pr.number} ${pr.state.toLowerCase()}` };
@@ -383,112 +440,151 @@ export function assess({ prs, worktreePath, ignore = [], tip }) {
 // ---------------------------------------------------------------- resource cleanup
 
 function dockerCleanup(wtId, resources, dryRun) {
-  const res = { containers: 0, volumes: 0, networks: 0, skipped: null, failed: 0 };
+  const res = { containers: 0, volumes: 0, networks: 0, skipped: null, errors: [] };
   if (!which('docker')) { res.skipped = 'docker not installed'; return res; }
-  const ids = (kind, args) => {
-    const r = run('docker', args);
-    if (r.status !== 0) throw new Error(`docker ${kind} list failed (exit ${r.status})`);
-    return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  };
   const tracked = (kind) => resources.filter((r) => r.kind === kind && r.where === 'local').map((r) => r.id);
   const label = `label=agent.wt=${wtId}`;
-  try {
-    const sets = [
-      ['containers', ['ps', '-aq', '--filter', label], 'docker-container', ['rm', '-f']],
-      ['volumes', ['volume', 'ls', '-q', '--filter', label], 'docker-volume', ['volume', 'rm', '-f']],
-      ['networks', ['network', 'ls', '-q', '--filter', label], 'docker-network', ['network', 'rm']],
-    ];
-    for (const [key, listArgs, kind, rmArgs] of sets) {
-      const all = [...new Set([...ids(key, listArgs), ...tracked(kind)])];
-      if (!all.length) continue;
-      if (dryRun) { res[key] = all.length; continue; }
-      for (const id of all) {
-        const r = run('docker', [...rmArgs, id]);
-        if (r.status === 0 || /no such/i.test(r.stderr)) res[key]++;
-        else res.failed++;
-      }
+  const sets = [
+    ['containers', ['ps', '-aq', '--filter', label], 'docker-container', ['rm', '-f']],
+    ['volumes', ['volume', 'ls', '-q', '--filter', label], 'docker-volume', ['volume', 'rm', '-f']],
+    ['networks', ['network', 'ls', '-q', '--filter', label], 'docker-network', ['network', 'rm']],
+  ];
+  for (const [key, listArgs, kind, rmArgs] of sets) {
+    const l = run('docker', listArgs);
+    if (l.status !== 0) { res.errors.push(`docker ${key} list failed (exit ${l.status})`); continue; }
+    const ids = l.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const extra = tracked(kind);
+    const bad = extra.filter((id) => !DOCKER_ID.test(id));
+    if (bad.length) res.errors.push(`${plural(bad.length, `invalid tracked ${kind} id`)}`);
+    const all = [...new Set([...ids, ...extra.filter((id) => DOCKER_ID.test(id))])];
+    if (dryRun) { res[key] = all.length; continue; }
+    for (const id of all) {
+      const r = run('docker', [...rmArgs, '--', id]);
+      if (r.status === 0 || /no such/i.test(r.stderr)) res[key]++;
+      else res.errors.push(`docker ${kind} could not be removed (exit ${r.status})`);
     }
-  } catch (e) {
-    res.skipped = e.message;
   }
   return res;
 }
 
-function unsafeToDelete(p, ctx) {
+/** Canonical paths of every worktree git lists for this repo, or null when listing fails. */
+function liveWorktrees(repoRoot) {
+  const r = git(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
+  if (r.status !== 0) return null;
+  return parseWorktrees(r.stdout);
+}
+
+/**
+ * Why a tracked path must not be deleted, or null. Allowed: inside this worktree, the temp
+ * folder or ~/.cache (after resolving links). Never: the worktree itself, the main checkout or
+ * git dir, another live worktree, or anything that contains one of those.
+ */
+export function deleteRefusal(p, ctx, live) {
   if (!path.isAbsolute(p)) return 'not absolute';
-  const r = path.resolve(p);
-  if (r === path.parse(r).root) return 'filesystem root';
-  for (const guard of [homeDir(), ctx.repoRoot, ctx.commonDir]) {
-    if (guard && isUnder(guard, r)) return 'contains a protected folder';
+  const tgt = canonical(p);
+  if (tgt === path.parse(tgt).root) return 'filesystem root';
+  const wt = canonical(ctx.worktreePath);
+  if (samePath(tgt, wt)) return 'is the worktree';
+  const inWt = isUnder(tgt, wt);
+  const home = canonical(homeDir());
+  const guards = [canonical(ctx.repoRoot), canonical(ctx.commonDir), home, wt, ...live.map((w) => canonical(w.path))];
+  if (guards.some((g) => isUnder(g, tgt))) return 'contains a protected folder';
+  if (!inWt) {
+    if (isUnder(tgt, canonical(ctx.repoRoot)) || isUnder(tgt, canonical(ctx.commonDir))) return 'inside the main checkout or git dir';
+    if (live.some((w) => isUnder(tgt, canonical(w.path)))) return 'inside another worktree';
+    const tmp = canonical(os.tmpdir());
+    const cache = canonical(path.join(homeDir(), '.cache'));
+    const allowed = (isUnder(tgt, tmp) && !samePath(tgt, tmp)) || (isUnder(tgt, cache) && !samePath(tgt, cache));
+    if (!allowed) return 'outside the worktree, the temp folder and ~/.cache';
   }
   return null;
 }
 
 /**
  * Teardown of everything recorded for one worktree, after the predicate said eligible.
- * Returns a summary object; .errors lists anything that needs the owner.
+ * Returns a summary object; .errors lists anything that needs the owner (then keep).
  */
 async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
   const s = { processes: 0, docker: null, paths: 0, envFile: false, remoteBranch: false, hook: null, crReview: null, left: 0, errors: [] };
   const wt = ctx.worktreePath;
+  const live = liveWorktrees(ctx.repoRoot);
+  if (!live) { s.errors.push('git worktree list failed'); return s; }
 
   if (!worktreeGone) {
-    const procs = processesUnder(wt, listProcesses());
-    if (dryRun) s.processes = procs.length;
-    else if (procs.length) {
-      const r = stopProcesses(procs);
+    const procs = listProcesses();
+    if (!procs) { s.errors.push('process list failed: cannot tell whether the worktree is in use'); return s; }
+    const inside = processesUnder(wt, procs);
+    if (dryRun) s.processes = inside.length;
+    else if (inside.length) {
+      const r = stopProcesses(inside);
       s.processes = r.stopped;
-      if (r.failed) s.errors.push(`${plural(r.failed, 'process')} under the worktree could not be stopped`);
+      if (r.listFailed) { s.errors.push('process list failed: nothing stopped'); return s; }
+      if (r.failed) { s.errors.push(`${plural(r.failed, 'process')} under the worktree could not be stopped`); return s; }
     }
   }
 
-  const hooks = await loadHooks(worktreeGone ? ctx.repoRoot : wt).catch((e) => { s.errors.push(`hooks.mjs failed to load: ${e.message}`); return null; });
-  if (hooks && typeof hooks.teardown === 'function') {
-    try { await hooks.teardown(hookCtx(ctx, ledger, { dryRun, worktreeGone })); s.hook = 'ok'; } catch (e) { s.hook = 'failed'; s.errors.push(`hooks.teardown failed: ${e.message}`); }
-  }
+  try {
+    s.hook = runHook('teardown', worktreeGone ? ctx.repoRoot : wt, hookData(ctx, ledger, { dryRun, worktreeGone }), ctx.commonDir);
+  } catch (e) { s.hook = 'failed'; s.errors.push(e.message); }
 
   if (which('cr-review')) {
     const key = ctx.ticket || ctx.wtId;
     if (dryRun) s.crReview = 'would run';
     else {
-      const r = run('cr-review', ['--cleanup', key], { cwd: worktreeGone ? ctx.repoRoot : wt });
+      const r = run('cr-review', ['--cleanup', key], { cwd: worktreeGone ? ctx.repoRoot : wt, env: stripToken(process.env) });
       s.crReview = r.status === 0 ? 'ok' : `exit ${r.status}`;
-      if (r.status !== 0) warn(`cr-review --cleanup ${key} exited ${r.status}`);
+      if (r.status !== 0) s.errors.push(`cr-review --cleanup ${key} exited ${r.status}`);
     }
   }
 
   const fresh = (!dryRun && readLedger(ctx.commonDir, ctx.wtId)) || ledger;
-  s.docker = dockerCleanup(ctx.wtId, fresh.resources, dryRun);
-  if (s.docker.failed) s.errors.push(`${plural(s.docker.failed, 'docker object')} could not be removed`);
+  s.docker = dockerCleanup(ctx.wtId, fresh.resources || [], dryRun);
+  s.errors.push(...s.docker.errors);
 
-  const pathKinds = new Set(['file', 'dir', 'cache', 'path']);
-  for (const r of fresh.resources) {
-    if (!pathKinds.has(r.kind) || r.where !== 'local') continue;
-    const why = unsafeToDelete(r.id, ctx);
+  for (const r of fresh.resources || []) {
+    if (!isPathKind(r.kind) || r.where !== 'local') continue;
+    const why = deleteRefusal(r.id, ctx, live);
     if (why) { s.errors.push(`refused to delete tracked ${r.kind} (${why})`); continue; }
-    if (!fs.existsSync(r.id)) continue;
+    if (!fs.existsSync(r.id) && !isSymlink(r.id)) continue;
     if (dryRun) { s.paths++; continue; }
-    try { fs.rmSync(r.id, { recursive: true, force: true }); s.paths++; } catch (e) { s.errors.push(`could not delete tracked ${r.kind}: ${e.code || e.message}`); }
+    try {
+      if (isSymlink(r.id)) fs.unlinkSync(r.id);
+      else fs.rmSync(r.id, { recursive: true, force: true });
+      s.paths++;
+    } catch (e) { s.errors.push(`could not delete tracked ${r.kind}: ${e.code || e.message}`); }
   }
 
   if (!worktreeGone) {
     const { out } = envPaths(ctx);
-    if (fs.existsSync(out)) s.envFile = dryRun ? 'would delete' : removeFile(out);
+    if ((fs.existsSync(out) || isSymlink(out)) && !isTracked(wt, out)) s.envFile = dryRun ? 'would delete' : removeFile(out);
   }
 
   const pattern = ctx.cfg.remoteBranchDelete ? new RegExp(ctx.cfg.remoteBranchDelete) : null;
   if (pr && pr.state === 'MERGED' && ctx.branch && pattern && pattern.test(ctx.branch) && !ledger.remoteBranchDeleted) {
-    if (dryRun) s.remoteBranch = 'would delete';
-    else {
-      const r = gh(['api', '-X', 'DELETE', `repos/{owner}/{repo}/git/refs/heads/${ctx.branch}`], { cwd: worktreeGone ? ctx.repoRoot : wt });
-      if (r.status === 0 || /reference does not exist|not found|HTTP 404|HTTP 422/i.test(r.stderr + r.stdout)) s.remoteBranch = true;
-      else warn(`remote branch not deleted (gh exit ${r.status}): ${firstLine(r.stderr)}`);
+    const ref = `repos/{owner}/{repo}/git/ref/heads/${ctx.branch.split('/').map(encodeURIComponent).join('/')}`;
+    const cwd = worktreeGone ? ctx.repoRoot : wt;
+    const got = ghRun(ctx.cfg, ['api', ref], { cwd });
+    if (got.status !== 0) {
+      if (/HTTP 404|Not Found/i.test(got.stderr + got.stdout)) s.remoteBranch = true;
+      else s.errors.push(`could not read the remote branch (gh exit ${got.status})`);
+    } else {
+      let sha = null;
+      try { sha = JSON.parse(got.stdout).object.sha; } catch { /* not JSON */ }
+      if (sha !== pr.headRefOid) {
+        s.remoteBranch = 'moved';
+        warn(`remote branch moved after PR #${pr.number} merged; left in place`);
+      } else if (dryRun) s.remoteBranch = 'would delete';
+      else {
+        const d = ghRun(ctx.cfg, ['api', '-X', 'DELETE', ref.replace('/git/ref/', '/git/refs/')], { cwd });
+        if (d.status === 0 || /HTTP 404|HTTP 422|reference does not exist/i.test(d.stderr + d.stdout)) s.remoteBranch = true;
+        else s.errors.push(`remote branch not deleted (gh exit ${d.status})`);
+      }
     }
   }
 
-  const known = new Set([...pathKinds, 'env-file', 'docker-container', 'docker-volume', 'docker-network']);
+  const known = new Set(['file', 'dir', 'cache', 'path', 'env-file', 'docker-container', 'docker-volume', 'docker-network']);
   const after = (!dryRun && readLedger(ctx.commonDir, ctx.wtId)) || fresh;
-  s.left = after.resources.filter((r) => !known.has(r.kind) || r.where !== 'local').length;
+  s.left = (after.resources || []).filter((r) => !known.has(r.kind) || r.where !== 'local').length;
   return s;
 }
 
@@ -500,7 +596,8 @@ function describe(s) {
     `${plural(s.paths, 'tracked path')} deleted`,
     s.envFile ? 'env file deleted' : 'no env file',
   ];
-  if (s.remoteBranch) parts.push('remote branch deleted');
+  if (s.remoteBranch === true) parts.push('remote branch deleted');
+  if (s.remoteBranch === 'moved') parts.push('remote branch moved (kept)');
   if (s.hook) parts.push(`hook ${s.hook}`);
   if (s.crReview) parts.push(`cr-review ${s.crReview}`);
   if (s.left) parts.push(`${plural(s.left, 'resource')} left to repo hooks`);
@@ -513,7 +610,14 @@ async function cmdTeardown(opts) {
   const ctx = resolveContext(startDir(opts));
   if (!ctx) { log('not inside a git checkout: nothing to do'); return 0; }
   if (ctx.isMain) { log('main checkout: nothing to do'); return 0; }
-  const { dryRun } = opts;
+  const conflict = identityConflict(ctx);
+  if (conflict) { warn(conflict); return 1; }
+  const release = opts.dryRun ? () => {} : tryLock(path.join(ledgerDir(ctx.commonDir), `${ctx.wtId}.teardown.lock`));
+  if (!release) { warn('keep: another teardown of this worktree is running'); return 1; }
+  try { return await teardown(ctx, opts); } finally { release(); }
+}
+
+async function teardown(ctx, { dryRun }) {
   const ledger = readLedger(ctx.commonDir, ctx.wtId) || { resources: [], ports: {} };
   const note = (state, keptReason, pr) => {
     if (dryRun) return;
@@ -523,10 +627,21 @@ async function cmdTeardown(opts) {
       prState: pr ? pr.state : l.prState || null,
     }));
   };
-  if (!ctx.branch) { log('detached HEAD: nothing removed'); note('active', 'detached HEAD', null); return 0; }
+  if (!ctx.branch) {
+    const n = Number(gitOut(['rev-list', '--count', 'HEAD', '--not', '--branches', '--remotes', '--tags'], { cwd: ctx.worktreePath }) ?? NaN);
+    if (!Number.isFinite(n) || n > 0) {
+      const why = Number.isFinite(n) ? `detached HEAD with ${plural(n, 'commit')} on no branch, remote or tag` : 'detached HEAD; cannot count its commits';
+      warn(`keep: ${why}`);
+      note('kept', why, null);
+      return 1;
+    }
+    log('detached HEAD: nothing removed');
+    note('active', 'detached HEAD', null);
+    return 0;
+  }
 
   let prs;
-  try { prs = prsForBranch(ctx.worktreePath, ctx.branch); } catch (e) {
+  try { prs = prsForBranch(ctx.cfg, ctx.worktreePath, ctx.branch); } catch (e) {
     warn(`keep: cannot read PR state (${e.message}); nothing removed`);
     note('kept', 'PR state unknown', null);
     return 1;
@@ -545,7 +660,11 @@ async function cmdTeardown(opts) {
   }
 
   const s = await cleanup(ctx, ledger, a.pr, { dryRun, worktreeGone: false });
-  if (dryRun) { log(`dry run, ${a.detail}: would do: ${describe(s)}`); return 0; }
+  if (dryRun) {
+    if (s.errors.length) for (const e of s.errors) warn(e);
+    log(`dry run, ${a.detail}: would do: ${describe(s)}`);
+    return 0;
+  }
   updateLedger(ctx.commonDir, ctx.wtId, (l) => Object.assign(l, {
     state: s.errors.length ? 'kept' : 'torn-down',
     keptReason: s.errors.length ? s.errors.join('; ') : null,
@@ -565,7 +684,7 @@ async function cmdTeardown(opts) {
 
 // ---------------------------------------------------------------- sweep
 
-function parseWorktrees(text) {
+export function parseWorktrees(text) {
   const out = [];
   let cur = null;
   for (const line of String(text || '').split(/\r?\n/)) {
@@ -588,12 +707,17 @@ function repoContext(repoRoot, cfg, repo, commonDir, wt) {
 }
 
 async function sweepRepo(root, opts) {
-  const { dryRun, quick } = opts;
   const id = gitIdentity(root);
-  if (!id) return { repo: root, error: 'not a git checkout' };
+  if (!id) return { repo: path.basename(root), errors: ['not a git checkout'] };
+  const release = tryLock(path.join(ledgerDir(id.commonDir), 'sweep.lock'));
+  const repo = repoName(loadConfig(id.repoRoot), id.repoRoot);
+  if (!release) return { repo, skipped: 'another sweep of this repo is running', errors: [] };
+  try { return await sweepLocked(id, repo, opts); } finally { release(); }
+}
+
+async function sweepLocked(id, repo, { dryRun, quick }) {
   const repoRoot = id.repoRoot;
   const cfg = loadConfig(repoRoot);
-  const repo = repoName(cfg, repoRoot);
   const base = baseBranch(cfg, repoRoot);
   const r = {
     repo, ledgersFinished: 0, ledgersRemoved: 0, worktreesRemoved: 0, branchesDeleted: 0,
@@ -601,104 +725,124 @@ async function sweepRepo(root, opts) {
   };
   if (!dryRun) git(['worktree', 'prune'], { cwd: repoRoot });
 
+  let worktrees = liveWorktrees(repoRoot);
+  if (!worktrees) { r.errors.push('git worktree list failed: nothing swept'); return r; }
+
   let index = null;
-  try { index = prIndex(repoRoot); } catch (e) { r.errors.push(`PR state unavailable (${e.message}): PR-dependent steps skipped`); }
+  try { index = prIndex(cfg, repoRoot); } catch (e) { r.errors.push(`PR state unavailable (${e.message}): PR-dependent steps skipped`); }
+  const forBranch = (b) => {
+    try { return index.forBranch(b); } catch (e) { r.errors.push(`${b}: ${e.message}`); return null; }
+  };
 
-  let worktrees = parseWorktrees(gitOut(['worktree', 'list', '--porcelain'], { cwd: repoRoot }));
-  const live = new Set(worktrees.filter((w) => !w.prunable).map((w) => normPath(w.path)));
+  const live = worktrees.filter((w) => !w.prunable);
+  const liveKeys = new Set(live.map((w) => canonKey(w.path)));
+  const liveBranches = new Set(live.map((w) => w.branch).filter(Boolean));
 
-  // 1. Ledgers whose worktree is gone: finish their teardown, then forget them.
+  // 1. Ledgers whose worktree is gone (not listed and not on disk).
   for (const { wtId, data } of listLedgers(id.commonDir)) {
-    const gone = !data.worktreePath || !live.has(normPath(data.worktreePath)) || !fs.existsSync(data.worktreePath);
-    if (!gone) continue;
+    const p = data.worktreePath;
+    if (p && (liveKeys.has(canonKey(p)) || fs.existsSync(p))) continue;
+    if (data.branch && liveBranches.has(data.branch)) { r.kept.push(`${wtId}: branch checked out in another worktree`); continue; }
+    const ctx = repoContext(repoRoot, cfg, repo, id.commonDir, { worktreePath: p || repoRoot, branch: data.branch, wtId });
     if (data.state === 'torn-down') {
+      const d = dockerCleanup(wtId, [], dryRun);
+      r.containersRemoved += d.containers || 0;
+      if (d.errors.length) { r.errors.push(`${wtId}: ${d.errors.join('; ')}`); continue; }
       if (!dryRun) deleteLedger(id.commonDir, wtId);
       r.ledgersRemoved++;
       continue;
     }
     if (!index) continue;
-    const a = data.branch ? assess({ prs: index.forBranch(data.branch) }) : { verdict: 'no-pr', pr: null };
-    if (['open', 'queued', 'stacked'].includes(a.verdict)) { r.kept.push(`${wtId}: ${a.detail}`); continue; }
-    const ctx = repoContext(repoRoot, cfg, repo, id.commonDir, { worktreePath: data.worktreePath || repoRoot, branch: data.branch, wtId });
-    const s = await cleanup(ctx, data, a.pr, { dryRun, worktreeGone: true });
-    r.containersRemoved += s.docker && s.docker.containers ? s.docker.containers : 0;
-    if (s.errors.length) { r.errors.push(`${wtId}: ${s.errors.join('; ')}`); continue; }
-    r.ledgersFinished++;
-    if (!dryRun) {
-      updateLedger(id.commonDir, wtId, (l) => Object.assign(l, {
-        state: 'torn-down', keptReason: null, tornDownAt: new Date().toISOString(),
-        remoteBranchDeleted: Boolean(l.remoteBranchDeleted || s.remoteBranch === true),
-        prNumber: a.pr ? a.pr.number : l.prNumber || null, prState: a.pr ? a.pr.state : l.prState || null,
-      }));
-    }
+    if (!data.branch) { r.kept.push(`${wtId}: no branch recorded`); continue; }
+    const tip = gitOut(['rev-parse', '--verify', '-q', `refs/heads/${data.branch}`], { cwd: repoRoot });
+    if (!tip) { r.kept.push(`${wtId}: local branch missing; cannot prove it was pushed`); continue; }
+    const prs = forBranch(data.branch);
+    if (!prs) continue;
+    const a = assess({ prs, tip, dir: repoRoot });
+    if (a.verdict !== 'eligible') { r.kept.push(`${wtId}: ${a.detail}`); continue; }
+    const lock = dryRun ? () => {} : tryLock(path.join(ledgerDir(id.commonDir), `${wtId}.teardown.lock`));
+    if (!lock) { r.kept.push(`${wtId}: teardown running`); continue; }
+    try {
+      const s = await cleanup(ctx, data, a.pr, { dryRun, worktreeGone: true });
+      r.containersRemoved += s.docker && s.docker.containers ? s.docker.containers : 0;
+      if (s.errors.length) { r.errors.push(`${wtId}: ${s.errors.join('; ')}`); continue; }
+      r.ledgersFinished++;
+      if (!dryRun) {
+        updateLedger(id.commonDir, wtId, (l) => Object.assign(l, {
+          state: 'torn-down', keptReason: null, tornDownAt: new Date().toISOString(),
+          remoteBranchDeleted: Boolean(l.remoteBranchDeleted || s.remoteBranch === true),
+          prNumber: a.pr.number, prState: a.pr.state,
+        }));
+      }
+    } finally { lock(); }
   }
 
   // 2. Hand-made worktrees outside the T3 root (T3 removes its own). Not in --quick.
   if (!quick && index) {
-    const lander = normPath(`${repoRoot}-lander`);
-    const t3 = t3Root();
-    let procs = null;
+    const lander = canonKey(`${repoRoot}-lander`);
+    const t3 = canonical(t3Root());
+    let procs;
     for (const w of worktrees) {
       if (samePath(w.path, repoRoot) || w.bare || w.locked || w.prunable || !w.branch) continue;
-      if (normPath(w.path) === lander || isUnder(w.path, t3)) continue;
       if (!fs.existsSync(w.path)) continue;
+      if (canonKey(w.path) === lander || isUnder(canonical(w.path), t3)) continue;
+      const name = path.basename(w.path);
       const wtId = makeWtId(repo, w.path);
-      const ctx = repoContext(repoRoot, loadConfig(w.path), repo, id.commonDir, { worktreePath: w.path, branch: w.branch, wtId });
+      const wcfg = loadConfig(w.path);
+      const ctx = repoContext(repoRoot, wcfg, repo, id.commonDir, { worktreePath: w.path, branch: w.branch, wtId });
+      const prs = forBranch(w.branch);
+      if (!prs) continue;
       const { out } = envPaths(ctx);
-      const a = assess({ prs: index.forBranch(w.branch), worktreePath: w.path, ignore: [out] });
-      if (a.verdict !== 'eligible') { r.kept.push(`${path.basename(w.path)}: ${a.detail}`); continue; }
-      procs = procs || listProcesses();
-      if (processesUnder(w.path, procs).length) { r.kept.push(`${path.basename(w.path)}: processes running inside`); continue; }
-      const ledger = readLedger(id.commonDir, wtId) || { resources: [], ports: {} };
-      const s = await cleanup(ctx, ledger, a.pr, { dryRun, worktreeGone: false });
-      if (s.errors.length) { r.errors.push(`${path.basename(w.path)}: ${s.errors.join('; ')}`); continue; }
-      if (dryRun) { r.worktreesRemoved++; continue; }
-      const rm = git(['worktree', 'remove', w.path], { cwd: repoRoot });
-      if (rm.status !== 0) { r.kept.push(`${path.basename(w.path)}: git worktree remove refused (${firstLine(rm.stderr)})`); continue; }
-      r.worktreesRemoved++;
-      if (readLedger(id.commonDir, wtId)) deleteLedger(id.commonDir, wtId);
+      const a = assess({ prs, worktreePath: w.path, ignore: [out] });
+      if (a.verdict !== 'eligible') { r.kept.push(`${name}: ${a.detail}`); continue; }
+      if (procs === undefined) procs = listProcesses();
+      if (!procs) { r.kept.push(`${name}: process list failed`); continue; }
+      if (processesUnder(w.path, procs).length) { r.kept.push(`${name}: processes running inside`); continue; }
+      const lock = dryRun ? () => {} : tryLock(path.join(ledgerDir(id.commonDir), `${wtId}.teardown.lock`));
+      if (!lock) { r.kept.push(`${name}: teardown running`); continue; }
+      try {
+        const ledger = readLedger(id.commonDir, wtId) || { resources: [], ports: {} };
+        const s = await cleanup(ctx, ledger, a.pr, { dryRun, worktreeGone: false });
+        if (s.errors.length) { r.errors.push(`${name}: ${s.errors.join('; ')}`); continue; }
+        if (dryRun) { r.worktreesRemoved++; continue; }
+        const rm = git(['worktree', 'remove', w.path], { cwd: repoRoot });
+        if (rm.status !== 0) { r.kept.push(`${name}: git worktree remove refused (${firstLine(rm.stderr)})`); continue; }
+        r.worktreesRemoved++;
+        if (readLedger(id.commonDir, wtId)) deleteLedger(id.commonDir, wtId);
+      } finally { lock(); }
     }
-    if (!dryRun) worktrees = parseWorktrees(gitOut(['worktree', 'list', '--porcelain'], { cwd: repoRoot }));
+    if (!dryRun) worktrees = liveWorktrees(repoRoot);
   }
 
   // 3. Local branches whose PR merged or closed, with nothing unpushed.
-  if (index) {
+  if (index && worktrees) {
     const checkedOut = new Set(worktrees.map((w) => w.branch).filter(Boolean));
     const refs = (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
     for (const line of refs) {
       const [branch, tip] = line.split(' ');
       if (branch === base || branch === 'agent-landing-lock' || checkedOut.has(branch)) continue;
-      const prs = index.forBranch(branch);
-      if (!prs.head.length) continue;
-      const a = assess({ prs, tip });
+      if (index.complete && !index.known(branch)) continue;
+      const prs = forBranch(branch);
+      if (!prs || !prs.head.length) continue;
+      const a = assess({ prs, tip, dir: repoRoot });
       if (a.verdict !== 'eligible') { r.kept.push(`branch ${branch}: ${a.detail}`); continue; }
-      const why = unpushedReason(repoRoot, tip, a.pr);
-      if (why) { r.kept.push(`branch ${branch}: ${why}`); continue; }
       if (!dryRun) {
         const d = git(['branch', '-D', branch], { cwd: repoRoot });
         if (d.status !== 0) { r.errors.push(`branch ${branch}: delete failed`); continue; }
       }
       r.branchesDeleted++;
     }
-  }
+  } else if (!worktrees) r.errors.push('git worktree list failed: branches not swept');
 
-  // 4. Labelled Docker leftovers of torn-down ledgers.
-  for (const { wtId, data } of listLedgers(id.commonDir)) {
-    if (data.state !== 'torn-down') continue;
-    const d = dockerCleanup(wtId, [], dryRun);
-    r.containersRemoved += d.containers || 0;
-  }
-
-  // 5. The repo's own sweep hook (repo-wide leftovers such as aged preview databases).
-  const hooks = await loadHooks(repoRoot).catch((e) => { r.errors.push(`hooks.mjs failed to load: ${e.message}`); return null; });
-  if (hooks && typeof hooks.sweep === 'function') {
-    const ctx = repoContext(repoRoot, cfg, repo, id.commonDir, { worktreePath: repoRoot, branch: null, wtId: null });
-    const hc = hookCtx(ctx, { ports: {} }, { dryRun, worktreeGone: false });
-    hc.track = () => { throw new Error('track is per worktree; not available in sweep'); };
-    hc.untrack = hc.track;
-    hc.ledgers = listLedgers(id.commonDir).map(({ wtId, data }) => ({ wtId, branch: data.branch, state: data.state, worktreePath: data.worktreePath, resources: data.resources || [] }));
-    try { await hooks.sweep(hc); r.hook = 'ok'; } catch (e) { r.errors.push(`hooks.sweep failed: ${e.message}`); }
-  }
+  // 4. The repo's own sweep hook (repo-wide leftovers such as aged preview databases).
+  try {
+    const data = {
+      repo, repoRoot, worktreePath: repoRoot, wtId: null, branch: null, ticket: null, ports: {},
+      dryRun: Boolean(dryRun), worktreeGone: false,
+      ledgers: listLedgers(id.commonDir).map(({ wtId, data: d }) => ({ wtId, branch: d.branch, state: d.state, worktreePath: d.worktreePath, resources: d.resources || [] })),
+    };
+    r.hook = runHook('sweep', repoRoot, data, id.commonDir);
+  } catch (e) { r.errors.push(e.message); }
   return r;
 }
 
@@ -721,6 +865,7 @@ async function cmdSweep(opts) {
   else {
     if (!roots.length) log('no repos to sweep');
     for (const r of results) {
+      if (r.skipped) { log(`sweep ${r.repo}: skipped (${r.skipped})`); continue; }
       log(`sweep ${r.repo}${opts.dryRun ? ' (dry run)' : ''}: ${r.ledgersFinished || 0} finished, ${r.ledgersRemoved || 0} ledgers removed, ${r.worktreesRemoved || 0} worktrees removed, ${r.branchesDeleted || 0} branches deleted, ${r.containersRemoved || 0} containers removed, ${(r.kept || []).length} kept`);
       for (const k of r.kept || []) log(`  kept ${k}`);
       for (const e of r.errors || []) warn(`${r.repo}: ${e}`);
@@ -779,11 +924,14 @@ function cmdGate(opts) {
 }
 
 function cmdTrack(opts, remove) {
-  const [kind, id] = opts._.slice(1);
-  if (!kind || !id) { warn(`usage: ${remove ? 'untrack' : 'track'} <kind> <id>${remove ? '' : ' [--where <host>]'}`); return 2; }
+  const [kind, rawId] = opts._.slice(1);
+  if (!kind || !rawId) { warn(`usage: ${remove ? 'untrack' : 'track'} <kind> <id>${remove ? '' : ' [--where <host>]'}`); return 2; }
   const ctx = resolveContext(startDir(opts));
   if (!ctx) { warn('not inside a git checkout'); return 2; }
   if (ctx.isMain) { warn('main checkout: resources are tracked per worktree'); return 2; }
+  const conflict = identityConflict(ctx);
+  if (conflict) { warn(conflict); return 1; }
+  const id = normalizeTrack(kind, rawId, ctx.worktreePath);
   if (opts.dryRun) { log(`would ${remove ? 'untrack' : 'track'} ${kind} ${id}`); return 0; }
   updateLedger(ctx.commonDir, ctx.wtId, (l) => {
     if (!l.repo) Object.assign(l, { repo: ctx.repo, repoRoot: ctx.repoRoot, worktreePath: ctx.worktreePath, branch: ctx.branch, ticket: ctx.ticket });

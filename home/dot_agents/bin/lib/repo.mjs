@@ -26,7 +26,7 @@ export const DEFAULTS = Object.freeze({
 
 /** Normalise a path for comparisons: resolved, forward slashes, lower case on Windows. */
 export function normPath(p) {
-  const r = path.resolve(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  const r = path.resolve(String(p).replace(/^\\\\\?\\(UNC\\)?/i, (m, unc) => (unc ? '\\\\' : ''))).replace(/\\/g, '/').replace(/\/+$/, '');
   return isWindows ? r.toLowerCase() : r;
 }
 
@@ -49,13 +49,46 @@ export function fnv1a(str) {
   return h >>> 0;
 }
 
-/** `<repo>-<basename>` reduced to [a-z0-9-], at most 40 characters (hash suffix when cut). */
+/** Strip the Win32 long-path prefixes (\\?\C:\x, \\?\UNC\host\share). */
+function stripLong(p) {
+  return String(p).replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '');
+}
+
+/**
+ * Canonical absolute path: the deepest existing ancestor resolved through symlinks and
+ * junctions (realpath.native), plus the part that does not exist yet.
+ */
+export function canonical(p) {
+  let cur = path.resolve(stripLong(p));
+  const rest = [];
+  for (;;) {
+    try {
+      const real = path.resolve(stripLong(fs.realpathSync.native(cur)));
+      return rest.length ? path.join(real, ...rest.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(stripLong(p));
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** Comparison key of a path after canonicalisation. */
+export function canonKey(p) { return normPath(canonical(p)); }
+
+/** isUnder after canonicalising both sides. */
+export function isUnderCanon(child, parent) { return isUnder(canonical(child), canonical(parent)); }
+
+/**
+ * `<repo>-<basename>-<6 hex of the canonical worktree path>`, reduced to [a-z0-9-], at most
+ * 40 characters. Two worktrees with the same folder name never share an id.
+ */
 export function makeWtId(repo, worktreePath) {
   const clean = (s) => String(s).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-  const full = clean(`${repo}-${path.basename(path.resolve(worktreePath))}`) || 'wt';
-  if (full.length <= 40) return full;
-  const suffix = fnv1a(full).toString(16).padStart(8, '0').slice(0, 6);
-  return `${full.slice(0, 33).replace(/-+$/, '')}-${suffix}`;
+  const prefix = (clean(`${repo}-${path.basename(path.resolve(stripLong(worktreePath)))}`) || 'wt').slice(0, 33).replace(/-+$/, '');
+  const hash = fnv1a(canonKey(worktreePath)).toString(16).padStart(8, '0').slice(0, 6);
+  return `${prefix}-${hash}`;
 }
 
 /** Read .agents/repo.json from dir (if any) merged over DEFAULTS. Throws on invalid JSON. */
