@@ -779,7 +779,7 @@ export function mergeArgv(cfg, { pr, sha, repo }) {
 
 // Runs from `cwd` (the repo's checkout), so a repo-relative mergeCmd or ghWrapper works from
 // wherever the tool was started (land-queue --all).
-export function mergePinned(gh, cfg, { pr, sha, cwd }) {
+export function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
   // `message` (the command's first output line, scrubbed) is for the local caller only; `summary`
   // has no command output and is what may go into a PR comment.
   const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env, cwd });
@@ -797,7 +797,9 @@ export function mergePinned(gh, cfg, { pr, sha, cwd }) {
     const s = `PR state is ${after.state} after the merge command`;
     return { ok: false, message: s, summary: s };
   }
-  clearQueueLabels(gh, after);
+  // The merge and its read-back take time: labels are cleared only while the lock is still ours
+  // (a leftover label on a merged PR is cleared by the next lander).
+  if (!lock || lock.stillHeld()) clearQueueLabels(gh, after);
   return { ok: true, mergeSha: after.mergeCommit?.oid || null };
 }
 

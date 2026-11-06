@@ -78,6 +78,8 @@ function pr(sub, rest) {
       ? { ...view(p), headRefOid: s.staleHead.sha } : view(p));
     const out = s.prs.filter((p) => (p.state || 'OPEN') === 'OPEN' && (!o.label || (p.labels || []).includes(o.label))).map(lagged);
     process.stdout.write(JSON.stringify(out));
+    // mutateAfter kind 'prList': counts the PR list reads.
+    if (s.mutateAfter?.kind === 'prList') { countAndMutate(s, 'prList'); save(s); }
     return;
   }
   if (sub === 'edit') {
@@ -158,7 +160,8 @@ function label(sub, rest) {
 
 // Test hook: right after the n-th call of one kind ('varGet': a repo variable read, 'lockGet':
 // a landing-lock ref read), change one PR once, so only the reads after it see the change:
-// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel? }; kind 'prView' counts reads of PR `pr`.
+// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel?, steal? }; kind 'prView' counts reads of PR `pr`.
+// steal: another lander replaces the landing lock (its sha goes to mutateAfter.stolen).
 function countAndMutate(s, kind) {
   const m = s.mutateAfter;
   if (!m || m.kind !== kind) return;
@@ -168,6 +171,12 @@ function countAndMutate(s, kind) {
   if (m.base) p.baseRefName = m.base;
   if (m.appendBody) p.body = `${p.body || ''}${m.appendBody}`;
   if (m.addLabel) p.labels = [...new Set([...(p.labels || []), m.addLabel])];
+  if (m.steal) {
+    const lock = 'refs/heads/agent-landing-lock';
+    const g = (...a) => spawnSync('git', ['-C', BARE, ...a], { encoding: 'utf8', shell: false }).stdout.trim();
+    m.stolen = g('commit-tree', g('rev-parse', `${lock}^{tree}`), '-m', `agent-landing-lock host=other pid=1 at=${new Date().toISOString()} ttl=45`);
+    g('update-ref', lock, m.stolen);
+  }
 }
 
 function api(rest) {

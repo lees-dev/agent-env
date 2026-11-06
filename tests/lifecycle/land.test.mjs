@@ -1429,6 +1429,49 @@ describe('land-queue', () => {
     assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0, 'no fix attempt used');
   });
 
+  // Recovery after an error reads the PR again; another lander can take the lock during that
+  // read. Ownership is checked after the read, right before any change: nothing is changed.
+  test('run: lock taken during the recovery read after an error: body, labels, checkout and the foreign lock untouched', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    // The pending-line edit fails; reads of #1: 1 the re-check before the push, 2 the recovery read.
+    const s = state(t);
+    s.failBodyEditMatching = 'push started';
+    s.mutateAfter = { kind: 'prView', n: 2, pr: 1, steal: true };
+    saveState(t, s);
+    const bodyBefore = prOf(t, 1).body;
+    const first = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(first.status, 1, 'the run reports the failed edit');
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen, 'the lock was taken during the recovery read');
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched: the next lander recovers `landing`');
+    assert.equal(prOf(t, 1).body, bodyBefore, 'body untouched');
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
+  // Leftover recovery lists the queue under the lock; another lander can take the lock during
+  // that read, and its own PR then carries `landing`: it is not reset.
+  test('run: lock taken during the leftover-recovery list read: the `landing` PR is not reset', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t);
+    s.prs.find((p) => p.number === 1).labels = ['landing'];
+    // List reads (landing, then queued): 1-2 the check for leftovers (no lock yet), 3-4 the
+    // recovery's own read under the lock; the lock moves at the end of that read.
+    s.mutateAfter = { kind: 'prList', n: 4, pr: 1, steal: true };
+    saveState(t, s);
+    const rep = runQueue(t);
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen, 'the lock was taken during the recovery read');
+    assert.deepEqual(rep.reset, []);
+    assert.deepEqual(rep.merged, []);
+    assert.match(rep.alerts.join('\n'), /lock was lost while resetting leftover/);
+    assert.deepEqual(prOf(t, 1).labels, ['landing']);
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
   test('run: GitHub still showing the head before the lander rebase is never a bounce', () => {
     const t = setup();
     const head = queuePr(t, 1);

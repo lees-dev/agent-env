@@ -322,7 +322,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
       line = othersInLine(gh, n);
       if (line.count === 0) {
         if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
-        const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root });
+        const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root, lock });
         if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);
         // The merge stands even if its count cannot be recorded (the next sweep may run late).
         try { bumpMergeCount(repo); } catch (e) { process.stderr.write(`warning: the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late\n`); }

@@ -255,6 +255,8 @@ async function landOne(ctx, pr) {
     const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
     resetOwned();
     if (push.status !== 0) return bounceOwned(ctx, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`);
+    // The pending line already names the pushed head: after a loss it is left for the next lander.
+    if (!lock.stillHeld()) return abort(gh, pr, { requeue: 'the landing lock was lost after the push', lost: true }, 'the merge', lock);
     const body = confirmPending(pr.body, landSha);
     gh.prEdit(pr.number, { body });
     pr.body = body;
@@ -272,7 +274,7 @@ async function landOne(ctx, pr) {
   if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
   const last = recheck(gh, pr, want, landSha, lock);
   if (last) return abort(gh, pr, last, 'the merge', lock);
-  const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root });
+  const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root, lock });
   if (!m.ok) return bounceOwned(ctx, pr, `merge failed (${m.summary})`);
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
 }
@@ -282,12 +284,14 @@ async function landOne(ctx, pr) {
 // Move the oldest queue-waiting PRs to queued while the unheld queued + landing PRs are fewer
 // than maxQueued.
 function admitWaiting(ctx, report) {
-  const { gh, cfg } = ctx;
+  const { gh, cfg, lock } = ctx;
   let free = cfg.maxQueued - capacityUsed(listQueue(gh));
-  if (free <= 0) return;
+  if (free <= 0) return true;
   for (const w of listWaiting(gh)) {
     if (free <= 0) break;
     if (labelNames(w).includes('queue-hold')) continue;
+    // Admission counts free slots under the lock: after a loss another lander admits.
+    if (!lock.stillHeld()) return false;
     const gated = parseLanding(w.body).gatedSha;
     if (!gated || !w.headRefOid.startsWith(gated)) {
       report.bounced.push(bounce(gh, w, 'head changed while waiting for queue capacity'));
@@ -297,6 +301,7 @@ function admitWaiting(ctx, report) {
     report.admitted.push(w.number);
     free--;
   }
+  return true;
 }
 
 // ---------------------------------------------------------------- per repo
@@ -347,12 +352,15 @@ function releaseLock(ctx, report) {
 }
 
 // Holding the lock, nothing can be landing: a `landing` label is left over from a crash.
-function resetLeftovers(gh, report) {
+function resetLeftovers(gh, report, lock) {
   for (const p of listQueue(gh)) {
     if (!labelNames(p).includes('landing')) continue;
+    // After a loss, `landing` may be the new holder's PR in flight: it is not reset.
+    if (lock && !lock.stillHeld()) return false;
     setLabels(gh, p, { add: ['queued'], remove: ['landing'] });
     if (!report.reset.includes(p.number)) report.reset.push(p.number);
   }
+  return true;
 }
 
 // After an error mid-landing, settle the PR from a fresh read: never leave `landing`, and never
@@ -360,17 +368,20 @@ function resetLeftovers(gh, report) {
 // came after it, for example while reading the PR back) is counted: returns { merged }.
 function settleAfterError(gh, pr, res, report, lock) {
   if (!pr || res?.merged) return null;
-  const owned = !lock || lock.stillHeld();
+  // Ownership is checked after the fresh read, right before each change: the lock can move
+  // during that read, so a check made before it proves nothing.
+  const owned = () => !lock || lock.stillHeld();
   let fresh;
   try { fresh = gh.prView(pr.number); } catch { return null; }
   if (fresh.state === 'MERGED') {
+    // A confirmed merge is counted either way; its labels are cleared only while the lock is ours.
     const merged = { pr: pr.number, sha: fresh.headRefOid, mergeSha: fresh.mergeCommit?.oid || null, rebased: null };
-    if (owned) clearQueueLabels(gh, fresh);
+    if (owned()) clearQueueLabels(gh, fresh);
     report.merged.push(merged);
     try { bumpMergeCount(gh.repo); } catch { /* the merge stands; only the sweep count is off */ }
     return { merged };
   }
-  if (!owned) return null;
+  if (!owned()) return null;
   try {
     if (fresh.state !== 'OPEN' || labelNames(fresh).includes('queue-blocked')) setLabels(gh, fresh, { remove: ['landing'] });
     else setLabels(gh, fresh, { add: ['queued'], remove: ['landing'] });
@@ -412,8 +423,10 @@ async function runRepo(t, opts) {
     if (listQueue(gh).some((p) => labelNames(p).includes('landing'))) {
       if (!takeLock(ctx, report, opts)) { fillQueueState(gh, report); return report; }
       let kept = false;
-      try { resetLeftovers(gh, report); } finally { kept = !releaseLock(ctx, report); }
-      if (kept) { fillQueueState(gh, report); return report; }
+      let held = true;
+      try { held = resetLeftovers(gh, report, ctx.lock); } finally { kept = !releaseLock(ctx, report); }
+      if (!held) report.alerts.push('the landing lock was lost while resetting leftover `landing` labels; stopped');
+      if (kept || !held) { fillQueueState(gh, report); return report; }
     }
     // A sweep that is already due (one that failed to pause, or merges by land-pr) runs before
     // anything else lands; if it stops or pauses, nothing lands in this run.
@@ -437,10 +450,12 @@ async function runRepo(t, opts) {
     try {
       // Under the lock: crash leftovers, then admission (so two landers never both fill the
       // same free slots), then one PR.
-      resetLeftovers(gh, report);
-      admitWaiting(ctx, report);
+      if (!resetLeftovers(gh, report, ctx.lock) || !admitWaiting(ctx, report)) {
+        lost = true;
+        report.alerts.push('the landing lock was lost before a landing started; stopped');
+      }
       q = fillQueueState(gh, report);
-      if (q.eligible.length) {
+      if (!lost && q.eligible.length) {
         pr = q.eligible[0];
         // If the base moves before the merge, redo the rebase and validation (bounded).
         for (let k = 1; ; k++) {
