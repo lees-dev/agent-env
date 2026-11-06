@@ -585,11 +585,41 @@ export function parseLanding(body) {
 }
 
 // Write the section for a fresh enqueue by land-pr: one Gate line, Queued time, earlier bounces kept.
+// Other lines in the section (Bounced:, Hold-By:, notes) are kept.
 export function writeLanding(body, { gateSha, queuedAt }) {
   const parts = splitLanding(body);
-  const bounces = parts.lines.filter((l) => /^Bounced:/i.test(strip(l)));
-  parts.lines = [`- Gate: pass @ ${gateSha}`, `- Queued: ${queuedAt}`, ...bounces];
+  const rest = parts.lines.filter((l) => !/^(Gate|Queued):/i.test(strip(l)));
+  parts.lines = [`- Gate: pass @ ${gateSha}`, `- Queued: ${queuedAt}`, ...rest];
   return joinLanding(parts);
+}
+
+// `Hold-By: <holder> <ISO time>` lines anywhere in the body record who set queue-hold.
+// <holder> is `--holder <id>`, else $T3CODE_THREAD_ID, else `<hostname>:<parent pid>`.
+const HOLD_LINE = /^[ \t]*(?:[-*][ \t]+)?Hold-By:[ \t]*(\S+)(?:[ \t]+(\S+))?[ \t]*$/i;
+
+export function holderId(explicit) {
+  const id = (explicit || process.env.T3CODE_THREAD_ID || `${os.hostname()}:${process.ppid}`).trim();
+  if (!/^\S+$/.test(id)) throw new LandError('a holder id has no spaces', 2);
+  return id;
+}
+
+export function parseHolds(body) {
+  const out = [];
+  for (const l of String(body || '').replace(/\r\n/g, '\n').split('\n')) {
+    const m = l.match(HOLD_LINE);
+    if (m) out.push({ holder: m[1], at: m[2] || null });
+  }
+  return out;
+}
+
+export function addHold(body, holder, at = new Date().toISOString()) {
+  return appendLanding(body, `Hold-By: ${holder} ${at}`);
+}
+
+export function removeHold(body, holder) {
+  return String(body || '').replace(/\r\n/g, '\n').split('\n')
+    .filter((l) => { const m = l.match(HOLD_LINE); return !(m && m[1] === holder); })
+    .join('\n');
 }
 
 export function appendLanding(body, line) {

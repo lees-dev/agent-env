@@ -44,8 +44,10 @@ chezmoi reads its source state from `home/` (`.chezmoiroot`). A path under `home
 
 | Path | Deploys to | What |
 |---|---|---|
-| `home/dot_agents/bin/**` | `~/.agents/bin/` | Node lifecycle tools run as `node <path>` (no `executable_` prefix): the worktree engine, the credentials helper, the landing tools, and their shared `lib/*.mjs` |
+| `home/dot_agents/bin/**` | `~/.agents/bin/` | Node lifecycle tools run as `node <path>` (no `executable_` prefix): the worktree engine, the credentials helper, the landing tools (`land-pr`, `land-queue`, `lib/land.mjs`; rules in `pr-workflow` section 4), and their shared `lib/*.mjs` |
+| `home/dot_agents/skills/exact_land-queue/`, `home/dot_agents/skills/exact_repo-defaults/` | `~/.agents/skills/` | The lander's prompt; the repo standard (managed `AGENTS.md` block, `t3.json`, `.agents/repo.json`) and `scripts/apply.mjs` |
 | `tests/lifecycle/**` | (not deployed) | `node:test` suites with fake `gh`, `docker` and `op` |
+| `tests/bin/**`, `tests/skills/**` | (not deployed) | `node:test` suites for the landing tools (fake `gh`) and `repo-defaults` |
 | `docs/lifecycle.md` | | How setup, teardown, sweep and the credentials helper work |
 
 **Skill links.** `~/.claude/skills/<name>` is a link to `~/.agents/skills/<name>`, so the two cannot drift. The link is a junction on Windows (`linkMode = "junction"`, because symlinks need Developer Mode) and a symlink elsewhere. Make the links with the run script on every OS, so all platforms take the same path. The script never touches `~/.claude/skills/synced/`, and never replaces a real directory without backing it up first.

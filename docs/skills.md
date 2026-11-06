@@ -8,6 +8,7 @@ This page belongs to the rules+skills area. It covers where each skill comes fro
 |---|---|---|
 | `home/dot_agents/skills/exact_<name>/` | `~/.agents/skills/<name>/` | Codex (user scope), Muse (user scope), Grok (`.agents/skills` at each tier) |
 | `home/.chezmoiscripts/run_after_20-skills-links.{ps1,sh}.tmpl` | a link at `~/.claude/skills/<name>` → `~/.agents/skills/<name>` | Claude Code. Grok also scans `~/.claude/skills` and dedupes skills by name |
+| `home/dot_agents/bin/*.mjs`, `home/dot_agents/bin/lib/*.mjs` | `~/.agents/bin/` | Every harness, by path: the land queue (`land-pr.mjs`, `land-queue.mjs`) that `pr-workflow` section 4 calls |
 | `home/dot_agents/docs/agents/*.md` | `~/.agents/docs/agents/` | Linked from the rules: issue tracker, triage labels, domain docs, PR standards, subagent routing |
 | `home/.chezmoitemplates/rules/global.md` and `machine-<osFlavour>.md` | (partials) | The one source of the global rules |
 | `home/dot_claude/CLAUDE.md.tmpl` | `~/.claude/CLAUDE.md` | Claude Code. Grok also reads it, through Claude compatibility |
@@ -23,7 +24,7 @@ This page belongs to the rules+skills area. It covers where each skill comes fro
 
 `~/.claude/skills/<name>` is a link to `~/.agents/skills/<name>`, so the two copies cannot drift. On Windows the link is a directory junction, which needs neither Developer Mode nor elevation. Elsewhere it is a symlink.
 
-`run_after_20-skills-links` makes the links after every apply. It is idempotent: a second run reports `31 ok`. The same script runs on every OS, as `docs/layout.md` requires. Unix does not use `symlink_` entries, because chezmoi would delete a real copy that differs without checking it first. For each canonical skill the script does this:
+`run_after_20-skills-links` makes the links after every apply. It is idempotent: a second run reports `33 ok`. The same script runs on every OS, as `docs/layout.md` requires. Unix does not use `symlink_` entries, because chezmoi would delete a real copy that differs without checking it first. For each canonical skill the script does this:
 
 | What `~/.claude/skills/<name>` is | Action |
 |---|---|
@@ -83,11 +84,13 @@ Muse Code 1.4.14 has no global rules file that this repo can write. Its path is 
 
 Muse reads skills straight from `~/.agents/skills`: `muse skills list` shows `$HOME/.agents/skills/<name>/SKILL.md`. Skills need no import. Muse also has a setting named `context.foreign_personal_rules`. The binary suggests it loads the Claude and Codex files live. Its effect and its default are untested [UNVERIFIED]. That setting belongs to the harness area (`modify_settings.json`).
 
-## Canonical skills (31)
+## Canonical skills (33)
 
 The original sources were `~/.claude/skills` and `~/.agents/skills` on Beast, on 2026-11-04. When the two copies of a skill differed, the copy with the newest file mtime won. Only `council` differed. `synced/` was skipped, and so were the skills that `vendor-skills.lock` lists.
 
 On 2026-11-05, `council` and `pr-workflow` were refreshed from the live `~/.claude/skills` copies on BEAST. `subagent-routing` was added from the same source and replaces the retired routing roster. Both managed standards documents were synced from `~/.agents/docs/agents/`. Source files were read only.
+
+On 2026-11-06, `land-queue` (the lander's prompt) and `repo-defaults` (the repo standard and its `scripts/apply.mjs`) were written in this repo, not copied from a machine. Their tests run from the repo root and are not deployed: `node --test "tests/**/*.test.mjs"`.
 
 The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<target relpath>\t<sha256 of the file with CRLF turned to LF>\n`. `run_after_20-skills-links` computes the same hash.
 
@@ -104,6 +107,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `herdr` | identical in both | 1 | `ec8f944a509de0497642390a564f27d23974efb874c28194d54ebb80ee48e9ab` |
 | `how` | identical in both | 3 | `c0681d3cc32d4164739a917c266b2dd5573d32037b8aba95a0b708e06664078b` |
 | `kun` | identical in both | 1 | `c5cafaca2a3c140002f140e96af2a2eb77423fe7d89251bef59e2b5577833892` |
+| `land-queue` | written here (2026-11-06) | 1 | `42ad653281790e736997c06e51c91fb82dfc136c72b6b72b80bbb7c0d8072a6b` |
 | `leaving-pr-comments` | identical in both | 2 | `247ef56da1e550f14cc3b87cab818378f714c461fb42aa4ea441def39e03e661` |
 | `maintain-verification-skill` | identical in both | 1 | `367c331254656433db735dd0f14ba8cbe4edec2f0f7ad84a899908471f5eac13` |
 | `modernize` | identical in both | 2 | `8b49a15ce260749a1fd237bf775a07b507114b1fedc2dd26ecacbeac164f1b62` |
@@ -118,6 +122,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `principle-subtract-before-you-add` | identical in both | 1 | `91cf90d82d8aeca82c237753b2022b0ca836cdb20d1b200a5b80d5ce4aef185a` |
 | `principle-type-system-discipline` | identical in both | 1 | `6a3a9db88195d3863d0a4ead13b68d5f6d996d142cdd1d04c20f9ee0c6922c1d` |
 | `react-best-practices` | identical in both | 49 | `81afad38880a4b945e92056485b04a3a75082818bb62094bbdc5329c8d82b7c1` |
+| `repo-defaults` | written here (2026-11-06) | 7 | `befb29c0550ee9cfe15c3c8af6158dacccf104485746f1d251d93ef42330cd52` |
 | `sol-loop` | identical in both | 1 | `65db87ad81f27476d487a3c31d7e117f473e383edf8bdfb7360ae7119331631c` |
 | `subagent-routing` | `~/.claude/skills` (2026-11-05) | 2 | `5d300353b82bb5698bd3a0c647b562bdeaa03fd3abb218780e3faf64a0b1b382` |
 | `takeover` | identical in both | 1 | `87987a701b4669b52401bd0940a99a9c2dbcd250ccb3b0da434c391dd50de216` |

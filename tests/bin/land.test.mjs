@@ -210,8 +210,8 @@ describe('lib/land.mjs', () => {
   });
 
   test('scrub masks credential shapes', () => {
-    const s = scrub(`DATABASE_URL=postgres://u:p@h/db API_TOKEN: abc123 sk-${'x'.repeat(24)} me@corp.example Bearer abcdefghijkl`);
-    assert.doesNotMatch(s, /u:p@|abc123|xxxxxxxx|me@corp|abcdefghijkl/);
+    const s = scrub(`DATABASE_URL=postgres://u:p@h/db API_TOKEN: abc123 sk-${'x'.repeat(24)} me@example.com Bearer abcdefghijkl`);
+    assert.doesNotMatch(s, /u:p@|abc123|xxxxxxxx|me@example|abcdefghijkl/);
   });
 
   test('rangeDiffChanges', () => {
@@ -381,6 +381,139 @@ describe('land-pr', () => {
     assert.equal(r.status, 2);
     assert.match(r.out, /^REFUSED queue-hold/);
     assert.deepEqual(prOf(t, 1).labels, ['queue-blocked', 'queue-hold']);
+  });
+
+  test('fairness: no merge-now while another PR is queued, even with a free lock and a current head', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const head = makePr(t, 2);
+    const r = tool(t, LAND_PR, '2', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const j = JSON.parse(r.out);
+    assert.equal(j.result, 'QUEUED');
+    assert.equal(j.current, true);
+    assert.equal(j.position, 2);
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+    assert.equal(lockExists(t), false);
+  });
+
+  test('fairness: a new PR waits behind older queue-waiting PRs even when there is room', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t); s.prs.find((p) => p.number === 1).labels = ['queue-waiting']; saveState(t, s);
+    const head = makePr(t, 2);
+    const r = tool(t, LAND_PR, '2', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 3, r.err);
+    assert.equal(r.out, 'QUEUE-FULL 2');
+    assert.deepEqual(prOf(t, 2).labels, ['queue-waiting']);
+  });
+
+  test('a queue-waiting PR that is oldest and has room moves to queued', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t); s.prs.find((p) => p.number === 1).labels = ['queue-waiting']; saveState(t, s);
+    const head = sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change');
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 0, r.err);
+    assert.equal(r.out, 'QUEUED 1');
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+  });
+
+  const HOLDER = 't3-thread-abc';
+  function heldPr(t, extraBody = '') {
+    queuePr(t, 1, { body: extraBody });
+    const h = tool(t, LAND_PR, 'hold', '1', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(h.status, 0, h.err);
+    assert.equal(h.out, `HELD ${HOLDER}`);
+    sh(t.work, t.env, 'checkout', '--quiet', 'agent/LEE-1-change');
+    fs.writeFileSync(path.join(t.work, 'edit.txt'), 'edit\n');
+    sh(t.work, t.env, 'add', '-A');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'edit');
+    sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+    return sh(t.work, t.env, 'rev-parse', 'HEAD');
+  }
+
+  test('--release-hold: removes the caller\'s own hold and records the new gated sha in one edit', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const queuedAt = parseLanding(prOf(t, 1).body).queuedAt;
+    const before = state(t).calls.length;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const j = JSON.parse(r.out);
+    assert.equal(j.result, 'QUEUED');
+    assert.equal(j.released, true);
+    const p = prOf(t, 1);
+    assert.deepEqual(p.labels, ['queued']);
+    assert.doesNotMatch(p.body, /Hold-By:/);
+    assert.equal(parseLanding(p.body).gatedSha, head);
+    assert.equal(parseLanding(p.body).queuedAt, queuedAt);
+    const edits = state(t).calls.slice(before).filter((c) => c.cmd === 'pr edit');
+    assert.deepEqual(edits[0].remove, ['queue-hold']);
+    assert.equal(edits[0].body, true, 'label and gated sha in the same edit');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+  });
+
+  test('hold: adds queue-hold and a Hold-By line in one edit; holder defaults to $T3CODE_THREAD_ID', () => {
+    const t = setup();
+    queuePr(t, 1);
+    t.env.T3CODE_THREAD_ID = 'thread-from-env';
+    const r = tool(t, LAND_PR, 'hold', '1', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    assert.equal(JSON.parse(r.out).holder, 'thread-from-env');
+    const p = prOf(t, 1);
+    assert.deepEqual(p.labels.sort(), ['queue-hold', 'queued']);
+    assert.match(p.body, /^- Hold-By: thread-from-env \d{4}-\d\d-\d\dT\S+Z$/m);
+    const edits = state(t).calls.filter((c) => c.cmd === 'pr edit');
+    assert.equal(edits.length, 1);
+    assert.deepEqual(edits[0].add, ['queue-hold']);
+    assert.equal(edits[0].body, true);
+    const again = tool(t, LAND_PR, 'hold', '1', '--holder', 'x', '--repo', 'o/r');
+    assert.equal(again.status, 2);
+    assert.match(again.out, /^REFUSED queue-hold already set/);
+  });
+
+  test('hold: holder defaults to <hostname>:<parent pid> without T3', () => {
+    const t = setup();
+    queuePr(t, 1);
+    delete t.env.T3CODE_THREAD_ID;
+    const r = tool(t, LAND_PR, 'hold', '1', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    assert.match(JSON.parse(r.out).holder, /^\S+:\d+$/);
+  });
+
+  test('hold refuses a landing PR', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t); s.prs.find((p) => p.number === 1).labels = ['landing']; saveState(t, s);
+    const r = tool(t, LAND_PR, 'hold', '1', '--holder', 'x', '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.out, /^REFUSED landing/);
+    assert.deepEqual(prOf(t, 1).labels, ['landing']);
+  });
+
+  test('--release-hold refuses a hold the caller did not set', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const body = prOf(t, 1).body;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', 'someone-else', '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.out, /^REFUSED queue-hold was not set by someone-else/);
+    assert.deepEqual(prOf(t, 1).labels, ['queued', 'queue-hold']);
+    assert.equal(prOf(t, 1).body, body);
+  });
+
+  test('--release-hold keeps queue-hold while another holder remains', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const s = state(t); const p0 = s.prs.find((p) => p.number === 1); p0.body += '\nHold-By: owner 2026-11-06T09:00:00Z\n'; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.out, /^REFUSED queue-hold is still set by 1 other holder/);
+    const p = prOf(t, 1);
+    assert.deepEqual(p.labels, ['queued', 'queue-hold']);
+    assert.doesNotMatch(p.body, new RegExp(HOLDER));
+    assert.match(p.body, /Hold-By: owner/);
   });
 
   test('capacity: queued + landing at maxQueued -> queue-waiting, QUEUE-FULL, exit 3', () => {
@@ -654,6 +787,76 @@ describe('land-queue', () => {
     assert.equal(rep.merged.length, 0);
     assert.match(rep.bounced[0].reason, /the rebase changed 1 of 1 commit/);
     assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head);
+  });
+
+  test('run: the base moves right before the merge -> rebase and validation run again, then merge', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const s = state(t); s.advanceBaseAfterLanderGate = 1; saveState(t, s);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.bounced, []);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.equal(sh(t.bare, t.env, 'log', '-1', '--format=%s', 'main~1'), 'base moved');
+    const gates = parseLanding(prOf(t, 1).body).gates.filter((g) => /lander rebase/.test(g.note));
+    assert.equal(gates.length, 2, 'rebased and gated twice');
+    assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 2);
+  });
+
+  test('run: a leftover landing label (crashed run) is reset to queued under the lock', () => {
+    const t = setup();
+    queuePr(t, 1, { labels: ['landing'] });
+    let s = state(t); s.prs.find((p) => p.number === 1).labels = ['landing']; saveState(t, s);
+    queuePr(t, 2, { priority: 1 });
+    const rep = runQueue(t);
+    assert.deepEqual(rep.reset, [1]);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [2, 1], 'after the reset, normal order applies');
+    s = state(t);
+    const edits = s.calls.filter((c) => c.cmd === 'pr edit' && c.pr === 1);
+    assert.deepEqual(edits[0].add, ['queued']);
+    assert.deepEqual(edits[0].remove, ['landing']);
+  });
+
+  test('run: an error mid-landing puts the PR back to queued (never left landing)', () => {
+    const t = setup();
+    queuePr(t, 1);
+    fs.writeFileSync(`${t.work}-lander`, 'not a checkout');
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1);
+    assert.match(JSON.parse(r.out).error, /not a git checkout/);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.equal(lockExists(t), false);
+  });
+
+  test('run: the third bounce parks the PR with a PARKED: comment', () => {
+    const t = setup();
+    const old = 'Bounced: 2026-11-05T01:00:00Z conflict';
+    queuePr(t, 1);
+    let s = state(t);
+    const p = s.prs.find((x) => x.number === 1);
+    p.body = appendLanding(appendLanding(p.body, old), old.replace('01:', '02:'));
+    saveState(t, s);
+    fs.writeFileSync(path.join(t.work, 'late.txt'), 'late\n');
+    sh(t.work, t.env, 'add', '-A');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'late');
+    sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+    const rep = runQueue(t);
+    assert.equal(rep.bounced[0].attempt, 3);
+    assert.equal(rep.bounced[0].parked, true);
+    assert.deepEqual(prOf(t, 1).labels, ['queue-blocked']);
+    s = state(t);
+    const c = s.comments.filter((x) => x.pr === 1);
+    assert.equal(c.length, 1);
+    assert.match(c[0].body, /^PARKED: /);
+  });
+
+  test('run: the first bounce is not parked', () => {
+    const t = setup();
+    queuePr(t, 1, { file: 'README.md', content: 'line one\nPR EDIT\nline three\n' });
+    advanceMain(t, 'README.md', 'line one\nMAIN EDIT\nline three\n');
+    const rep = runQueue(t);
+    assert.equal(rep.bounced[0].parked, false);
+    assert.doesNotMatch(state(t).comments[0].body, /^PARKED/);
   });
 
   test('run --dry-run reports the plan and changes nothing', () => {

@@ -1,4 +1,5 @@
 // land-queue: the per-repo lander. Lands `queued` PRs one at a time, serially per repo.
+// The rules: pr-workflow skill, section 4.
 //
 // Usage:
 //   node land-queue.mjs run     [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]
@@ -7,22 +8,28 @@
 //
 // Repos: --root (default: the current checkout); --all reads ~/.agents/state/repos.json.
 // Each round: stop if the repo is paused (repo variable AGENT_LANDING_PAUSED=1); admit the oldest
-// `queue-waiting` PRs while queued + landing < maxQueued; take the landing lock; land the first
-// PR in order (landing, queue-next, Linear-Priority 1..4 with 0/missing = 3, time queued, number):
+// `queue-waiting` PRs while queued + landing < maxQueued; take the landing lock; reset any leftover
+// `landing` label (a crashed run) to `queued`; land the first PR in order (queue-next,
+// Linear-Priority 1..4 with 0/missing = 3, time queued, number):
 //   head == gated sha -> rebase in <main checkout>-lander -> unchanged? -> setup + affectedGate
-//   (one retry) -> re-check -> push --force-with-lease -> re-check -> merge pinned -> release.
+//   (one retry) -> re-check -> push --force-with-lease -> re-check -> final base check -> merge
+//   pinned -> release.
 // "Unchanged" = no conflict, every commit `=` in `git range-diff <old base>..<gated>
 // <new base>..<rebased>`, and the rebased diff touches no path the gated diff did not.
 // The re-checks re-read the PR's labels and head and the pause flag right before the push and
 // right before the merge: queue-hold or a pause aborts without a merge (the PR goes back to
-// `queued`), a changed head bounces. Anything else that fails bounces the PR: queued/landing ->
-// queue-blocked, one comment with the reason, and a `Bounced:` line in its `## Landing` section.
+// `queued`, keeping queue-hold), a changed head bounces. The final base check refetches the base
+// immediately before the merge; if it moved, the rebase and validation run again (at most 3
+// times, then a bounce). An error mid-landing also puts the PR back to `queued`: `landing` is
+// never left behind. Anything else that fails bounces the PR: queued/landing -> queue-blocked,
+// one comment with the reason, and a `Bounced:` line in its `## Landing` section. The third bounce
+// (after two automatic fix attempts) parks it: the comment starts with `PARKED:`.
 // A red wide sweep (every sweepEveryMerges merges) sets AGENT_LANDING_PAUSED=1; `unpause` reruns
 // the sweep on the base and clears the flag only when it is green.
 // A stale lock (older than its ttl) is reported, and reclaimed only with --reclaim-stale.
 // Output (--json): one report per repo
-//   {repo, merged:[{pr,sha,mergeSha,rebased}], bounced:[{pr,reason,attempt}], admitted:[n],
-//    aborted:[{pr,reason}], queued, held:[n], waiting:[{pr,dependsOn}], queueWaiting:[n],
+//   {repo, merged:[{pr,sha,mergeSha,rebased}], bounced:[{pr,reason,attempt,parked}], admitted:[n],
+//    aborted:[{pr,reason}], reset:[n], queued, held:[n], waiting:[{pr,dependsOn}], queueWaiting:[n],
 //    stale:[{host,pid,ageMin}], busy, paused, alerts:[...], sweep}
 // Exit: 0 when every repo was processed (bounces included), 1 on an error, 2 on bad usage.
 import fs from 'node:fs';
@@ -37,6 +44,7 @@ import {
 const USAGE = 'usage: node land-queue.mjs <run|status|unpause> [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]';
 const MAX_PRS_PER_RUN = 50;
 const MAX_BASE_RETRIES = 3;
+const MAX_AUTO_FIXES = 2;
 
 // ---------------------------------------------------------------- lander checkout
 
@@ -89,16 +97,24 @@ function bounce(gh, pr, reason, tail = []) {
   gh.prEdit(pr.number, { body });
   pr.body = body;
   setLabels(gh, pr, { add: ['queue-blocked'], remove: ['queued', 'landing', 'queue-waiting'] });
-  const lines = [
-    BOUNCE_MARKER,
-    `**Land queue bounced this PR** (attempt ${attempt}): ${scrub(reason)}`,
-    '',
-    'Fix it on the branch, run the gate and the review on the new head, then run `land-pr <n> --sha <new head>` again.',
-  ];
+  // Two automatic fix attempts (after bounces 1 and 2); the third bounce parks it for the owner.
+  const parked = attempt > MAX_AUTO_FIXES;
+  const lines = parked
+    ? [
+      `PARKED: the land queue bounced this PR ${attempt} times; the last reason: ${scrub(reason)}`,
+      '',
+      `No more automatic fixes (${MAX_AUTO_FIXES} attempts used). The owner or \`full-send\` decides the next step; after a fix, re-gate, re-review and run \`land-pr <n> --sha <new head>\`.`,
+    ]
+    : [
+      `**Land queue bounced this PR** (attempt ${attempt} of ${MAX_AUTO_FIXES} automatic fixes): ${scrub(reason)}`,
+      '',
+      'Fix it on the branch, run the gate and the review on the new head, then run `land-pr <n> --sha <new head>` again.',
+    ];
   const t = tail.map(scrub).filter((l) => l.trim()).slice(-20);
   if (t.length) lines.push('', `Last ${t.length} lines of output:`, '', '```text', ...t.map((l) => l.replace(/```/g, "'''")), '```');
+  lines.push('', BOUNCE_MARKER);
   gh.prComment(pr.number, `${lines.join('\n')}\n`);
-  return { pr: pr.number, reason: scrub(reason), attempt };
+  return { pr: pr.number, reason: scrub(reason), attempt, parked };
 }
 
 // ---------------------------------------------------------------- one PR
@@ -117,7 +133,10 @@ function recheck(gh, pr, expectHead) {
 
 // Handle a failed re-check: queue-hold or pause -> back to queued, no merge; head -> bounce.
 function onRecheck(gh, pr, r, stage) {
-  if (r.stop) return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}` } };
+  if (r.stop) {
+    setLabels(gh, pr, { remove: ['landing'] });
+    return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}` } };
+  }
   if (r.hold) {
     setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
     return { aborted: { pr: pr.number, reason: `${r.hold} before ${stage}` }, paused: Boolean(r.paused) };
@@ -198,11 +217,12 @@ async function landOne(ctx, pr) {
     if (seen.headRefOid !== landSha) return { retry: true, note: 'GitHub has not seen the pushed head yet' };
   }
 
-  // Right before the merge: the base is still an ancestor, nothing held, paused or pushed.
-  fetchBranch(dir, base);
-  if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
+  // Right before the merge: nothing held, paused or pushed; then the final base check (a moved
+  // base means the caller redoes the rebase and validation).
   const pre = recheck(gh, pr, landSha);
   if (pre) return onRecheck(gh, pr, pre, 'the merge');
+  fetchBranch(dir, base);
+  if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
   const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha });
   if (!m.ok) return { bounced: bounce(gh, pr, `merge failed: ${m.message}`) };
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
@@ -280,22 +300,19 @@ async function runRepo(t, opts) {
   const ctx = context(t);
   const { gh, cfg } = ctx;
   const report = {
-    repo: t.repo, merged: [], bounced: [], admitted: [], aborted: [], queued: 0, held: [], waiting: [], queueWaiting: [],
+    repo: t.repo, merged: [], bounced: [], admitted: [], aborted: [], reset: [], queued: 0, held: [], waiting: [], queueWaiting: [],
     stale: [], busy: false, paused: false, alerts: [], sweep: null,
   };
-  const retries = new Map();
   if (!opts.dryRun) gh.ensureLabels();
   for (let i = 0; i < MAX_PRS_PER_RUN; i++) {
     if (gh.isPaused()) { report.paused = true; break; }
     if (!opts.dryRun) admitWaiting(ctx, report);
-    const q = fillQueueState(gh, report);
+    let q = fillQueueState(gh, report);
     if (!q.eligible.length) break;
     if (opts.dryRun) { report.plan = q.eligible.map((p) => p.number); break; }
 
-    const pr = q.eligible[0];
-    const base = pr.baseRefName || cfg.base;
-    fetchBranch(ctx.root, base);
-    const got = ctx.lock.acquire(baseTreeOf(ctx.root, `refs/remotes/origin/${base}`));
+    fetchBranch(ctx.root, cfg.base);
+    const got = ctx.lock.acquire(baseTreeOf(ctx.root, `refs/remotes/origin/${cfg.base}`));
     if (!got.held) {
       const h = got.holder ? { host: got.holder.host, pid: got.holder.pid, ageMin: got.holder.ageMin } : null;
       if (got.stale && opts.reclaimStale && ctx.lock.reclaim(got.holder)) {
@@ -306,9 +323,28 @@ async function runRepo(t, opts) {
       }
     }
     let res;
+    let pr = null;
     try {
-      res = await landOne(ctx, pr);
+      // Holding the lock, nothing can be landing: a `landing` label is left over from a crash.
+      for (const p of listQueue(gh)) {
+        if (labelNames(p).includes('landing')) { setLabels(gh, p, { add: ['queued'], remove: ['landing'] }); report.reset.push(p.number); }
+      }
+      q = fillQueueState(gh, report);
+      if (!q.eligible.length) break;
+      pr = q.eligible[0];
+      const base = pr.baseRefName || cfg.base;
+      // If the base moves before the merge, redo the rebase and validation (bounded).
+      for (let k = 1; ; k++) {
+        res = await landOne(ctx, pr);
+        if (!res.retry) break;
+        if (k >= MAX_BASE_RETRIES) { res = { bounced: bounce(gh, pr, `could not land after ${k} tries: ${res.note}`) }; break; }
+        pr = gh.prView(pr.number);
+      }
       if (res.merged) await wideSweep(ctx, report, base);
+    } catch (e) {
+      // Never leave `landing` behind.
+      if (pr) { try { setLabels(gh, gh.prView(pr.number), { add: ['queued'], remove: ['landing'] }); } catch { /* reported below */ } }
+      throw e;
     } finally {
       ctx.lock.release();
     }
@@ -317,10 +353,6 @@ async function runRepo(t, opts) {
     else if (res.aborted) {
       report.aborted.push(res.aborted);
       if (res.paused) { report.paused = true; break; }
-    } else if (res.retry) {
-      const k = (retries.get(pr.number) || 0) + 1;
-      retries.set(pr.number, k);
-      if (k >= MAX_BASE_RETRIES) report.bounced.push(bounce(gh, pr, `could not land after ${k} tries: ${res.note}`));
     }
     if (report.paused) break;
   }
@@ -372,7 +404,8 @@ function runText(r) {
   const parts = [`${r.repo}: merged ${r.merged.length}, bounced ${r.bounced.length}, queued ${r.queued}, held ${r.held.length}, waiting for capacity ${r.queueWaiting.length}`];
   if (r.paused) parts.push('  PAUSED (AGENT_LANDING_PAUSED=1): nothing merges until land-queue unpause');
   for (const m of r.merged) parts.push(`  MERGED #${m.pr} ${m.mergeSha || m.sha}${m.rebased ? ' (lander rebase)' : ''}`);
-  for (const b of r.bounced) parts.push(`  BOUNCED #${b.pr} attempt ${b.attempt}: ${b.reason}`);
+  for (const b of r.bounced) parts.push(`  ${b.parked ? 'PARKED' : 'BOUNCED'} #${b.pr} attempt ${b.attempt}: ${b.reason}`);
+  if (r.reset.length) parts.push(`  reset leftover landing: ${r.reset.map((n) => `#${n}`).join(' ')}`);
   for (const a of r.aborted) parts.push(`  ABORTED #${a.pr}: ${a.reason}`);
   if (r.admitted.length) parts.push(`  admitted ${r.admitted.map((n) => `#${n}`).join(' ')}`);
   for (const s of r.stale) parts.push(`  STALE lock: ${s?.host} pid ${s?.pid}, ${s?.ageMin} min (rerun with --reclaim-stale once the holder is gone)`);

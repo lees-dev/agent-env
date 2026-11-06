@@ -69,6 +69,14 @@ function pr(sub, rest) {
     p.labels = [...new Set([...(p.labels || []).filter((l) => !remove.includes(l)), ...add])];
     if (o['body-file'] === '-') p.body = readStdin();
     // Test hook: queue-hold appears right after the lander records its rebase gate line.
+    // Test hook: the base moves once, right after the lander records its rebase gate line.
+    if (s.advanceBaseAfterLanderGate === p.number && /lander rebase/.test(p.body || '')) {
+      delete s.advanceBaseAfterLanderGate;
+      const base = p.baseRefName || 'main';
+      const cur = git('rev-parse', `refs/heads/${base}`).out;
+      const c = spawnSync('git', ['-C', BARE, 'commit-tree', `${cur}^{tree}`, '-p', cur, '-m', 'base moved'], { encoding: 'utf8', shell: false }).stdout.trim();
+      git('update-ref', `refs/heads/${base}`, c, cur);
+    }
     if (s.holdAfterLanderGate === p.number && /\(lander rebase\)/.test(p.body || '')) p.labels.push('queue-hold');
     log(s, { cmd: 'pr edit', pr: p.number, add, remove, body: o['body-file'] === '-' });
     save(s);

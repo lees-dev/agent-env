@@ -5,7 +5,7 @@ description: The lander. Run by each repo's T3 `land-queue` schedule (or `run_sc
 
 # Land queue (the lander)
 
-You are the repo's lander. The landing rules live in the `pr-workflow` skill, section 4 ("Open and land" and "The land queue"); this skill is how the lander carries them out. Mechanical work: do not edit code yourself, do not merge by any other means, do not change labels the script owns.
+You are the repo's lander. The landing rules live in the `pr-workflow` skill, section 4 ("Open and land", "The land queue", "Editing a queued PR"); where this skill and that section differ, section 4 wins. This skill is how the lander carries them out. The work is mechanical: do not edit code yourself, do not merge by any other means, and do not change labels the script owns.
 
 ## 1. Run it
 
@@ -14,33 +14,52 @@ node ~/.agents/bin/land-queue.mjs run --json            # this repo (run from it
 node ~/.agents/bin/land-queue.mjs run --all --json      # every repo in ~/.agents/state/repos.json
 ```
 
-The script works one repo at a time under the repo lock (`refs/heads/agent-landing-lock`) and one PR at a time:
+The script works one repo at a time, one PR at a time, under the repo lock (`refs/heads/agent-landing-lock`):
 
 - stops when the repo is paused (`AGENT_LANDING_PAUSED=1`);
 - admits the oldest `queue-waiting` PRs while `queued` + `landing` < 5 (a waiting PR whose head moved is bounced);
-- order: `queue-next`, then `Linear-Priority:` (1 Urgent .. 4 Low; 0 or missing = 3), then time queued; skips `queue-hold` and unmerged `Depends-on: #n`;
-- checks head == gated sha, rebases in `<main checkout>-lander`, and treats the rebase as unchanged only when every commit is `=` in `git range-diff <base_old>..<gated> <base_new>..<rebased>`, there was no conflict, and the rebased diff touches no new path;
-- runs the repo's `affectedGate` (one retry), re-reads labels, head and pause flag, pushes `--force-with-lease`, appends `Gate: pass @ <newsha> (lander rebase)`, re-reads them again, merges `--match-head-commit <newsha>`;
-- anything else bounces the PR to `queue-blocked` with one comment and a `Bounced:` line (the attempt number);
+- takes the lock, then resets any leftover `landing` PR (a crashed run) to `queued`;
+- order: `queue-next`, then `Linear-Priority:` (1 Urgent, 2 High, 3 Medium, 4 Low; 0 or missing = 3; ascending), then time queued; skips `queue-hold` and unmerged `Depends-on: #n`;
+- checks the head still equals the gated sha, rebases in `<main checkout>-lander`, and treats the rebase as unchanged only when every commit is `=` in `git range-diff <base_old>..<gated> <base_new>..<rebased>`, there was no conflict, and the rebased diff touches no new path;
+- runs the repo's `affectedGate` (one retry); re-reads labels, head and pause flag; pushes `--force-with-lease`; appends `Gate: pass @ <newsha> (lander rebase)`; re-reads them again; refetches and requires `git merge-base --is-ancestor origin/<base> <newsha>` (if the base moved it redoes the rebase and validation, at most three times, then bounces); merges `--match-head-commit <newsha>`;
+- on any abort (hold, pause, head change, crash) puts `queued` back, keeping `queue-hold`, and never leaves `landing` behind;
+- anything else bounces the PR to `queue-blocked` with one comment and a `Bounced:` line (the attempt number); the third bounce, after two automatic fix attempts, posts a comment starting `PARKED:`;
 - every `sweepEveryMerges` merges runs the repo's wide sweep on the base; red sets the repo pause.
 
-Use `land-queue status --json` to look without changing anything, and `run --dry-run --json` for the plan.
+`land-queue status --json` looks without changing anything; `run --dry-run --json` shows the plan.
 
 ## 2. Act on the report
 
-Each repo report has `merged`, `bounced`, `aborted`, `admitted`, `queued`, `held`, `waiting`, `queueWaiting`, `stale`, `busy`, `paused`, `alerts`, `sweep`.
+Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted`, `admitted`, `reset`, `queued`, `held`, `waiting`, `queueWaiting`, `stale`, `busy`, `paused`, `alerts`, `sweep`.
 
-- **merged**: mark each PR's Linear ticket Done with the merge sha; clean up per `pr-workflow` section 7 (the worktree teardown does most of it).
-- **bounced** with `attempt` 1 or 2: move the Linear ticket back to In Progress with the reason, then start an Opus fixer (`subagent-routing`): in this project `delegate_task` with `isolation: "worktree"`; for another repo `t3_thread_launch` with a worktree. Brief it with the PR, the bounce reason and `pr-workflow` "Editing a queued PR": add `queue-hold`, confirm no `landing`, fix on the PR branch, run the affected gate, get one cross-family review of the fix (for a conflict, of the resolution), remove `queue-hold`, then `land-pr <n> --sha <new gated sha>`. Never push to a PR labelled `landing`.
-- **bounced** with `attempt` 3 or more: park it. Leave `queue-blocked`, comment that it needs the owner, note it on the Linear ticket. No more automatic fixers.
-- **aborted**: `queue-hold` or a pause appeared mid-landing. Nothing to do; the PR stays `queued`.
-- **stale**: the lock is older than its ttl. Check the holder (`host`, `pid`) is gone: same machine, no such process, no lander thread running. Only then rerun with `--reclaim-stale`. Otherwise report it.
+- **merged**: mark each PR's Linear ticket Done with the merge sha; clean up per `pr-workflow` section 7 (worktree teardown does most of it).
+- **bounced**, not parked: move the Linear ticket back to In Progress with the reason. Start an Opus fixer (`subagent-routing`): in this project `delegate_task` with `isolation: "worktree"`; for another repo `t3_thread_launch` with a worktree. Brief it with the PR, the bounce reason, and `pr-workflow` "Editing a queued PR":
+  1. `node ~/.agents/bin/land-pr.mjs hold <n>` (adds `queue-hold` and `Hold-By: <holder> <ISO time>`; it refuses if `queue-hold` is already set or the PR is `landing`: then report and stop);
+  2. fix on the PR branch, push, run the affected gate;
+  3. one cross-family reviewer checks the fix (for a conflict, the resolution), started the same way;
+  4. `node ~/.agents/bin/land-pr.mjs <n> --sha <new gated sha> --release-hold` (records the new gated sha and removes only its own hold, in one edit; the PR goes back in line).
+  If no fixer can be started, report that for `full-send` or the owner.
+- **bounced** and **parked** (`PARKED:` comment posted): start no fixer. Note it on the Linear ticket; `full-send` and the owner act on it.
+- **aborted**: `queue-hold` or a pause appeared mid-landing. Nothing to do; the PR is `queued` again.
+- **reset**: a crashed run left `landing`; it is `queued` again. Mention it.
+- **stale**: the lock is older than its ttl. Confirm the holder (`host`, `pid`) is gone: same machine, no such process, no lander thread running. Only then rerun with `--reclaim-stale`. Otherwise report it. Only the lander reclaims a stale lock.
 - **busy**: another lander holds the lock. Stop; the next run picks up.
-- **paused** or a sweep alert: open a LEE ticket for the red sweep on the base, with the failing command and the alert text. Do not land anything. When a fix is on the base, `node ~/.agents/bin/land-queue.mjs unpause` reruns the sweep and clears the pause only if it is green; the owner may also clear it.
+- **paused** or a sweep alert: open a LEE ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node ~/.agents/bin/land-queue.mjs unpause` reruns the sweep and clears the pause only when it is green; the owner may also clear it.
 - **error** on a repo: report the message; do not retry in a loop.
 
-Never remove `queue-hold` (only whoever set it may; the owner may clear any), never add `queue-next` (owner only), never `gh pr merge` a PR with a queue label.
+## 3. Labels
 
-## 3. Report
+| Label | Set by | Cleared by |
+| --- | --- | --- |
+| `queued` | `land-pr`; the lander (admitting a `queue-waiting` PR, or after an abort) | the lander, `full-stop` |
+| `landing` | the lander | the lander |
+| `queue-blocked` | the lander | the lander, or `land-pr` re-landing it |
+| `queue-hold` | the owner, `full-stop`, or an agent editing a queued PR (`land-pr hold`) | only whoever set it (`--release-hold`); the owner may clear any |
+| `queue-next` | the owner | the owner (`full-stop` may remove it only while setting `queue-hold`) |
+| `queue-waiting` | `land-pr` | the lander (admission), `land-pr`, `full-stop` |
 
-One line per repo, counts only: merged, bounced (fixers started, parked), aborted, admitted, still queued, waiting for room, held, and any stale lock, pause or alert. No secrets, no log dumps.
+Never remove a `queue-hold` you did not set, never add `queue-next`, never `gh pr merge` a PR with a queue label.
+
+## 4. Report
+
+One line per repo, counts only: merged, bounced (fixers started, parked), aborted, reset, admitted, still queued, waiting for room, held, and any stale lock, pause or alert. No secrets, no log dumps.
