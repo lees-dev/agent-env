@@ -1,5 +1,6 @@
 .agents/bin/agent-secret.mjs
 .agents/bin/agent-worktree.mjs
+.agents/bin/lib/hook-runner.mjs
 .agents/bin/lib/ledger.mjs
 .agents/bin/lib/op.mjs
 .agents/bin/lib/proc.mjs
