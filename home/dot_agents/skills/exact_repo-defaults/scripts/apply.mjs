@@ -49,7 +49,26 @@ function readOwned(p) {
 function eolOf(text) { return /\r\n/.test(text) ? '\r\n' : '\n'; }
 function withEol(text, eol) { return eol === '\n' ? text : text.replace(/\r?\n/g, eol); }
 function asset(name) { return fs.readFileSync(path.join(ASSETS, name), 'utf8').replace(/\r\n/g, '\n'); }
-function writeFile(p, text) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, text); }
+// Write without ever leaving a half-written file: the text goes to a temp file next to the real
+// target, which then replaces it in one rename (mode kept). A link stays a link: its target is
+// what gets written, as a plain write through the link would.
+function writeFile(p, text) {
+  let target = p;
+  try {
+    if (fs.lstatSync(p).isSymbolicLink()) target = path.resolve(path.dirname(p), fs.readlinkSync(p));
+  } catch { /* p does not exist yet */ }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let mode;
+  try { mode = fs.statSync(target).mode & 0o777; } catch { mode = undefined; }
+  const tmp = `${target}.repo-defaults-${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, text, mode === undefined ? undefined : { mode });
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* never created */ }
+    throw e;
+  }
+}
 function json(text) { try { return { ok: true, value: JSON.parse(text) }; } catch (e) { return { ok: false, error: e.message }; } }
 // A JSON object (not null, not an array, not a scalar).
 function jsonObject(text) {
@@ -92,7 +111,7 @@ function agentsBlock(root) {
   if (!blocks.length) {
     return {
       name: 'AGENTS.md block', status: 'missing', detail: 'no managed block',
-      fix: () => { fs.writeFileSync(p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
+      fix: () => { writeFile(p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
     };
   }
   const found = blocks.map((b) => `v${b[1]}`).join(', ');
@@ -106,7 +125,7 @@ function agentsBlock(root) {
     fix: () => {
       // Replace exactly the block's span; every other byte of the file stays as it was.
       const b = blocks[0];
-      fs.writeFileSync(p, `${text.slice(0, b.index)}${withEol(BLOCK, eol)}${text.slice(b.index + b[0].length)}`);
+      writeFile(p, `${text.slice(0, b.index)}${withEol(BLOCK, eol)}${text.slice(b.index + b[0].length)}`);
       return `refreshed the block in AGENTS.md (was ${found})`;
     },
   };
@@ -128,7 +147,7 @@ function claudeMd(root) {
   const eol = eolOf(text);
   return {
     name: 'CLAUDE.md', status: 'missing', detail: 'does not import @AGENTS.md',
-    fix: () => { fs.writeFileSync(p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
+    fix: () => { writeFile(p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
   };
 }
 
@@ -171,7 +190,7 @@ function t3Json(root) {
         return c;
       });
       const out = { ...cur, defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, ...others] };
-      fs.writeFileSync(p, `${JSON.stringify(out, null, 2)}\n`);
+      writeFile(p, `${JSON.stringify(out, null, 2)}\n`);
       const kept = scripts.filter((s) => !isCanonical(s));
       const demoted = kept.filter((s) => s.runOnWorktreeCreate || s.runOnSettle).length;
       const custom = kept.filter((s) => isSetup(s) || isTeardown(s)).length;
@@ -256,7 +275,7 @@ function repoJson(root) {
       fix: () => {
         const out = { ...cur };
         for (const k of missing) out[k] = tmpl[k];
-        fs.writeFileSync(p, `${JSON.stringify(out, null, 2)}\n`);
+        writeFile(p, `${JSON.stringify(out, null, 2)}\n`);
         return `added ${missing.length} key(s) to .agents/repo.json`;
       },
     };
@@ -284,7 +303,7 @@ function gitignore(root) {
       const text = current;
       const eol = text ? eolOf(text) : '\n';
       const sep = text && !text.endsWith('\n') ? eol : '';
-      fs.writeFileSync(p, `${text}${sep}${text ? eol : ''}# agent-standard: secrets injected from 1Password (repo-defaults)${eol}${missing.join(eol)}${eol}`);
+      writeFile(p, `${text}${sep}${text ? eol : ''}# agent-standard: secrets injected from 1Password (repo-defaults)${eol}${missing.join(eol)}${eol}`);
       return `added ${missing.length} line(s) to .gitignore`;
     },
   };
@@ -338,7 +357,10 @@ function envFiles(root) {
   const op = readText(path.join(root, '.env.op'));
   const refs = op ? op.split(/\r?\n/).filter((l) => /=\s*["']?op:\/\//.test(l)) : [];
   const foreign = refs.filter((l) => !/op:\/\/agent-repos\//.test(l)).length;
-  return { envOp: op === null ? null : { refs: refs.length, foreignVaultRefs: foreign }, files: out };
+  // `.env.op` must be committed. A broad rule (for example `.env*`) would make a new one
+  // silently left out of `git add`; a tracked one is committed whatever the rules say.
+  const envOpIgnored = !tracked('.env.op') && git(['check-ignore', '-q', '--no-index', '--', '.env.op'], root).ok;
+  return { envOp: op === null ? null : { refs: refs.length, foreignVaultRefs: foreign }, envOpIgnored, files: out };
 }
 
 // Workflows that run on pull requests or the merge queue gate PRs; release/deploy ones do not.
@@ -412,13 +434,18 @@ function main() {
 
   let ev = evaluate(root, { offline });
   const actions = [];
+  const failed = [];
   if (mode === 'apply') {
-    for (const it of ev.items) if (DRIFT.has(it.status) && it.fix) actions.push(it.fix());
+    // A fix that fails is recorded and the others still run; every fix done is reported.
+    for (const it of ev.items) {
+      if (!DRIFT.has(it.status) || !it.fix) continue;
+      try { actions.push(it.fix()); } catch (e) { failed.push({ name: it.name, error: e.code || String(e.message || e).split('\n')[0] }); }
+    }
     ev = evaluate(root, { offline });
   }
   const drift = ev.items.filter((i) => DRIFT.has(i.status));
   const result = {
-    mode, root, standard: `agent-standard v${BLOCK_VERSION}`, actions,
+    mode, root, standard: `agent-standard v${BLOCK_VERSION}`, actions, failed,
     items: ev.items.map(({ name, status, detail }) => ({ name, status, detail })),
     drift: drift.length, todo: ev.todo?.detail || null,
     detection: ev.detection, env: ev.env, gatingWorkflows: ev.workflows, rulesets: ev.rulesets,
@@ -427,8 +454,10 @@ function main() {
   else {
     const L = [];
     for (const a of actions) L.push(`APPLIED ${a}`);
+    for (const f of failed) L.push(`FAILED ${f.name}: ${f.error}`);
     for (const i of result.items) L.push(`${i.status === 'ok' ? 'OK   ' : 'DRIFT'} ${i.name}: ${i.detail}`);
     if (ev.todo) L.push(`WARN  ${ev.todo.name}: ${ev.todo.detail}`);
+    if (ev.env.envOpIgnored) L.push('WARN  .env.op would be ignored by a .gitignore rule: add `!.env.op` to .gitignore so it is committed');
     if (mode !== 'check') {
       for (const e of ev.env.files) {
         const tracked = e.tracked && e.role !== 'template' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
@@ -445,8 +474,19 @@ function main() {
     process.stdout.write(`${L.join('\n')}\n`);
   }
   if (mode === 'check') return drift.length ? 1 : 0;
-  if (mode === 'apply') return drift.length ? 1 : 0;
+  if (mode === 'apply') return drift.length || failed.length ? 1 : 0;
   return 0;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exitCode = main();
+// Run main() only when started directly. Both sides are resolved through links: run through a
+// skill link (~/.claude/skills/<name> is a junction or symlink), argv[1] is the link path while
+// import.meta.url is the real file.
+function startedDirectly() {
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (startedDirectly()) process.exitCode = main();

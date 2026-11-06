@@ -47,12 +47,21 @@ function sh(cwd, env, ...args) {
 // 1Password token, and can change the fake GitHub mid-landing (LAND_TEST_GATE_ACTION):
 // hold, pause, move (push to the PR branch), dep (add an unmerged Depends-on), retarget (base
 // becomes "other"), steal (another lander replaces the landing lock; its sha goes to <gate>.stolen).
-// LAND_TEST_GATE_SLEEP_MS keeps it running (for the lock refresh ticks).
+// LAND_TEST_GATE_SLEEP_MS keeps it running (for the lock refresh ticks). It always prints a
+// secret-shaped line that no scrub pattern matches (it must never reach a PR comment).
+// LAND_TEST_GATE_HANG=1 starts a child that sleeps for ten minutes (its pid goes to
+// <gate>.child) and then never exits itself.
 const GATE = `import fs from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 const f = process.env.LAND_TEST_GATE;
 if (f) fs.appendFileSync(f + '.runs', 'x');
+console.log('debug: config value plainword-SHOULD-NOT-LEAK-7f3a');
 if (process.env.OP_SERVICE_ACCOUNT_TOKEN) { console.log('token leaked into the gate'); process.exit(1); }
+if (process.env.LAND_TEST_GATE_HANG === '1') {
+  const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore' });
+  fs.writeFileSync(f + '.child', String(c.pid));
+  setInterval(() => {}, 1000);
+} else {
 const g = (...a) => spawnSync('git', ['-C', process.env.FAKE_GH_BARE, ...a], { encoding: 'utf8' }).stdout.trim();
 const [act, n] = (process.env.LAND_TEST_GATE_ACTION || '').split(':');
 if (act) {
@@ -79,8 +88,18 @@ if (act) {
 const wait = Number(process.env.LAND_TEST_GATE_SLEEP_MS || 0);
 if (wait) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
 process.exit(f && fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes('fail') ? 1 : 0);
+}
 `;
-const SWEEP = `process.exit(process.env.LAND_TEST_SWEEP === 'fail' ? 1 : 0);\n`;
+// The wide sweep: LAND_TEST_SWEEP=fail exits 1; =steal replaces the landing lock (another
+// lander) and exits 0 at once, before any lock refresh.
+const SWEEP = `import { spawnSync } from 'node:child_process';
+if (process.env.LAND_TEST_SWEEP === 'steal') {
+  const g = (...a) => spawnSync('git', ['-C', process.env.FAKE_GH_BARE, ...a], { encoding: 'utf8' }).stdout.trim();
+  const lock = 'refs/heads/agent-landing-lock';
+  g('update-ref', lock, g('commit-tree', g('rev-parse', lock + '^{tree}'), '-m', 'agent-landing-lock host=other pid=1 at=' + new Date().toISOString() + ' ttl=45'));
+}
+process.exit(process.env.LAND_TEST_SWEEP === 'fail' ? 1 : 0);
+`;
 
 function setup(repoJson = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land test '));
@@ -174,7 +193,9 @@ function setLock(t, minutesAgo) {
 const lockExists = (t) => spawnSync('git', ['-C', t.bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/agent-landing-lock'], { env: t.env }).status === 0;
 
 function tool(t, script, ...args) {
-  const r = spawnSync(process.execPath, [script, ...args], { cwd: t.cwd || t.work, env: t.env, encoding: 'utf8', shell: false });
+  // A hung tool fails its test after five minutes instead of stalling the suite.
+  const r = spawnSync(process.execPath, [script, ...args], { cwd: t.cwd || t.work, env: t.env, encoding: 'utf8', shell: false, timeout: 300000 });
+  if (r.error) return { status: null, out: '', err: String(r.error.message) };
   return { status: r.status, out: r.stdout.trim(), err: r.stderr.trim() };
 }
 
@@ -797,16 +818,37 @@ describe('land-queue', () => {
     assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head);
   });
 
-  test('run: a red affected gate is retried once, then bounced with a scrubbed tail', () => {
+  test('run: a red affected gate is retried once, then bounced; no gate output reaches the PR or the report', () => {
     const t = setup();
     queuePr(t, 1);
     advanceMain(t, 'other.txt', 'x\n');
     fs.writeFileSync(t.env.LAND_TEST_GATE, 'fail');
-    const rep = runQueue(t);
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const rep = JSON.parse(r.out);
     assert.equal(rep.merged.length, 0);
-    assert.match(rep.bounced[0].reason, /affected gate failed/);
+    assert.match(rep.bounced[0].reason, /affected gate failed: affectedGate\[0\] `node scripts\/gate\.mjs` exit 1/);
     assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 2);
     assert.equal(prOf(t, 1).state, 'OPEN');
+    const comments = state(t).comments.map((c) => c.body).join('\n');
+    assert.doesNotMatch(comments, /SHOULD-NOT-LEAK/);
+    assert.doesNotMatch(`${r.out}\n${r.err}`, /SHOULD-NOT-LEAK/);
+  });
+
+  test('run: a gate that hangs is stopped at the command timeout, with its child processes', { timeout: 180000 }, () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '3000' });
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0);
+    assert.match(rep.bounced[0].reason, /timed out after/);
+    assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 1, 'a timed-out gate is not retried');
+    const child = Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}.child`, 'utf8'));
+    let alive = true;
+    try { process.kill(child, 0); } catch { alive = false; }
+    assert.equal(alive, false, 'the gate\'s child process was stopped too');
+    assert.equal(lockExists(t), false);
   });
 
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {
@@ -1051,6 +1093,94 @@ describe('land-queue', () => {
     assert.doesNotMatch(sh(t.work, t.env, 'worktree', 'list', '--porcelain'), /land-queue lander checkout/, 'not locked by the lander');
     assert.deepEqual(prOf(t, 1).labels, ['queued']);
     assert.equal(lockExists(t), false);
+  });
+
+  test('run: an unlocked checkout at the lander path holding an ignored user file is refused intact', () => {
+    const t = setup();
+    fs.appendFileSync(path.join(t.work, '.git', 'info', 'exclude'), 'f1.txt\n');
+    // The PR tracks f1.txt (force-added past the exclude), and is behind the base.
+    sh(t.work, t.env, 'fetch', '--quiet', 'origin');
+    sh(t.work, t.env, 'checkout', '--quiet', '-B', 'agent/LEE-1-change', 'origin/main');
+    fs.writeFileSync(path.join(t.work, 'f1.txt'), 'pr bytes\n');
+    sh(t.work, t.env, 'add', '-f', 'f1.txt');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'f1');
+    sh(t.work, t.env, 'push', '--quiet', '-f', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+    const head = sh(t.work, t.env, 'rev-parse', 'HEAD');
+    const s = state(t);
+    s.prs.push({ number: 1, title: 'f1', headRefName: 'agent/LEE-1-change', baseRefName: 'main', state: 'OPEN', labels: ['queued'], body: writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z' }) });
+    saveState(t, s);
+    advanceMain(t, 'other.txt', 'x\n');
+    const dir = `${t.work}-lander`;
+    sh(t.work, t.env, 'worktree', 'add', '--quiet', '--detach', dir, 'origin/main');
+    fs.writeFileSync(path.join(dir, 'f1.txt'), 'user bytes\n');
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1, r.out);
+    assert.match(JSON.parse(r.out).error, /refusing to use .* ignored file/);
+    assert.equal(fs.readFileSync(path.join(dir, 'f1.txt'), 'utf8'), 'user bytes\n');
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+  });
+
+  test('run: an unlocked checkout at the lander path with a rebase in progress is refused, its rebase kept', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const dir = `${t.work}-lander`;
+    sh(t.work, t.env, 'worktree', 'add', '--quiet', '--detach', dir, 'origin/main');
+    // A user's rebase that stopped (its exec step failed); the work tree itself is clean.
+    spawnSync('git', ['-C', dir, 'rebase', '--exec', 'git rev-parse --verify --quiet refs/heads/no-such-branch', 'HEAD~1'], { env: t.env, encoding: 'utf8' });
+    const gitDir = sh(dir, t.env, 'rev-parse', '--absolute-git-dir');
+    assert.ok(fs.existsSync(path.join(gitDir, 'rebase-merge')), 'fixture: a rebase is in progress');
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1, r.out);
+    assert.match(JSON.parse(r.out).error, /refusing to use .* in progress/);
+    assert.ok(fs.existsSync(path.join(gitDir, 'rebase-merge')), 'the user\'s rebase is still there');
+  });
+
+  test('run: a leftover rebase-apply in the lander\'s own checkout is cleared before landing', () => {
+    const t = setup();
+    queuePr(t, 1);
+    runQueue(t);
+    const dir = `${t.work}-lander`;
+    // Leave the lander's own checkout in a stopped apply-backend rebase (a conflict).
+    sh(dir, t.env, 'checkout', '--quiet', '--detach', 'origin/main');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'lander side\n');
+    sh(dir, t.env, 'commit', '--quiet', '-am', 'conflicting');
+    advanceMain(t, 'README.md', 'main side\n');
+    sh(dir, t.env, 'fetch', '--quiet', 'origin');
+    spawnSync('git', ['-C', dir, '-c', 'rebase.backend=apply', 'rebase', 'origin/main'], { env: t.env, encoding: 'utf8' });
+    const gitDir = sh(dir, t.env, 'rev-parse', '--absolute-git-dir');
+    assert.ok(fs.existsSync(path.join(gitDir, 'rebase-apply')), 'fixture: rebase-apply left behind');
+    queuePr(t, 2);
+    advanceMain(t, 'other.txt', 'x\n');
+    const rep = runQueue(t);
+    assert.deepEqual(rep.bounced, []);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [2]);
+  });
+
+  test('run: a sweep that loses the lock before any refresh stays due and stops the run', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1, { priority: 1 });
+    queuePr(t, 2, { priority: 2 });
+    t.env.LAND_TEST_SWEEP = 'steal';
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /lock was lost/);
+    assert.equal(rep.busy, false, 'stopped because the lock was lost, not because it was busy');
+    assert.deepEqual(prOf(t, 2).labels, ['queued']);
+    const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].sinceSweep, 1, 'still due');
+    assert.ok(lockExists(t), 'the other lander keeps its lock');
+  });
+
+  test('run: an idle overdue sweep that loses the lock stays due', () => {
+    const t = setup({ sweepEveryMerges: 2, wideSweep: 'node scripts/sweep.mjs' });
+    const dir = path.join(t.home, '.agents', 'state');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'land-queue.json'), JSON.stringify({ 'o/r': { merges: 3, sinceSweep: 3 } }));
+    t.env.LAND_TEST_SWEEP = 'steal';
+    const rep = runQueue(t);
+    assert.match(rep.alerts.join('\n'), /lock was lost/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 3);
   });
 
   test('run: the lander rebase runs repo hooks without the 1Password token', () => {

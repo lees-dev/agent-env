@@ -63,7 +63,9 @@ function repo(files = {}) {
 
 function run(r, ...args) {
   const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--offline', ...args], { env: r.e, encoding: 'utf8', shell: false });
-  return { status: p.status, out: p.stdout, err: p.stderr, json: args.includes('--json') ? JSON.parse(p.stdout) : null };
+  let json = null;
+  if (args.includes('--json')) { try { json = JSON.parse(p.stdout); } catch { json = null; } }
+  return { status: p.status, out: p.stdout, err: p.stderr, json };
 }
 
 const read = (r, f) => fs.readFileSync(path.join(r.work, f), 'utf8');
@@ -320,6 +322,52 @@ describe('repo-defaults apply.mjs', () => {
       fs.chmodSync(p, 0o644);
     }
     assert.equal(fs.readFileSync(p, 'utf8'), 'Owned rules.\n');
+  });
+
+  test('a fix that fails is reported with the fixes that were done; the rest still run', () => {
+    const r = repo({ 'docs/agents': 'a file where the docs/agents folder should be\n' });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1, a.err);
+    assert.ok(a.json, 'the report is still printed');
+    assert.ok(a.json.actions.some((x) => /AGENTS\.md/.test(x)), 'earlier fixes are reported');
+    assert.ok(a.json.actions.some((x) => /t3\.json/.test(x)), 'later fixes still ran');
+    assert.deepEqual(a.json.failed.map((f) => f.name), ['docs/agents/repo.md']);
+    assert.ok(read(r, 'AGENTS.md').startsWith(BLOCK));
+    assert.equal(read(r, 'docs/agents'), 'a file where the docs/agents folder should be\n');
+  });
+
+  test('an existing file is rewritten atomically; a link keeps pointing at its target', (t) => {
+    const old = '<!-- BEGIN agent-standard v0 -->\nold\n<!-- END agent-standard -->\n\nOwned.\n';
+    const r = repo({ 'docs/RULES.md': old });
+    try { fs.symlinkSync(path.join('docs', 'RULES.md'), path.join(r.work, 'AGENTS.md'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    assert.equal(run(r, '--apply').status, 0);
+    assert.ok(fs.lstatSync(path.join(r.work, 'AGENTS.md')).isSymbolicLink(), 'still a link');
+    assert.equal(read(r, 'docs/RULES.md'), `${BLOCK}\n\nOwned.\n`);
+    assert.deepEqual(fs.readdirSync(path.join(r.work, 'docs')).filter((f) => f.endsWith('.tmp')), [], 'no temp file left');
+  });
+
+  test('apply.mjs runs when started through a linked skill folder (junction or symlink)', () => {
+    const r = repo();
+    const link = path.join(path.dirname(r.work), 'linked skill');
+    fs.symlinkSync(SKILL, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const p = spawnSync(process.execPath, [path.join(link, 'scripts', 'apply.mjs'), '--repo', r.work, '--check'], { env: r.e, encoding: 'utf8', shell: false });
+    assert.equal(p.status, 1, 'drift found: main() ran');
+    assert.match(p.stdout, /repo-defaults: drift/);
+  });
+
+  test('an untracked .env.op that a broad rule would ignore is reported; a tracked one is not', () => {
+    const r = repo({ '.gitignore': '.env*\n' });
+    const i = run(r, '--inspect', '--json');
+    assert.equal(i.json.env.envOpIgnored, true);
+    assert.match(run(r, '--inspect').out, /WARN {2}\.env\.op would be ignored/);
+    assert.equal(read(r, '.gitignore'), '.env*\n', 'the repo .gitignore is not changed');
+    fs.writeFileSync(path.join(r.work, '.env.op'), 'A=op://agent-repos/sample-app-x-dev/A\n');
+    git(r.work, r.e, 'add', '-f', '.env.op');
+    git(r.work, r.e, 'commit', '--quiet', '-m', 'env.op');
+    assert.equal(run(r, '--inspect', '--json').json.env.envOpIgnored, false);
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

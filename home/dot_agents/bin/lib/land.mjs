@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
 import { captureToken, homeDir, stripToken } from './op.mjs';
-import { prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
+import { isWindows, prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
 import { baseBranch, canonKey, gitIdentity, loadConfig } from './repo.mjs';
 
 // Entry points call this first: OP_SERVICE_ACCOUNT_TOKEN leaves process.env, so no child (git
@@ -81,31 +81,63 @@ export function run(argv, { cwd, env = childEnv(), input } = {}) {
   return { status: r.status, stdout: r.stdout, stderr };
 }
 
-// Run asynchronously with stdin ignored, keeping only the last `tailLines` lines of output.
-// onTick runs every tickMs while the child runs (used to refresh the landing lock).
-export function runAsync(argv, { cwd, env = childEnv(), tailLines = 40, tickMs = 0, onTick } = {}) {
+// Run a repo command asynchronously. Its output is discarded, never kept: gate output can hold
+// secret values, and only an exit status leaves this function. onTick runs every tickMs while it
+// runs (the lock refresh). After timeoutMs the command and every process it started are stopped
+// (Unix: its own process group; Windows: taskkill /T on its process tree), and this resolves
+// only once the command has exited: { status, timedOut, stuck }.
+export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
     let prepared;
-    try { prepared = prepare(argv[0], argv.slice(1), { cwd, env }); } catch (e) { resolve({ status: 127, tail: [String(e.message)] }); return; }
+    try { prepared = prepare(argv[0], argv.slice(1), { cwd, env }); } catch { resolve({ status: 127, timedOut: false }); return; }
     const [file, args, options] = prepared;
-    const child = spawn(file, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
-    const tail = [];
-    let partial = '';
-    const take = (chunk) => {
-      const lines = (partial + chunk.toString('utf8')).split(/\r?\n/);
-      partial = lines.pop();
-      for (const l of lines) { tail.push(l); if (tail.length > tailLines) tail.shift(); }
+    const child = spawn(file, args, { ...options, stdio: 'ignore', detached: !isWindows });
+    let timedOut = false;
+    let stuck = false;
+    const timers = [];
+    if (tickMs > 0 && onTick) timers.push(setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs));
+    if (timeoutMs > 0) {
+      timers.push(setTimeout(() => {
+        timedOut = true;
+        killTree(child.pid, 'SIGTERM');
+        timers.push(setTimeout(() => killTree(child.pid, 'SIGKILL'), 3000));
+        // A tree that cannot be stopped is reported rather than waited on forever.
+        timers.push(setTimeout(() => { stuck = true; done(124); }, 30000));
+      }, timeoutMs));
+    }
+    let finished = false;
+    const done = (status) => {
+      if (finished) return;
+      finished = true;
+      for (const t of timers) { clearInterval(t); clearTimeout(t); }
+      // The command is gone; on Unix, anything left in its group goes with it.
+      if (!isWindows && timedOut) killTree(child.pid, 'SIGKILL');
+      resolve({ status, timedOut, stuck });
     };
-    child.stdout.on('data', take);
-    child.stderr.on('data', take);
-    const timer = tickMs > 0 && onTick ? setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs) : null;
-    child.on('error', (e) => { if (timer) clearInterval(timer); resolve({ status: 127, tail: [String(e.message)] }); });
-    child.on('close', (code) => {
-      if (timer) clearInterval(timer);
-      if (partial) { tail.push(partial); if (tail.length > tailLines) tail.shift(); }
-      resolve({ status: code ?? 1, tail });
-    });
+    child.on('error', () => done(127));
+    child.on('exit', (code, signal) => done(code ?? (signal ? 128 : 1)));
   });
+}
+
+// Stop a process and everything it started. Unix: the child leads its own process group
+// (spawned detached), so the group is signalled. Windows: taskkill /T /F on the tree.
+function killTree(pid, signal) {
+  if (!pid) return;
+  if (isWindows) {
+    const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
+    procRun(taskkill, ['/PID', String(pid), '/T', '/F'], { env: childEnv() });
+    return;
+  }
+  try { process.kill(-pid, signal); } catch { /* already gone */ }
+}
+
+// The time one repo command may run (gate, setup, sweep): repo.json commandTimeoutMin (default
+// 60), or AGENT_LAND_CMD_TIMEOUT_MS for tests.
+export function commandTimeoutMs(cfg) {
+  const v = Number(process.env.AGENT_LAND_CMD_TIMEOUT_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  const min = Number(cfg?.commandTimeoutMin);
+  return (Number.isFinite(min) && min > 0 ? min : 60) * 60000;
 }
 
 export function pollMs() {
@@ -655,10 +687,15 @@ export function mergeArgv(cfg, { pr, sha, repo }) {
 // Runs from `cwd` (the repo's checkout), so a repo-relative mergeCmd or ghWrapper works from
 // wherever the tool was started (land-queue --all).
 export function mergePinned(gh, cfg, { pr, sha, cwd }) {
+  // `message` (the command's first output line, scrubbed) is for the local caller only; `summary`
+  // has no command output and is what may go into a PR comment.
   const r = run(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { env: gh.env, cwd });
-  if (r.status !== 0) return { ok: false, message: firstLine(r.stderr || r.stdout) };
+  if (r.status !== 0) return { ok: false, message: firstLine(r.stderr || r.stdout), summary: `merge command exit ${r.status}` };
   const after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
-  if (after.state !== 'MERGED') return { ok: false, message: `PR state is ${after.state} after the merge command` };
+  if (after.state !== 'MERGED') {
+    const s = `PR state is ${after.state} after the merge command`;
+    return { ok: false, message: s, summary: s };
+  }
   clearQueueLabels(gh, after);
   return { ok: true, mergeSha: after.mergeCommit?.oid || null };
 }
@@ -693,17 +730,26 @@ export function landerCheckout(mainRoot, base) {
     gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
   }
   const entry = verifyLander(dir, mainRoot, mainCommon);
+  const gitDir = gitOk(['rev-parse', '--absolute-git-dir'], { cwd: dir });
+  const inProgress = ['rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG']
+    .filter((f) => fs.existsSync(path.join(gitDir, f)));
   if (entry.locked !== LANDER_LOCK_REASON) {
     const refuse = (why) => { throw new LandError(`refusing to use ${dir} as the lander checkout: ${why}; it was left untouched`); };
     if (entry.locked !== null) refuse(`it is locked by someone else (${entry.locked || 'no reason given'})`);
     if (!entry.detached) refuse('it has a branch checked out (the lander uses a detached checkout)');
-    const st = git(['status', '--porcelain', '--untracked-files=all'], { cwd: dir });
+    if (inProgress.length) refuse(`an operation is in progress there (${inProgress.join(', ')})`);
+    // Ignored files count too: a reset to a commit that tracks the same path would overwrite them.
+    const st = git(['status', '--porcelain', '--untracked-files=all', '--ignored'], { cwd: dir });
     if (st.status !== 0) refuse('git status failed there');
-    if (st.stdout.trim()) refuse(`it has ${st.stdout.trim().split(/\r?\n/).length} changed or untracked file(s)`);
+    const lines = st.stdout.split(/\r?\n/).filter(Boolean);
+    const ignored = lines.filter((l) => l.startsWith('!! ')).length;
+    if (lines.length - ignored) refuse(`it has ${lines.length - ignored} changed or untracked file(s)`);
+    if (ignored) refuse(`it has ${ignored} ignored file(s)`);
     gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
+  } else if (inProgress.some((f) => f.startsWith('rebase-'))) {
+    // The lander's own checkout: leave a half-finished rebase of an earlier run (either backend).
+    git(['rebase', '--abort'], { cwd: dir });
   }
-  // Leave any earlier half-finished rebase.
-  if (fs.existsSync(path.join(gitOk(['rev-parse', '--absolute-git-dir'], { cwd: dir }), 'rebase-merge'))) git(['rebase', '--abort'], { cwd: dir });
   return dir;
 }
 
@@ -738,15 +784,26 @@ export const commandEnv = () => childEnv({ AGENT_LANDER: '1' });
 
 // Run repo commands in order while refreshing the lock. Stops at the first failure; a refresh
 // that fails means another lander may own the lock now: { ok: false, lost: true }.
-export async function runCommands(cmds, dir, lock, ttlMin) {
+// `entries` are { name, cmd } (name: the repo.json key and index, e.g. "affectedGate[0]").
+// Returns { ok, lost, timedOut, name, cmd, status, summary }; `summary` is the only text about a
+// failure that leaves here (name, command, exit status or timeout), never the command's output.
+export async function runCommands(entries, dir, lock, cfg) {
   let lost = false;
   const onTick = () => { if (lock && !lock.refresh()) lost = true; };
-  for (const c of cmds) {
-    const r = await runAsync(splitArgv(c), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(ttlMin) : 0, onTick });
-    if (lost) return { ok: false, lost: true, cmd: c, status: r.status, tail: r.tail };
-    if (r.status !== 0) return { ok: false, cmd: c, status: r.status, tail: r.tail };
+  const limit = commandTimeoutMs(cfg);
+  for (const { name, cmd } of entries) {
+    const r = await runAsync(splitArgv(cmd), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(cfg.lockTtlMin) : 0, onTick, timeoutMs: limit });
+    const what = `${name} \`${cmd}\``;
+    if (lost) return { ok: false, lost: true, name, cmd, status: r.status, summary: `${what}: the landing lock was lost` };
+    if (r.timedOut) return { ok: false, timedOut: true, name, cmd, status: r.status, summary: `${what} timed out after ${Math.round(limit / 60000) || '<1'} min${r.stuck ? ' (it could not be stopped)' : ''}` };
+    if (r.status !== 0) return { ok: false, name, cmd, status: r.status, summary: `${what} exit ${r.status}` };
   }
   return { ok: true };
+}
+
+// [{ name: "key[i]", cmd }] for the commands of one repo.json key.
+export function named(key, cmds) {
+  return (Array.isArray(cmds) ? cmds : cmds ? [cmds] : []).map((cmd, i) => ({ name: `${key}[${i}]`, cmd }));
 }
 
 // ---------------------------------------------------------------- wide sweep
@@ -765,28 +822,30 @@ export async function runSweep({ cfg, mainRoot, lock }) {
   const dir = landerCheckout(mainRoot, cfg.base);
   fetchBranch(dir, cfg.base);
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
-  const cmds = Array.isArray(cfg.wideSweep) ? cfg.wideSweep : [cfg.wideSweep];
-  const r = await runCommands([...cfg.setup, ...cmds], dir, lock, cfg.lockTtlMin);
+  const r = await runCommands([...named('setup', cfg.setup), ...named('wideSweep', cfg.wideSweep)], dir, lock, cfg);
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
+  // A sweep can finish before any refresh noticed another lander: ownership is checked last.
+  if (!r.lost && lock && !lock.stillHeld()) return { ...r, ok: false, lost: true, summary: 'the landing lock was lost' };
   return r;
 }
 
 // The sweep that is due after `sinceSweep` merges (call while holding the lock). Returns null
-// when none is due, else { ran, ok, afterMerges, alert? }; a red sweep pauses the repo. The
-// counter resets only when the sweep finished (green or red): a sweep that throws (a checkout
-// error, a bad command) or loses the lock stays due, so the next run tries it again.
+// when none is due, else { ran, ok, afterMerges, lost?, alert? }; a red sweep pauses the repo.
+// The counter resets only when the sweep finished (green or red) while the lock was still ours:
+// a sweep that throws (a checkout error, a bad command) or loses the lock stays due, so the next
+// run tries it again; `lost` tells the caller to stop.
 export async function dueSweep(ctx) {
   const { gh, cfg } = ctx;
   if (!sweepDue(gh.repo, cfg)) return null;
   const afterMerges = sweepState(gh.repo).sinceSweep || 0;
   const r = await runSweep(ctx);
   const out = { ran: true, ok: r.ok, afterMerges };
-  if (r.lost) { out.ok = false; out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost; it stays due`; return out; }
+  if (r.lost) { out.ok = false; out.lost = true; out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost; it stays due`; return out; }
   markSwept(gh.repo);
   if (r.ok) return out;
   gh.setPaused(true);
   out.paused = true;
-  out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (\`${r.cmd}\` exit ${r.status}); the repo is paused (AGENT_LANDING_PAUSED=1). Open a ticket, fix ${cfg.base}, then run land-queue unpause.`;
+  out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (${r.summary}); the repo is paused (AGENT_LANDING_PAUSED=1). Open a ticket, fix ${cfg.base}, then run land-queue unpause.`;
   return out;
 }
 

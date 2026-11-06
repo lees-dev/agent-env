@@ -23,7 +23,9 @@
 // refetches the base right before the merge; if it moved, the rebase and validation run again
 // (at most 3 times, then a bounce). An error mid-landing also puts the PR back to `queued`:
 // `landing` is never left behind. Anything else that fails bounces the PR: queued/landing ->
-// queue-blocked, one comment with the reason, and a `Bounced:` line in its `## Landing` section.
+// queue-blocked, one comment with the reason (commands, exit codes, paths, SHAs; never command
+// output), and a `Bounced:` line in its `## Landing` section. A repo command that runs longer than
+// commandTimeoutMin (default 60) is stopped with every process it started.
 // The third bounce (after two automatic fix attempts) parks it: the comment starts with `PARKED:`.
 // A red wide sweep (every sweepEveryMerges merges, or overdue when the lander is idle) sets
 // AGENT_LANDING_PAUSED=1; `unpause` takes the landing lock, reruns the sweep on the base and
@@ -40,7 +42,7 @@ import {
   appendLanding, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
-  retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
+  named, retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
 } from './lib/land.mjs';
 
 const USAGE = 'usage: node land-queue.mjs <run|status|unpause> [--repo owner/name] [--root <checkout>] [--all] [--json] [--dry-run] [--reclaim-stale]';
@@ -54,7 +56,9 @@ function changedPaths(dir, from, to) {
 
 // ---------------------------------------------------------------- bounce
 
-function bounce(gh, pr, reason, tail = []) {
+// The reason is a summary built here (commands, exit codes, paths, SHAs); the output of a
+// command never goes into a PR comment, where a secret it printed would be public.
+function bounce(gh, pr, reason) {
   const at = new Date().toISOString();
   const attempt = parseLanding(pr.body).bounces.length + 1;
   const body = appendLanding(pr.body, `Bounced: ${at} ${reason}`);
@@ -74,9 +78,7 @@ function bounce(gh, pr, reason, tail = []) {
       '',
       'Fix it on the branch, run the gate and the review on the new head, then run `land-pr <n> --sha <new head>` again.',
     ];
-  const t = tail.map(scrub).filter((l) => l.trim()).slice(-20);
-  if (t.length) lines.push('', `Last ${t.length} lines of output:`, '', '```text', ...t.map((l) => l.replace(/```/g, "'''")), '```');
-  lines.push('', BOUNCE_MARKER);
+  lines.push('', 'Command output is not posted here; run the command in your worktree to see it.', '', BOUNCE_MARKER);
   gh.prComment(pr.number, `${lines.join('\n')}\n`);
   return { pr: pr.number, reason: scrub(reason), attempt, parked };
 }
@@ -157,13 +159,13 @@ async function landOne(ctx, pr) {
     const rd = git(['range-diff', '--no-color', `${forkPoint}..${head}`, `${newBase}..${rebasedSha}`], { cwd: dir });
     if (rd.status !== 0) {
       resetTo(dir, baseRef);
-      return { bounced: bounce(gh, pr, `git range-diff failed: ${firstLine(rd.stderr)}`) };
+      return { bounced: bounce(gh, pr, `git range-diff failed (exit ${rd.status})`) };
     }
     const changes = rangeDiffChanges(rd.stdout);
     if (changes.total === 0 || changes.changed.length) {
       resetTo(dir, baseRef);
       const what = changes.total === 0 ? 'the rebase left no commits' : `the rebase changed ${changes.changed.length} of ${changes.total} commit(s)`;
-      return { bounced: bounce(gh, pr, `${what}; re-gate and re-review`, changes.changed) };
+      return { bounced: bounce(gh, pr, `${what}; re-gate and re-review`) };
     }
     const before = changedPaths(dir, forkPoint, head);
     const added = [...changedPaths(dir, newBase, rebasedSha)].filter((p) => !before.has(p));
@@ -172,19 +174,21 @@ async function landOne(ctx, pr) {
       return { bounced: bounce(gh, pr, `the rebased diff touches ${added.length} new path(s): ${added.slice(0, 10).join(', ')}; re-gate and re-review`) };
     }
     // Same patches on a newer base: rerun the affected gate only.
-    let g = await runCommands([...cfg.setup, ...cfg.affectedGate], dir, lock, cfg.lockTtlMin);
-    if (!g.ok && !g.lost) g = await runCommands(cfg.affectedGate, dir, lock, cfg.lockTtlMin);
+    // A failed gate gets one retry; a lost lock or a timeout does not.
+    let g = await runCommands([...named('setup', cfg.setup), ...named('affectedGate', cfg.affectedGate)], dir, lock, cfg);
+    let retried = false;
+    if (!g.ok && !g.lost && !g.timedOut) { retried = true; g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg); }
     if (g.lost) { resetTo(dir, baseRef); return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push'); }
     if (!g.ok) {
       resetTo(dir, baseRef);
-      return { bounced: bounce(gh, pr, `affected gate failed after the rebase (\`${g.cmd}\` exit ${g.status}, retried once)`, g.tail) };
+      return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}${retried ? ' (retried once)' : ''}, after the rebase`) };
     }
     landSha = rebasedSha;
     const pre = recheck(gh, pr, want, head, lock);
     if (pre) { resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
     const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
     resetTo(dir, baseRef);
-    if (push.status !== 0) return { bounced: bounce(gh, pr, `push of the rebased head was rejected: ${firstLine(push.stderr || push.stdout)}`) };
+    if (push.status !== 0) return { bounced: bounce(gh, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`) };
     const body = appendLanding(pr.body, `Gate: pass @ ${landSha} (lander rebase)`);
     gh.prEdit(pr.number, { body });
     pr.body = body;
@@ -201,7 +205,7 @@ async function landOne(ctx, pr) {
   const last = recheck(gh, pr, want, landSha, lock);
   if (last) return abort(gh, pr, last, 'the merge');
   const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root });
-  if (!m.ok) return { bounced: bounce(gh, pr, `merge failed: ${m.message}`) };
+  if (!m.ok) return { bounced: bounce(gh, pr, `merge failed (${m.summary})`) };
   return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
 }
 
@@ -286,13 +290,15 @@ function resetLeftovers(gh, report) {
 async function sweepAfter(ctx, report) {
   try {
     const s = await dueSweep(ctx);
-    if (!s) return;
-    report.sweep = { ran: true, ok: s.ok, afterMerges: s.afterMerges };
+    if (!s) return false;
+    report.sweep = { ran: true, ok: s.ok, afterMerges: s.afterMerges, lost: Boolean(s.lost) };
     if (s.alert) report.alerts.push(s.alert);
     if (s.paused) report.paused = true;
+    return Boolean(s.lost);
   } catch (e) {
     report.sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
     report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}; it stays due and runs again next time`);
+    return false;
   }
 }
 
@@ -339,7 +345,7 @@ async function runRepo(t, opts) {
       if (res?.merged) {
         report.merged.push(res.merged);
         bumpMergeCount(gh.repo);
-        await sweepAfter(ctx, report);
+        if (await sweepAfter(ctx, report)) lost = true;
       }
     } catch (e) {
       // Never leave `landing` behind; a merged PR is never put back in line.
@@ -361,7 +367,7 @@ async function runRepo(t, opts) {
   // nothing else is in the way.
   if (!opts.dryRun && !report.paused && !report.busy && !report.stale.length && !lost && sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
     if (takeLock(ctx, report, opts)) {
-      try { await sweepAfter(ctx, report); } finally { releaseLock(ctx, report); }
+      try { if (await sweepAfter(ctx, report)) lost = true; } finally { releaseLock(ctx, report); }
     }
   }
   fillQueueState(gh, report);
@@ -386,7 +392,8 @@ async function unpauseRepo(t) {
     } finally {
       if (!releaseLock(ctx, probe)) process.stderr.write(`WARNING: ${probe.alerts.at(-1)}\n`);
     }
-    if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red`, lockRetained: probe.lockRetained || null };
+    if (r.lost) return { repo: t.repo, paused: true, sweep, note: 'the landing lock was lost during the sweep; the pause stays', lockRetained: probe.lockRetained || null };
+    if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red (${r.summary})`, lockRetained: probe.lockRetained || null };
   }
   gh.setPaused(false);
   return { repo: t.repo, paused: false, sweep, note: 'cleared AGENT_LANDING_PAUSED' };

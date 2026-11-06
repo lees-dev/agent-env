@@ -30,7 +30,7 @@ A repo describes itself in `.agents/repo.json` (version 1). Every key is optiona
 | `branchPattern` | `^agent/([A-Z]+-\d+)` | Group 1 is the ticket id |
 | `remoteBranchDelete` | `^(agent\|revert)/` | Merged branches matching this lose their remote head at teardown |
 
-Other keys (`vault`, `mergeMethod`, `mergeCmd`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`) belong to the landing tools.
+Other keys (`vault`, `mergeMethod`, `mergeCmd`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`, `commandTimeoutMin`) belong to the landing tools.
 
 ## Hooks
 
