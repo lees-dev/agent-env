@@ -158,7 +158,8 @@ if [ "$op_ready" -eq 1 ]; then
     ae_hint "create it or grant this account/service account read access, then rerun"
   fi
 fi
-# BEAST's hub admin account may read all agent vaults. Device accounts see their key only.
+# BEAST's hub admin account may read all agent vaults. Device accounts see their own key,
+# plus the shared repo-credentials vault agent-repos (not item-scanned; docs/cpa.md).
 # Counts titles only; no field value is fetched and no title is printed.
 if [ "$op_ready" -eq 1 ] && [ "$OP_MODE" = service ]; then
   if [ "$ROLE" = hub ]; then
@@ -166,9 +167,11 @@ if [ "$op_ready" -eq 1 ] && [ "$OP_MODE" = service ]; then
   else
     [ "$VAULT" = "agent-env-$MACHINE" ] ||
       ae_warn "service mode reads vault '$VAULT': use a vault of its own, 'agent-env-$MACHINE' (docs/cpa.md '1Password vaults')"
-    _op_nv=0; _op_extra=0
+    _op_nv=0; _op_extra=0; _op_repos=0
+    _op_repos_id=$(op vault get agent-repos --format json </dev/null 2>/dev/null | grep -o '"id": *"[^"]*"' | head -n 1 | sed 's/.*"\([^"]*\)"$/\1/')
     _op_vaults=$(op vault list --format json </dev/null 2>/dev/null) || ae_fail "cannot list service-account vaults to check scope"
     for _op_v in $(printf '%s' "$_op_vaults" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/'); do
+      if [ -n "$_op_repos_id" ] && [ "$_op_v" = "$_op_repos_id" ]; then _op_repos=1; continue; fi
       _op_nv=$((_op_nv + 1))
       _op_items=$(op item list --vault "$_op_v" --format json </dev/null 2>/dev/null) || ae_fail "cannot list service-account items to check scope"
       for _op_t in $(printf '%s' "$_op_items" | grep -o '"title": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' | tr ' ' '_'); do
@@ -179,13 +182,18 @@ if [ "$op_ready" -eq 1 ] && [ "$OP_MODE" = service ]; then
       done
     done
     if [ "$_op_nv" -eq 1 ] && [ "$_op_extra" -eq 0 ]; then
-      ae_ok "device service account sees one vault and only its own key"
+      ae_ok "device service account sees one key vault and only its own key"
     else
       [ "$_op_nv" -eq 1 ] || ae_warn "device service account sees $_op_nv vault(s), expected one"
       [ "$_op_extra" -eq 0 ] || ae_warn "device service account can read $_op_extra unexpected item(s)"
-      ae_hint "scope this machine's service account read-only to vault 'agent-env-$MACHINE' only (docs/cpa.md)"
+      ae_hint "scope this machine's service account read-only to vault 'agent-env-$MACHINE', plus read+write on 'agent-repos' (docs/cpa.md)"
     fi
-    unset _op_nv _op_extra _op_v _op_t _op_vaults _op_items
+    if [ "$_op_repos" -eq 1 ]; then
+      ae_ok "device service account reaches vault 'agent-repos' (repo dev credentials)"
+    else
+      ae_warn "device service account cannot reach vault 'agent-repos': repo dev credentials will not inject (docs/cpa.md '1Password vaults')"
+    fi
+    unset _op_nv _op_extra _op_repos _op_repos_id _op_v _op_t _op_vaults _op_items
   fi
 fi
 
