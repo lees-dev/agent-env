@@ -130,15 +130,19 @@ const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return fal
 
 /**
  * The path an absolute word starts, when words may have been split at spaces inside it
- * (an unquoted Windows path, or ps output): the longest run of words that exists on disk,
- * else the word itself.
+ * (an unquoted Windows path, or ps output). A join with the next word is taken when the
+ * folder or file it names at the join exists, e.g. `C:\x\wt` + `copy\gone.js` when
+ * `C:\x\wt copy` exists, even if gone.js does not; otherwise the word stands alone.
  */
 function widestPath(words, i, first) {
   let best = first;
   let cur = first;
   for (let j = i + 1; j < words.length && j < i + 16; j++) {
-    cur = `${cur} ${words[j]}`;
-    if (exists(cur)) best = cur;
+    const w = words[j];
+    cur = `${cur} ${w}`;
+    const sep = w.search(/[\\/]/);
+    const atJoin = sep >= 0 ? cur.slice(0, cur.length - w.length + sep) : cur;
+    if (exists(atJoin)) best = cur;
   }
   return best;
 }

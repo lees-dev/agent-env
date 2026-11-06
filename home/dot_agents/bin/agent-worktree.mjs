@@ -196,9 +196,12 @@ function envOutputProblem(dir, out) {
   return null;
 }
 
-/** The env output to leave out of the dirty check: only a plain, untracked generated file. */
+/**
+ * The env output to leave out of the dirty check (dirtyCount skips it only as an untracked
+ * `??` entry, so staged or tracked changes to it still count).
+ */
 function envIgnore(dir, out) {
-  return linkedAncestor(dir, out) || isTracked(dir, out) ? [] : [out];
+  return linkedAncestor(dir, out) ? [] : [out];
 }
 
 function removeFile(file) {
@@ -421,13 +424,17 @@ export function unpushedReason(dir, tip, pr) {
   return `${plural(Number(ahead || 0), 'commit')} not on any remote and HEAD differs from PR #${pr.number} head`;
 }
 
-/** Changed or untracked files (ignored files and the paths in ignore excluded), or null. */
+/**
+ * Changed or untracked files, or null when git status fails. Ignored files never count; a path
+ * in ignore is skipped only while it is untracked (`??`), never a staged or tracked change.
+ */
 function dirtyCount(worktreePath, ignore = []) {
   const st = gitOut(['status', '--porcelain', '--untracked-files=all'], { cwd: worktreePath });
   if (st === null) return null;
   const skip = ignore.map((p) => normPath(p));
   return st.split(/\r?\n/).filter(Boolean).filter((line) => {
-    const rel = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop();
+    if (!line.startsWith('?? ')) return true;
+    const rel = line.slice(3).replace(/^"|"$/g, '');
     return !skip.includes(normPath(path.resolve(worktreePath, rel)));
   }).length;
 }

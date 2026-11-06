@@ -93,16 +93,15 @@ export function tryLock(lock) {
   return null;
 }
 
-/** Delete lock if it still holds held, under <lock>.recover. False when someone else is at it. */
+/**
+ * Delete lock if it still holds held, under <lock>.recover. False when someone else is at it.
+ * The recovery file itself is never reclaimed automatically (that would repeat the race it
+ * prevents): one left by a recoverer that crashed in this short step keeps the lock busy
+ * until someone deletes it by hand.
+ */
 function breakStale(lock, held, token) {
   const rec = `${lock}.recover`;
-  if (!create(rec, token)) {
-    const r = readHeld(rec);
-    if (r && !stale(r.held, r.st)) return false;
-    // A recoverer that died mid-way: clear its file once, then try again next attempt.
-    try { if (r && fs.readFileSync(rec, 'utf8') === r.held && stale(r.held, fs.statSync(rec))) fs.unlinkSync(rec); } catch { /* raced */ }
-    return true;
-  }
+  if (!create(rec, token)) return false;
   try {
     const now = readHeld(lock);
     if (now && now.held === held && stale(now.held, now.st)) fs.unlinkSync(lock);

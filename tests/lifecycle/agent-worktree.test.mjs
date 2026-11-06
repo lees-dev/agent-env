@@ -372,15 +372,19 @@ describe('teardown', () => {
     assert.equal(ledgerOf(repo).state, 'kept');
   });
 
-  test('a tracked env output with a staged change counts as dirty', () => {
-    const { s, repo } = fixture({ config: { env: { output: 'README.md' } } });
-    merged(s, repo);
-    write(path.join(repo.wt, 'README.md'), 'changed\n');
-    gitIn(s, repo.wt, 'add', 'README.md');
-    const r = engine(s, ['teardown'], repo.wt);
-    assert.equal(r.status, 1, r.out);
-    assert.match(r.stderr, /keep: 1 changed or untracked file/);
-    assert.equal(fs.readFileSync(path.join(repo.wt, 'README.md'), 'utf8'), 'changed\n');
+  test('a tracked env output with a staged change or staged deletion counts as dirty', () => {
+    for (const change of ['modify', 'delete']) {
+      const { s, repo } = fixture({ config: { env: { output: 'README.md' } } });
+      merged(s, repo);
+      if (change === 'modify') {
+        write(path.join(repo.wt, 'README.md'), 'changed\n');
+        gitIn(s, repo.wt, 'add', 'README.md');
+      } else gitIn(s, repo.wt, 'rm', '-q', 'README.md');
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 1, `${change}: ${r.out}`);
+      assert.match(r.stderr, /keep: 1 changed or untracked file/, change);
+      assert.equal(s.readState().gh.deleted, undefined, change);
+    }
   });
 
   test('closed (not merged): resources removed, remote branch kept', () => {

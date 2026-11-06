@@ -54,7 +54,7 @@ node ~/.agents/bin/agent-worktree.mjs track neon-branch <id> --where neon   # le
 
 The engine removes `docker-container`, `docker-volume` and `docker-network` ids, every Docker object labelled `agent.wt=<wtId>` (so label containers you start), and local `file`, `dir`, `cache` and `path` entries. A tracked path is deleted only when, after resolving links and junctions, it lies inside this worktree, the temp folder or `~/.cache`. It is never the worktree itself, never inside the main checkout, the git dir or another worktree (including one nested inside this worktree), and never contains any of those or the home folder. A refused path keeps the worktree (exit 1). Hooks remove any other kind.
 
-Locks: one lock per ledger, one repo-wide lock around port allocation, one per worktree around teardown (a second teardown exits 1), and one per repo around sweep (a second sweep skips the repo). Each lock file holds an owner token. A lock is stale when its holder's pid is dead or the lock is over two hours old; a stale lock is broken only under a separate `<lock>.recover` lock, so two processes never both break it.
+Locks: one lock per ledger, one repo-wide lock around port allocation, one per worktree around teardown (a second teardown exits 1), and one per repo around sweep (a second sweep skips the repo). Each lock file holds an owner token. A lock is stale when its holder's pid is dead or the lock is over two hours old; a stale lock is broken only under a separate `<lock>.recover` lock, so two processes never both break it. That recovery file is never reclaimed automatically; if a crash ever leaves one behind, the lock stays busy until you delete it.
 
 ## Setup
 

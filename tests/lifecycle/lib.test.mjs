@@ -160,6 +160,7 @@ describe('processes', () => {
     write(path.join(s.dir, 'wt copy', 'a.js'), '');
     const mk = (cmd) => (isWin ? { cmd, args: procs.splitWindowsArgs(cmd) } : { cmd, psOnly: true });
     assert.equal(procs.argsUnder(mk(`node ${path.join(s.dir, 'wt copy', 'a.js')}`), [dir]), false);
+    assert.equal(procs.argsUnder(mk(`node ${path.join(s.dir, 'wt copy', 'removed.js')}`), [dir]), false, 'script gone, folder still there');
     assert.equal(procs.argsUnder(mk(`node ${path.join(dir, 'b.js')}`), [dir]), true);
   });
 
@@ -252,8 +253,11 @@ describe('repo and ledger', () => {
     assert.equal(ledger.tryLock(lock), null, 'another live process is recovering');
     assert.equal(fs.readFileSync(lock, 'utf8'), '2147480000 dead');
     fs.writeFileSync(`${lock}.recover`, '2147480001 crashed');
+    assert.equal(ledger.tryLock(lock), null, 'a recovery file is never reclaimed automatically');
+    assert.ok(fs.existsSync(`${lock}.recover`));
+    fs.unlinkSync(`${lock}.recover`);
     const got = ledger.tryLock(lock);
-    assert.ok(got, 'a crashed recoverer does not block forever');
+    assert.ok(got, 'with no recovery in progress the stale lock is broken');
     got();
     assert.equal(fs.existsSync(`${lock}.recover`), false);
     fs.writeFileSync(lock, `${process.pid} long-ago`);
