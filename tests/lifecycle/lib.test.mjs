@@ -161,6 +161,11 @@ describe('processes', () => {
     const mk = (cmd) => (isWin ? { cmd, args: procs.splitWindowsArgs(cmd) } : { cmd, psOnly: true });
     assert.equal(procs.argsUnder(mk(`node ${path.join(s.dir, 'wt copy', 'a.js')}`), [dir]), false);
     assert.equal(procs.argsUnder(mk(`node ${path.join(s.dir, 'wt copy', 'removed.js')}`), [dir]), false, 'script gone, folder still there');
+    if (isWin) {
+      // Quoted arguments are complete: "<dir>" followed by copy\removed.js is the worktree itself.
+      assert.equal(procs.argsUnder(mk(`node "${dir}" copy\\removed.js`), [dir]), true);
+      assert.equal(procs.argsUnder(mk(`node "${path.join(s.dir, 'wt copy', 'a.js')}"`), [dir]), false);
+    }
     assert.equal(procs.argsUnder(mk(`node ${path.join(dir, 'b.js')}`), [dir]), true);
   });
 

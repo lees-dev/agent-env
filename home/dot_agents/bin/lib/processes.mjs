@@ -97,10 +97,16 @@ export function listPs(env, runner = run) {
 
 /** Split a Windows command line the way CommandLineToArgvW does. */
 export function splitWindowsArgs(cmd) {
+  return splitWindowsArgsDetailed(cmd).map((a) => a.value);
+}
+
+/** As splitWindowsArgs, with {value, quoted}: quoted when any part of it was in quotes. */
+export function splitWindowsArgsDetailed(cmd) {
   const out = [];
   let cur = '';
   let has = false;
   let quoted = false;
+  let wasQuoted = false;
   for (let i = 0; i < cmd.length; i++) {
     const c = cmd[i];
     if (c === '\\') {
@@ -114,13 +120,15 @@ export function splitWindowsArgs(cmd) {
     } else if (c === '"') {
       if (quoted && cmd[i + 1] === '"') { cur += '"'; i++; } else quoted = !quoted;
       has = true;
+      wasQuoted = true;
     } else if ((c === ' ' || c === '\t') && !quoted) {
-      if (has) out.push(cur);
+      if (has) out.push({ value: cur, quoted: wasQuoted });
       cur = '';
       has = false;
+      wasQuoted = false;
     } else { cur += c; has = true; }
   }
-  if (has) out.push(cur);
+  if (has) out.push({ value: cur, quoted: wasQuoted });
   return out;
 }
 
@@ -132,12 +140,14 @@ const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return fal
  * The path an absolute word starts, when words may have been split at spaces inside it
  * (an unquoted Windows path, or ps output). A join with the next word is taken when the
  * folder or file it names at the join exists, e.g. `C:\x\wt` + `copy\gone.js` when
- * `C:\x\wt copy` exists, even if gone.js does not; otherwise the word stands alone.
+ * `C:\x\wt copy` exists, even if gone.js does not; otherwise the word stands alone. A quoted
+ * Windows argument is complete: it is never extended, and never extends into another one.
  */
-function widestPath(words, i, first) {
+function widestPath(words, i, first, quoted = []) {
+  if (quoted[i]) return first;
   let best = first;
   let cur = first;
-  for (let j = i + 1; j < words.length && j < i + 16; j++) {
+  for (let j = i + 1; j < words.length && j < i + 16 && !quoted[j]; j++) {
     const w = words[j];
     cur = `${cur} ${w}`;
     const sep = w.search(/[\\/]/);
@@ -151,12 +161,16 @@ function widestPath(words, i, first) {
 export function argsUnder(p, dirs) {
   // /proc gives exact arguments; Windows and ps output may split an unquoted path at spaces.
   const exact = !p.psOnly && !isWindows;
-  const words = p.psOnly ? String(p.cmd || '').split(/\s+/).filter(Boolean).map((w) => w.replace(/^["']+|["']+$/g, '')) : (p.args || []);
+  // Windows: re-split the command line to know which arguments were quoted (complete).
+  const detail = !p.psOnly && isWindows && p.cmd ? splitWindowsArgsDetailed(p.cmd) : null;
+  const words = p.psOnly ? String(p.cmd || '').split(/\s+/).filter(Boolean).map((w) => w.replace(/^["']+|["']+$/g, ''))
+    : detail ? detail.map((a) => a.value) : (p.args || []);
+  const quoted = detail ? detail.map((a) => a.quoted) : [];
   for (let i = 0; i < words.length; i++) {
     const a = words[i];
     for (const v of [a, a.includes('=') ? a.slice(a.indexOf('=') + 1) : null]) {
       if (!v || !isAbs(v)) continue;
-      const full = exact ? v : widestPath(words, i, v);
+      const full = exact ? v : widestPath(words, i, v, quoted);
       if (dirs.some((d) => isUnder(full, d))) return true;
     }
   }
