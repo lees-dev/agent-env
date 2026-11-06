@@ -73,7 +73,7 @@ const phrases = [
   ["gh run watch 123", ["t3_background_wait", "only for PR checks"]],
   ["gh pr merge 42 --squash", ["land-pr <n> --sha <gated sha>", "fallback", "list_scheduled_tasks", "~/.agents/bin/land-pr.mjs", "AGENT_LANDING_PAUSED", "Depends-on", "Gate: pass @ <sha>", "no queue labels", "queue-hold", "queue-next", "one at a time", "--is-ancestor origin/<base> <sha>", "pins the head, not the base", "no --auto", "rebase and rerun the gate", "stop and report", "fallback used"]],
   ["gh api -X PUT repos/o/r/pulls/42/merge", ["land-pr <n> --sha <gated sha>", "fallback", "AGENT_LANDING_PAUSED", "Depends-on", "Gate: pass @ <sha>", "no queue labels", "--is-ancestor origin/<base> <sha>", "fallback used"]],
-  ["git push origin HEAD", ["never push to a PR labelled landing", "already carries queue-hold", "push nothing that lands", "queue-next", "add your own queue-hold first", "Hold-By:", "remove your hold and wait", "affected gate", "review of the new range", "land-pr <n> --sha <new gated sha> --release-hold", "removes only your own hold", "rerun the local gate first"]],
+  ["git push origin HEAD", ["never push to a PR labelled landing", "already carries queue-hold", "push nothing that lands", "queue-next", "add your own queue-hold first", "Hold-By:", "remove your hold and wait", "affected gate", "review of the new range", "land-pr <n> --sha <new gated sha> --release-hold --holder <id>", "land-pr hold <n> --holder <id>", "removes only your own hold", "rerun the local gate first"]],
   ["~/bin/git-app-push https://github.com/o/r.git HEAD:refs/heads/x", ["never push to a PR labelled landing", "add your own queue-hold first", "--release-hold"]],
   ["gh pr create --fill --body x", ["pr-workflow section 4", "QUEUE-FULL", "REFUSED"]],
 ];

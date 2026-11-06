@@ -93,7 +93,8 @@ Each repo has one lander: a T3 `schedule_task` named `land-queue` that runs `lan
 
 - `landing`: never push. Wait for its merge or bounce.
 - `queue-hold` already present (the owner, `full-stop` or someone else set it): leave it, push nothing that lands, and report it.
-- Otherwise: add your own `queue-hold` and a `Hold-By: <thread or host> <ISO time>` line in the PR body, re-read the labels and confirm there is no `landing` (if you find `landing` while holding your own hold, remove your hold and wait), push, run the affected gate and the review of the new range, then `land-pr <n> --sha <new gated sha> --release-hold` (it refreshes the gated sha and removes only your own hold, in one step).
+- Otherwise: take your own hold with `land-pr hold <n> --holder <id>` (it adds `queue-hold` and a `Hold-By:` line; use `$T3CODE_THREAD_ID` as the id in T3, otherwise one fixed id for this task, and the same id on every call), confirm there is no `landing` (if you find `landing` while holding your own hold, release it and wait), push, run the affected gate and the review of the new range, then `land-pr <n> --sha <new gated sha> --release-hold --holder <id>` (it refreshes the gated sha and removes only your own hold, in one step).
+- The lander clears `landing`, `queued`, `queue-waiting` and `queue-next` from a PR it merges.
 
 Done when `land-pr` printed `MERGED <sha>` (or `gh pr view <n> --json state` reports `MERGED`), or a builder handed back at `QUEUED` / `QUEUE-FULL` with the lander kicked, or `REFUSED <reason>` was reported.
 

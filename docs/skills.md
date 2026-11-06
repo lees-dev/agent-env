@@ -113,7 +113,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `leaving-pr-comments` | identical in both | 2 | `247ef56da1e550f14cc3b87cab818378f714c461fb42aa4ea441def39e03e661` |
 | `maintain-verification-skill` | `~/.agents/skills` (2026-11-06) | 1 | `7bb23921fde2e10024b0927a163abea4a783c4b8c7e17b79877bd68f77aa5ef1` |
 | `modernize` | `~/.agents/skills` (2026-11-06) | 2 | `0186bfc60db5655fc52b60487797b8a2b98d1d8a166cc46bca87c949ad556b3d` |
-| `pr-workflow` | `~/.agents/skills` (2026-11-06), public examples | 4 | `20b86f5e7d25e07fa1dd489939648fd2e2927e60386390532a299953b2686f25` |
+| `pr-workflow` | `~/.agents/skills` (2026-11-06), public examples | 4 | `d9c16c8bef37a2b7c5e9d3aeeae9da3f13b4b9aabf25ab7274cff48a29a45d68` |
 | `principle-boundary-discipline` | identical in both | 1 | `cb9a0b008885757b969430d0f85b4edb6ba5b41994455474c3f9b7f2a5d341d0` |
 | `principle-encode-lessons-in-structure` | identical in both | 1 | `f4c2345b2b07f5c6a067012c58325f36bd98ab40e3bc470c8414dc29ebbe89be` |
 | `principle-fix-root-causes` | identical in both | 1 | `2317a5ac92561c97fe4609b5a54f4379a35a2b7c542aa92f0dc3344d5e4b6959` |
