@@ -57,8 +57,11 @@ const f = process.env.LAND_TEST_GATE;
 if (f) fs.appendFileSync(f + '.runs', 'x');
 console.log('debug: config value plainword-SHOULD-NOT-LEAK-7f3a');
 if (process.env.OP_SERVICE_ACCOUNT_TOKEN) { console.log('token leaked into the gate'); process.exit(1); }
-if (process.env.LAND_TEST_GATE_HANG === '1') {
-  const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore' });
+if (process.env.LAND_TEST_GATE_HANG) {
+  // =detached: the child gets its own session/process group (it escapes a group kill).
+  const detached = process.env.LAND_TEST_GATE_HANG === 'detached';
+  const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore', detached });
+  if (detached) c.unref();
   fs.writeFileSync(f + '.child', String(c.pid));
   fs.writeFileSync(f + '.self', String(process.pid));
   setInterval(() => {}, 1000);
@@ -1094,6 +1097,77 @@ describe('land-queue', () => {
     assert.doesNotMatch(sh(t.work, t.env, 'worktree', 'list', '--porcelain'), /land-queue lander checkout/, 'not locked by the lander');
     assert.deepEqual(prOf(t, 1).labels, ['queued']);
     assert.equal(lockExists(t), false);
+  });
+
+  test('run: a timed-out gate\'s detached child (own process group) is found and stopped too', { timeout: 180000 }, () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: 'detached', AGENT_LAND_CMD_TIMEOUT_MS: '3000' });
+    let child = 0;
+    try {
+      const rep = runQueue(t);
+      child = Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}.child`, 'utf8'));
+      let alive = true;
+      try { process.kill(child, 0); } catch { alive = false; }
+      // Either it was stopped and the lock released, or (never both) it survived and the lock was kept.
+      assert.equal(alive, false, 'the detached child was stopped');
+      assert.match(rep.bounced[0].reason, /timed out after/);
+      assert.equal(rep.lockRetained, undefined);
+      assert.equal(lockExists(t), false);
+    } finally {
+      for (const f of ['.self', '.child']) {
+        try { process.kill(Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}${f}`, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
+  test('run: an unrelated process in the lander checkout is never killed; the lock is kept instead', { timeout: 240000 }, () => {
+    const t = setup();
+    queuePr(t, 1);
+    runQueue(t); // creates the lander checkout
+    const dir = `${t.work}-lander`;
+    // Not started by any gate: it only runs in the checkout (its cwd, and an argument inside it).
+    const { spawn } = process.getBuiltinModule('node:child_process');
+    const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)', path.join(dir, 'marker')], { cwd: dir, stdio: 'ignore', detached: true });
+    other.unref();
+    try {
+      queuePr(t, 2);
+      advanceMain(t, 'other.txt', 'x\n');
+      Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '3000' });
+      const rep = runQueue(t);
+      let alive = true;
+      try { process.kill(other.pid, 0); } catch { alive = false; }
+      assert.equal(alive, true, 'the unrelated process survives');
+      const child = Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}.child`, 'utf8'));
+      let childAlive = true;
+      try { process.kill(child, 0); } catch { childAlive = false; }
+      assert.equal(childAlive, false, 'the gate\'s own child was stopped');
+      assert.ok(rep.lockRetained?.sha, 'nothing proves the checkout is free: the lock is kept');
+      assert.equal(lockExists(t), true);
+    } finally {
+      try { process.kill(other.pid, 'SIGKILL'); } catch { /* gone */ }
+      for (const f of ['.self', '.child']) {
+        try { process.kill(Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}${f}`, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
+  test('run: a PR whose base is not fetched yet creates the lander checkout on that base', () => {
+    const t = setup();
+    sh(t.bare, t.env, 'branch', 'other', 'main');
+    // PR 1 targets "other", which this clone has never fetched; no lander checkout exists yet.
+    const head = makePr(t, 1, { base: 'main' });
+    const s = state(t);
+    const p = s.prs.find((x) => x.number === 1);
+    p.baseRefName = 'other';
+    p.labels = ['queued'];
+    p.body = writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z' });
+    saveState(t, s);
+    spawnSync('git', ['-C', t.work, 'update-ref', '-d', 'refs/remotes/origin/other'], { env: t.env });
+    assert.equal(fs.existsSync(`${t.work}-lander`), false);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
   });
 
   test('run: a timed-out gate that cannot be stopped keeps the lock, leaves the checkout and stops the run', { timeout: 180000 }, () => {

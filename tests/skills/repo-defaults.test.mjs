@@ -349,6 +349,82 @@ describe('repo-defaults apply.mjs', () => {
     assert.deepEqual(fs.readdirSync(path.join(r.work, 'docs')).filter((f) => f.endsWith('.tmp')), [], 'no temp file left');
   });
 
+  test('a stale block in AGENTS.md hard-linked as CLAUDE.md: refreshed in place, both names keep one inode', () => {
+    const old = '<!-- BEGIN agent-standard v0 -->\nold\n<!-- END agent-standard -->\n\nOwned.\n';
+    const r = repo({ 'AGENTS.md': old });
+    fs.linkSync(path.join(r.work, 'AGENTS.md'), path.join(r.work, 'CLAUDE.md'));
+    const ino = fs.statSync(path.join(r.work, 'AGENTS.md')).ino;
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 0, a.out);
+    assert.equal(a.json.drift, 0);
+    assert.equal(fs.statSync(path.join(r.work, 'AGENTS.md')).ino, ino, 'same inode');
+    assert.equal(fs.statSync(path.join(r.work, 'CLAUDE.md')).ino, ino, 'still hard-linked');
+    assert.equal(read(r, 'AGENTS.md'), `${BLOCK}\n\nOwned.\n`);
+    assert.equal(read(r, 'CLAUDE.md'), `${BLOCK}\n\nOwned.\n`);
+    assert.equal(run(r, '--check').status, 0);
+  });
+
+  test('a chain of links (AGENTS.md -> rules-link -> docs/RULES.md): the final file changes, both links stay', (t) => {
+    const old = '<!-- BEGIN agent-standard v0 -->\nold\n<!-- END agent-standard -->\n\nOwned.\n';
+    const r = repo({ 'docs/RULES.md': old });
+    try {
+      fs.symlinkSync(path.join('docs', 'RULES.md'), path.join(r.work, 'rules-link'), 'file');
+      fs.symlinkSync('rules-link', path.join(r.work, 'AGENTS.md'), 'file');
+    } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    assert.equal(run(r, '--apply').status, 0);
+    assert.ok(fs.lstatSync(path.join(r.work, 'AGENTS.md')).isSymbolicLink());
+    assert.ok(fs.lstatSync(path.join(r.work, 'rules-link')).isSymbolicLink(), 'the middle link is still a link');
+    assert.equal(read(r, 'docs/RULES.md'), `${BLOCK}\n\nOwned.\n`);
+  });
+
+  test('a link to nothing is invalid and left as it is', (t) => {
+    const r = repo();
+    try { fs.symlinkSync(path.join('docs', 'missing.md'), path.join(r.work, 'AGENTS.md'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    assert.equal(a.json.items.find((i) => i.name === 'AGENTS.md block').status, 'invalid');
+    assert.ok(fs.lstatSync(path.join(r.work, 'AGENTS.md')).isSymbolicLink());
+    assert.equal(fs.existsSync(path.join(r.work, 'docs', 'missing.md')), false);
+  });
+
+  test('CLAUDE.md linked to another repo\'s AGENTS.md is invalid; a link to this one (not created yet) is ok', (t) => {
+    const r = repo();
+    const other = path.join(path.dirname(r.work), 'other repo');
+    fs.mkdirSync(other);
+    fs.writeFileSync(path.join(other, 'AGENTS.md'), `${BLOCK}\n`);
+    try { fs.symlinkSync(path.join('..', 'other repo', 'AGENTS.md'), path.join(r.work, 'CLAUDE.md'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const a = run(r, '--inspect', '--json');
+    assert.equal(a.json.items.find((i) => i.name === 'CLAUDE.md').status, 'invalid');
+    fs.unlinkSync(path.join(r.work, 'CLAUDE.md'));
+    fs.symlinkSync('AGENTS.md', path.join(r.work, 'CLAUDE.md'), 'file');
+    assert.equal(run(r, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'ok');
+    assert.equal(run(r, '--apply').status, 0);
+    assert.ok(fs.lstatSync(path.join(r.work, 'CLAUDE.md')).isSymbolicLink());
+  });
+
+  test('t3.json: an engine script with extra repo fields is kept; a manual script keeps its async', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const withIcon = { ...want.scripts[0], icon: 'rocket' };
+    const manual = { name: 'Watch', command: 'npm run watch', async: true };
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'local', scripts: [withIcon, manual] }) });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 0, a.out);
+    const t3 = JSON.parse(read(r, 't3.json'));
+    assert.deepEqual(t3.scripts.map((s) => s.name), ['Agent setup', 'Agent teardown', 'Agent setup', 'Watch']);
+    assert.equal(t3.scripts[2].icon, 'rocket');
+    assert.equal(t3.scripts[3].async, true);
+    assert.match(a.json.actions.join('\n'), /custom script\(s\) that call agent-worktree kept/);
+  });
+
   test('apply.mjs runs when started through a linked skill folder (junction or symlink)', () => {
     const r = repo();
     const link = path.join(path.dirname(r.work), 'linked skill');
@@ -398,6 +474,11 @@ describe('repo-defaults apply.mjs', () => {
     assert.ok(lines.some((l) => l.startsWith('git ')), 'git ran through the shim');
     assert.ok(lines.some((l) => l.startsWith('gh ')), 'gh ran through the shim');
     assert.deepEqual(lines.filter((l) => l.endsWith('LEAK')), []);
+    // --apply lists rulesets once (for the final report), not before the fixes too.
+    fs.writeFileSync(log, '');
+    const a = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--apply', '--json'], { env: e, encoding: 'utf8', shell: false });
+    assert.equal(a.status, 0, a.stderr);
+    assert.equal(fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.startsWith('gh ')).length, 1);
   });
 
   test('BEGIN without END is reported and never touched', () => {

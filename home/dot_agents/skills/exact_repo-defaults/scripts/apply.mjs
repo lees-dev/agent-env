@@ -42,8 +42,12 @@ function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
 class Unreadable extends Error {}
 function readOwned(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch (e) {
-    if (e.code === 'ENOENT') return null;
-    throw new Unreadable(`exists but cannot be read (${e.code || e.message}): fix by hand`);
+    if (e.code !== 'ENOENT') throw new Unreadable(`exists but cannot be read (${e.code || e.message}): fix by hand`);
+    // A link to nothing exists too: never write through it or replace it.
+    let link = false;
+    try { link = fs.lstatSync(p).isSymbolicLink(); } catch { /* really missing */ }
+    if (link) throw new Unreadable('is a link to a file that does not exist: fix by hand');
+    return null;
   }
 }
 function eolOf(text) { return /\r\n/.test(text) ? '\r\n' : '\n'; }
@@ -53,17 +57,21 @@ function asset(name) { return fs.readFileSync(path.join(ASSETS, name), 'utf8').r
 // target, which then replaces it in one rename (mode kept). A link stays a link: its target is
 // what gets written, as a plain write through the link would.
 function writeFile(p, text) {
+  // The final file behind every link in a chain; links themselves are never replaced. (A link
+  // to nothing never gets here: readOwned makes that item invalid.)
   let target = p;
-  try {
-    if (fs.lstatSync(p).isSymbolicLink()) target = path.resolve(path.dirname(p), fs.readlinkSync(p));
-  } catch { /* p does not exist yet */ }
+  try { target = fs.realpathSync(p); } catch { /* p does not exist yet */ }
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  let mode;
-  try { mode = fs.statSync(target).mode & 0o777; } catch { mode = undefined; }
+  let st = null;
+  try { st = fs.statSync(target); } catch { st = null; }
+  const mode = st ? st.mode & 0o777 : undefined;
   const tmp = `${target}.repo-defaults-${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, text, mode === undefined ? undefined : { mode });
-    fs.renameSync(tmp, target);
+    // A file with several hard links (CLAUDE.md as a hard link to AGENTS.md) must keep its
+    // inode, so every name sees the new text: copy the finished temp file over it in place.
+    // That one case is not atomic; every other write is a rename.
+    if (st && st.nlink > 1) { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); } else fs.renameSync(tmp, target);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch { /* never created */ }
     throw e;
@@ -139,8 +147,12 @@ function claudeMd(root) {
   // One file under two names (a link to it, or a hard link): already the same rules.
   if (sameFile(p, path.join(root, 'AGENTS.md'))) return { name: 'CLAUDE.md', status: 'ok', detail: 'same file as AGENTS.md' };
   if (st.isSymbolicLink()) {
-    const target = path.basename(fs.readlinkSync(p));
-    return target === 'AGENTS.md' ? { name: 'CLAUDE.md', status: 'ok', detail: 'link to AGENTS.md' } : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${target}: fix by hand` };
+    // Only a link to this repo's own AGENTS.md (which may not exist yet) is the same rules.
+    const raw = fs.readlinkSync(p);
+    const key = (x) => (process.platform === 'win32' ? path.resolve(x).toLowerCase() : path.resolve(x));
+    return key(path.resolve(root, raw)) === key(path.join(root, 'AGENTS.md'))
+      ? { name: 'CLAUDE.md', status: 'ok', detail: 'link to AGENTS.md' }
+      : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${raw}, not this repo's AGENTS.md: fix by hand` };
   }
   const text = readOwned(p) ?? '';
   if (/^@AGENTS\.md\s*$/m.test(text)) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
@@ -184,9 +196,9 @@ function t3Json(root) {
       const others = scripts.filter((s) => !isCanonical(s)).map((s) => {
         // Only the first create/settle script runs: ours. Keep the others as manual scripts.
         const c = { ...s };
-        if (c.runOnWorktreeCreate) c.runOnWorktreeCreate = false;
+        // `async` only matters for a create script; a script that was already manual keeps it.
+        if (c.runOnWorktreeCreate) { c.runOnWorktreeCreate = false; delete c.async; }
         if (c.runOnSettle) c.runOnSettle = false;
-        delete c.async;
         return c;
       });
       const out = { ...cur, defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, ...others] };
@@ -202,10 +214,12 @@ function t3Json(root) {
   };
 }
 
-// An exact copy of one of the canonical engine scripts (whitespace aside).
+// A copy of one of the canonical engine scripts: the same command (whitespace aside) and no
+// field the canonical script lacks. One with extra repo fields is kept (and reported).
 const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ');
 function isCanonical(s) {
-  return JSON.parse(asset('t3.json')).scripts.some((w) => norm(w.command) === norm(s?.command));
+  return JSON.parse(asset('t3.json')).scripts.some((w) => norm(w.command) === norm(s?.command)
+    && Object.keys(s).every((k) => k in w));
 }
 
 // ------------------------------------------------------------------ detection
@@ -432,7 +446,8 @@ function main() {
   const root = path.resolve(top.out);
   const offline = flags.has('--offline') || mode === 'check';
 
-  let ev = evaluate(root, { offline });
+  // The fixes need no ruleset listing: --apply lists rulesets once, for the final report.
+  let ev = evaluate(root, { offline: offline || mode === 'apply' });
   const actions = [];
   const failed = [];
   if (mode === 'apply') {

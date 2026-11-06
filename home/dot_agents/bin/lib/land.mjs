@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
 import { captureToken, homeDir, stripToken } from './op.mjs';
+import { listProcesses, processesUnder, stopProcesses } from './processes.mjs';
 import { isWindows, prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
 import { baseBranch, canonKey, gitIdentity, loadConfig } from './repo.mjs';
 
@@ -96,23 +97,32 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
     let stuck = false;
     const timers = [];
     if (tickMs > 0 && onTick) timers.push(setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs));
+    let owned = null;
     if (timeoutMs > 0) {
       timers.push(setTimeout(() => {
         timedOut = true;
+        // Snapshot what the command owns while its tree is intact (a detached child is still
+        // linked to its parent here), then stop it all.
+        owned = ownedProcesses(child.pid, cwd, env);
         killTree(child.pid, 'SIGTERM');
+        stopOwned(owned, env);
         timers.push(setTimeout(() => killTree(child.pid, 'SIGKILL'), 3000));
-        // A tree that cannot be stopped is not waited on forever: `stuck` tells the caller the
-        // command may still run, so it keeps the landing lock and touches nothing more.
-        timers.push(setTimeout(() => { stuck = true; done(124); }, stuckMs()));
+        // A command that does not exit is not waited on forever: `stuck` tells the caller it may
+        // still run, so it keeps the landing lock and touches nothing more.
+        timers.push(setTimeout(() => done(124, true), stuckMs()));
       }, timeoutMs));
     }
     let finished = false;
-    const done = (status) => {
+    const done = (status, forced = false) => {
       if (finished) return;
       finished = true;
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
-      // The command is gone; on Unix, anything left in its group goes with it.
-      if (!isWindows && timedOut) killTree(child.pid, 'SIGKILL');
+      if (timedOut) {
+        // The command is gone; on Unix, anything left in its group goes with it. Then prove
+        // that nothing it owned survives; when that cannot be shown, it counts as stuck.
+        if (!isWindows) killTree(child.pid, 'SIGKILL');
+        stuck = forced || !ownedGone(owned, cwd, env);
+      }
       // One that could not be stopped must not keep this process from exiting.
       if (stuck) child.unref();
       resolve({ status, timedOut, stuck });
@@ -120,6 +130,52 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
     child.on('error', () => done(127));
     child.on('exit', (code, signal) => done(code ?? (signal ? 128 : 1)));
   });
+}
+
+// What a timed-out command provably owns: the command and every descendant by parent pid
+// (detached ones included, while they are still linked to it), snapshotted while its tree is
+// intact. Only these are ever signalled. null when the process list cannot be read.
+function ownedProcesses(pid, cwd, env) {
+  const procs = listProcesses(env);
+  if (!procs) return null;
+  const owned = new Map();
+  const seen = new Set();
+  const queue = procs.filter((p) => p.pid === pid);
+  while (queue.length) {
+    const p = queue.shift();
+    if (seen.has(p.pid)) continue;
+    seen.add(p.pid);
+    owned.set(p.pid, p);
+    for (const c of procs) if (c.ppid === p.pid) queue.push(c);
+  }
+  return [...owned.values()];
+}
+
+// Stop the given processes; each pid is re-checked (start time, command) before each signal,
+// so a reused pid is never touched.
+function stopOwned(list, env) {
+  if (!list || !list.length || process.env.AGENT_LAND_TEST_NO_KILL === '1') return;
+  stopProcesses(list, env);
+}
+
+// True only when a fresh process list shows none of the owned processes still running (one
+// more stop of those is tried) and nothing else running inside the directory. A process that
+// only runs in the checkout (its cwd or an argument is inside it) is not provably the
+// command's, so it is never signalled: it makes this false, and the caller keeps the lock.
+function ownedGone(owned, cwd, env) {
+  if (!owned) return false;
+  const check = () => {
+    const now = listProcesses(env);
+    if (!now) return null;
+    const byPid = new Map(now.map((p) => [p.pid, p]));
+    const left = owned.filter((p) => { const q = byPid.get(p.pid); return q && q.start === p.start && q.cmd === p.cmd; });
+    const inDir = processesUnder(cwd, now).filter((p) => !left.some((x) => x.pid === p.pid));
+    return { left, inDir };
+  };
+  let r = check();
+  if (r === null) return false;
+  if (r.left.length) { stopOwned(r.left, env); r = check(); }
+  return r !== null && r.left.length === 0 && r.inDir.length === 0;
 }
 
 // Stop a process and everything it started. Unix: the child leads its own process group
@@ -749,6 +805,9 @@ export function landerCheckout(mainRoot, base) {
   let exists = true;
   try { fs.lstatSync(dir); } catch { exists = false; }
   if (!exists) {
+    // A new checkout starts on the PR's base, which may never have been fetched here. (An
+    // existing path is verified first, before anything is fetched or touched.)
+    fetchBranch(mainRoot, base);
     gitOk(['worktree', 'add', '--detach', dir, `refs/remotes/origin/${base}`], { cwd: mainRoot });
     gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
   }

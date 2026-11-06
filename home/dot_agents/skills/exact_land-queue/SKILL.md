@@ -45,7 +45,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 - **reset**: a crashed run left `landing`; it is `queued` again. Mention it.
 - **stale**: the lock is older than its ttl. Confirm the holder (`host`, `pid`) is gone: same machine, no such process, no lander thread running. Only then rerun with `--reclaim-stale`. Otherwise report it. Only the lander reclaims a stale lock.
 - **busy**: another lander holds the lock. Stop; the next run picks up.
-- **lockRetained**: this run could not delete its own lock (the alert says why and gives the command). Report it; it blocks every lander until its ttl. Delete it with that command only once no lander run is active.
+- **lockRetained**: this run did not delete its own lock (the alert says why and gives the command). Report it; it blocks every lander until it is deleted, or reclaimed as stale once its ttl has passed. When the alert says a command could not be stopped, first make sure that command and everything it started (in the lander checkout) have stopped; then delete the lock with that command, and only while no lander run is active.
 - **paused** or a sweep alert: open a ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node ~/.agents/bin/land-queue.mjs unpause` takes the landing lock (it refuses while another lander holds it), reruns the sweep and clears the pause only when it is green; the owner may also clear it.
 - **error** on a repo: report the message; do not retry in a loop.
 
