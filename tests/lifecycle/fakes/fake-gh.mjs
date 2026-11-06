@@ -59,6 +59,8 @@ function pr(sub, rest) {
     // Test hook: the first read of PR n after it merged fails (the merge itself went through).
     if (s.failViewAfterMerge === p.number && p.state === 'MERGED') { delete s.failViewAfterMerge; save(s); die('HTTP 502: Bad Gateway'); }
     process.stdout.write(JSON.stringify(view(p)));
+    // mutateAfter kind 'prView': counts the reads of that one PR.
+    if (s.mutateAfter?.kind === 'prView' && s.mutateAfter.pr === p.number) { countAndMutate(s, 'prView'); save(s); }
     return;
   }
   if (sub === 'list') {
@@ -144,7 +146,7 @@ function label(sub, rest) {
 
 // Test hook: right after the n-th call of one kind ('varGet': a repo variable read, 'lockGet':
 // a landing-lock ref read), change one PR once, so only the reads after it see the change:
-// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel? }.
+// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel? }; kind 'prView' counts reads of PR `pr`.
 function countAndMutate(s, kind) {
   const m = s.mutateAfter;
   if (!m || m.kind !== kind) return;

@@ -722,6 +722,42 @@ describe('land-pr', () => {
     assert.equal(lockExists(t), false);
   });
 
+  // A retarget right after the first (unlocked) checks, seen first by the locked read: refused
+  // in every mode, before any edit or merge (B4: the validated target is never re-based).
+  for (const mode of ['merge-now', 'queue', 'release-hold', 'hold']) {
+    test(`a retarget while taking the lock is refused before any change (${mode})`, () => {
+      const t = setup();
+      sh(t.bare, t.env, 'branch', 'other', 'main');
+      let args;
+      if (mode === 'release-hold') {
+        const head = heldPr(t);
+        args = ['1', '--sha', head, '--release-hold', '--holder', HOLDER];
+      } else if (mode === 'hold') {
+        queuePr(t, 1);
+        args = ['hold', '1', '--holder', HOLDER];
+      } else {
+        if (mode === 'queue') queuePr(t, 2);
+        args = ['1', '--sha', makePr(t, 1)];
+      }
+      // The change lands right after the unlocked checks: after repo-variable read #1 (the
+      // refusal checks), or for hold (no variable read) after its first read of the PR.
+      const s = state(t);
+      s.mutateAfter = mode === 'hold' ? { kind: 'prView', n: 1, pr: 1, base: 'other' } : { kind: 'varGet', n: 1, pr: 1, base: 'other' };
+      saveState(t, s);
+      const body = prOf(t, 1).body;
+      const labels = [...prOf(t, 1).labels].sort();
+      const before = state(t).calls.length;
+      const r = tool(t, LAND_PR, ...args, '--repo', 'o/r');
+      assert.notEqual(r.status, 0, r.out);
+      assert.match(`${r.out}\n${r.err}`, /now targets other/);
+      const calls = state(t).calls.slice(before);
+      assert.equal(calls.some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge'), false, 'nothing changed');
+      assert.equal(prOf(t, 1).body, body);
+      assert.deepEqual([...prOf(t, 1).labels].sort(), labels);
+      assert.equal(lockExists(t), false);
+    });
+  }
+
   test('capacity: a queue-hold PR does not use a slot (it still counts for fairness)', () => {
     const t = setup({ maxQueued: 2 });
     queuePr(t, 1, { labels: ['queue-hold'] });

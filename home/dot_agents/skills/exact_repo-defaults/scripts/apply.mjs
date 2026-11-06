@@ -118,6 +118,8 @@ export function replaceVia(tmp, target, text, mode, inPlace) {
   try {
     fs.writeFileSync(tmp, text, { flag: 'wx', ...(mode === undefined ? {} : { mode }) });
     created = true;
+    // The umask can clear bits at creation (0664 becomes 0644 under 022): set the mode exactly.
+    if (mode !== undefined) fs.chmodSync(tmp, mode);
     if (inPlace) { fs.copyFileSync(tmp, target); fs.unlinkSync(tmp); } else fs.renameSync(tmp, target);
   } catch (e) {
     if (created) { try { fs.unlinkSync(tmp); } catch { /* already moved or gone */ } }
@@ -166,6 +168,11 @@ function agentsBlock(root) {
   }
   const eol = eolOf(text);
   const blocks = [...text.matchAll(BLOCK_RE)];
+  // A BEGIN inside a match means an END is missing: the match would swallow repo text up to a
+  // later block's END. Report it; never replace it.
+  if (blocks.some((b) => b[0].slice(1).includes('<!-- BEGIN agent-standard'))) {
+    return { name: 'AGENTS.md block', status: 'invalid', detail: 'a BEGIN marker without its END before the next block: fix by hand' };
+  }
   if (/<!-- BEGIN agent-standard/.test(text) && !blocks.length) {
     return { name: 'AGENTS.md block', status: 'invalid', detail: 'BEGIN marker without END: fix by hand' };
   }
@@ -501,9 +508,13 @@ function main() {
   const known = new Set(['--inspect', '--check', '--apply', '--repo', '--json', '--offline', '--help']);
   for (const f of flags) if (!known.has(f)) { process.stderr.write(`unknown option ${f}\n`); return 2; }
   if (flags.has('--help')) { process.stdout.write('usage: node apply.mjs [--inspect|--check|--apply] [--repo <path>] [--json] [--offline]\n'); return 0; }
+  // One mode at most, and --repo needs a path: a wrong call stops here, before any write.
+  const modes = ['--inspect', '--check', '--apply'].filter((m) => flags.has(m));
+  if (modes.length > 1) { process.stderr.write(`choose one of ${modes.join(', ')}\n`); return 2; }
   const mode = flags.has('--apply') ? 'apply' : flags.has('--check') ? 'check' : 'inspect';
   const ri = argv.indexOf('--repo');
-  const start = ri >= 0 ? path.resolve(argv[ri + 1] || '.') : process.cwd();
+  if (ri >= 0 && (argv[ri + 1] === undefined || argv[ri + 1].startsWith('--'))) { process.stderr.write('--repo needs a path\n'); return 2; }
+  const start = ri >= 0 ? path.resolve(argv[ri + 1]) : process.cwd();
   const top = git(['rev-parse', '--show-toplevel'], start);
   if (!top.ok) { process.stderr.write('repo-defaults: not inside a git checkout\n'); return 2; }
   const root = path.resolve(top.out);

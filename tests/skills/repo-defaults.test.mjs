@@ -614,6 +614,55 @@ describe('repo-defaults apply.mjs', () => {
     assert.match(run(r, '--inspect').out, /WARN {2}\.github\/workflows could not be listed/);
   });
 
+  test('a BEGIN without its END before a second block: invalid, the repo text between is untouched', () => {
+    const text = `${BLOCK.replace('<!-- END agent-standard -->', '')}\n\nRepo text that must stay.\n\n${BLOCK.replace(/v1/g, 'v0')}\n`;
+    const r = repo({ 'AGENTS.md': text });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    const item = a.json.items.find((i) => i.name === 'AGENTS.md block');
+    assert.equal(item.status, 'invalid');
+    assert.match(item.detail, /BEGIN marker without its END/);
+    assert.equal(read(r, 'AGENTS.md'), text);
+  });
+
+  test('CLI: --repo without a path and two modes at once exit 2 before any write', () => {
+    const r = repo();
+    for (const args of [['--apply', '--repo'], ['--repo', '--apply'], ['--apply', '--check']]) {
+      const p = spawnSync(process.execPath, [APPLY, ...args], { cwd: r.work, env: r.e, encoding: 'utf8', shell: false });
+      assert.equal(p.status, 2, `${args.join(' ')}: ${p.stdout}${p.stderr}`);
+      assert.equal(fs.existsSync(path.join(r.work, 'AGENTS.md')), false, `${args.join(' ')} wrote nothing`);
+    }
+  });
+
+  test('a rewritten file keeps its exact mode (0664 under umask 022), on both write paths', (t) => {
+    if (process.platform === 'win32') { t.skip('POSIX modes'); return; }
+    const old = '<!-- BEGIN agent-standard v0 -->\nold\n<!-- END agent-standard -->\n';
+    const r = repo({ 'AGENTS.md': old, 'CLAUDE.md': 'Claude note.\n' });
+    fs.chmodSync(path.join(r.work, 'AGENTS.md'), 0o664);
+    fs.chmodSync(path.join(r.work, 'CLAUDE.md'), 0o664);
+    // CLAUDE.md gets a second name: its write goes the in-place (several hard links) way.
+    fs.linkSync(path.join(r.work, 'CLAUDE.md'), path.join(path.dirname(r.work), 'claude-other-name.md'));
+    const saved = process.umask(0o022);
+    try {
+      assert.equal(run(r, '--apply').status, 0);
+    } finally {
+      process.umask(saved);
+    }
+    assert.equal(fs.statSync(path.join(r.work, 'AGENTS.md')).mode & 0o777, 0o664, 'rename path');
+    assert.equal(fs.statSync(path.join(r.work, 'CLAUDE.md')).mode & 0o777, 0o664, 'in-place path');
+    assert.match(read(r, 'CLAUDE.md'), /^@AGENTS\.md/);
+  });
+
+  test('docs/agents/repo.md with every placeholder filled counts no TODO marker', () => {
+    const r = repo();
+    assert.equal(run(r, '--apply').status, 0);
+    const p = path.join(r.work, 'docs', 'agents', 'repo.md');
+    fs.writeFileSync(p, read(r, 'docs/agents/repo.md').replace(/TODO\(repo-defaults\)$/gm, 'filled'));
+    const rj = path.join(r.work, '.agents', 'repo.json');
+    fs.writeFileSync(rj, read(r, '.agents/repo.json').replace(/TODO\(repo-defaults\)[^"]*/g, 'filled'));
+    assert.equal(run(r, '--inspect', '--json').json.todo, null);
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

@@ -2,7 +2,7 @@
 
 Facts only. Process (worktrees, landing, cleanup, credentials) comes from the global rules and the
 managed block at the top of `AGENTS.md`; a line here may add a stricter check, never a different
-process. Machine-readable settings live in `.agents/repo.json`. Replace every `TODO(repo-defaults)`.
+process. Machine-readable settings live in `.agents/repo.json`. Replace every placeholder below.
 
 ## Gate
 

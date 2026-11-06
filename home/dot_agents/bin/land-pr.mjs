@@ -106,7 +106,8 @@ function hold(args, n) {
     return '';
   };
   // Read-only checks first.
-  const first = check(gh.prView(n));
+  const seen = gh.prView(n);
+  const first = check(seen);
   if (first) return refuse(first);
   // The edit happens under the landing lock: the lander changes PR bodies and labels only while
   // holding it, and GitHub keeps the last body written, so this is what stops a bounce from
@@ -122,6 +123,10 @@ function hold(args, n) {
     const pr = gh.prView(n);
     const again = check(pr);
     if (again) return refuse(again);
+    // The same PR as checked before the lock: a retarget meanwhile is refused, with no edit.
+    if (pr.baseRefName !== seen.baseRefName || pr.headRefName !== seen.headRefName) {
+      return refuse(`the PR now targets ${pr.baseRefName} from ${pr.headRefName} (it changed while taking the lock); run hold again`);
+    }
     gh.ensureLabels();
     gh.prEdit(n, { body: addHold(pr.body, holder), add: ['queue-hold'] });
     const after = gh.prView(n);
@@ -201,7 +206,9 @@ async function main() {
       : `the landing lock stayed busy (a landing is in progress); run land-pr again after it; nothing was changed`);
   }
   try {
-    return await underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse, mergedOut });
+    // The base and head branch this run validated (before the lock); every locked read must match.
+    const want = { base: pr.baseRefName || cfg.base, headRef: pr.headRefName };
+    return await underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse, mergedOut, want });
   } finally {
     if (!lock.release()) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);
   }
@@ -228,12 +235,19 @@ function queueFull(gh, cfg, n, labels, line) {
   return !room || line.waiting.length > 0;
 }
 
-async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse, mergedOut }) {
-  // The same PR as checked before the lock.
+async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse, mergedOut, want }) {
+  // The same PR as checked before the lock: same head, same base and branch (a retarget while
+  // waiting for the lock is caught here, before anything is changed).
   let pr = gh.prView(n);
   if (pr.state === 'MERGED') return mergedOut(pr);
   if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
   if (pr.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${pr.headRefOid}; re-run the gate`);
+  const sameTarget = (p) => {
+    if ((p.baseRefName || want.base) !== want.base || p.headRefName !== want.headRef) {
+      throw new LandError(`PR #${n} now targets ${p.baseRefName} from ${p.headRefName}; re-run the gate and land-pr`);
+    }
+  };
+  sameTarget(pr);
 
   // Release the caller's own hold and record the new gated sha in one edit. Every check runs
   // again on this fresh read first (only queue-hold itself is excepted; `landing`, an unmerged
@@ -268,14 +282,14 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     pr = gh.prView(n);
     if (pr.state === 'MERGED') return mergedOut(pr);
     if (pr.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${pr.headRefOid} while releasing the hold; re-run the gate`);
+    sameTarget(pr);
   }
 
   const refused = refusal(gh, pr);
   if (refused) return refuse(refused);
   const labels = labelNames(pr);
   const blocked = labels.includes('queue-blocked');
-  const base = pr.baseRefName || cfg.base;
-  const headRef = pr.headRefName;
+  const { base, headRef } = want;
   fetchBranch(root, base);
   const current = isAncestor(`refs/remotes/origin/${base}`, sha, root);
   let line = othersInLine(gh, n);
