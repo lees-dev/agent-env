@@ -101,8 +101,9 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
         timedOut = true;
         killTree(child.pid, 'SIGTERM');
         timers.push(setTimeout(() => killTree(child.pid, 'SIGKILL'), 3000));
-        // A tree that cannot be stopped is reported rather than waited on forever.
-        timers.push(setTimeout(() => { stuck = true; done(124); }, 30000));
+        // A tree that cannot be stopped is not waited on forever: `stuck` tells the caller the
+        // command may still run, so it keeps the landing lock and touches nothing more.
+        timers.push(setTimeout(() => { stuck = true; done(124); }, stuckMs()));
       }, timeoutMs));
     }
     let finished = false;
@@ -112,6 +113,8 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
       // The command is gone; on Unix, anything left in its group goes with it.
       if (!isWindows && timedOut) killTree(child.pid, 'SIGKILL');
+      // One that could not be stopped must not keep this process from exiting.
+      if (stuck) child.unref();
       resolve({ status, timedOut, stuck });
     };
     child.on('error', () => done(127));
@@ -123,12 +126,21 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
 // (spawned detached), so the group is signalled. Windows: taskkill /T /F on the tree.
 function killTree(pid, signal) {
   if (!pid) return;
+  // Test hook: simulate a process tree that cannot be stopped (nothing is signalled).
+  if (process.env.AGENT_LAND_TEST_NO_KILL === '1') return;
   if (isWindows) {
     const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
     procRun(taskkill, ['/PID', String(pid), '/T', '/F'], { env: childEnv() });
     return;
   }
   try { process.kill(-pid, signal); } catch { /* already gone */ }
+}
+
+// How long a timed-out command may take to exit after it was signalled (AGENT_LAND_STUCK_MS
+// overrides the 30 s for tests).
+function stuckMs() {
+  const v = Number(process.env.AGENT_LAND_STUCK_MS);
+  return Number.isFinite(v) && v > 0 ? v : 30000;
 }
 
 // The time one repo command may run (gate, setup, sweep): repo.json commandTimeoutMin (default
@@ -476,11 +488,18 @@ export class LandingLock {
   // the caller must report it (it stays until its ttl or until deleted by hand). The delete is
   // lock plumbing, not repo content, so it skips the repo's pre-push hook (--no-verify); every
   // push of PR content keeps the hooks.
+  // Never release: a command started under the lock may still be running (see runCommands).
+  keep(reason) { this.keepReason = reason; }
+
   release() {
     if (!this.commit) return true;
     const mine = this.commit;
     this.commit = null;
     this.retained = null;
+    if (this.keepReason) {
+      this.retained = { sha: mine, reason: `kept on purpose: ${this.keepReason}` };
+      return false;
+    }
     const r = git(['push', '--no-verify', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${LOCK_REF}:${mine}`, 'origin', `:refs/heads/${LOCK_REF}`], { cwd: this.cwd });
     if (r.status === 0) return true;
     let cur;
@@ -498,7 +517,11 @@ export class LandingLock {
 
 // What to tell the user when release() kept the lock.
 export function retainedLockMessage(lock) {
-  return `the landing lock could not be released (${lock.retained?.reason}); it stays until its ttl (${lock.ttlMin} min) or until removed with: git push --no-verify origin :refs/heads/${LOCK_REF}`;
+  const remove = `git push --no-verify origin :refs/heads/${LOCK_REF}`;
+  if (lock.keepReason) {
+    return `the landing lock is kept because ${lock.keepReason}; stop that command's processes in the lander checkout first, then remove the lock with: ${remove}`;
+  }
+  return `the landing lock could not be released (${lock.retained?.reason}); it stays until its ttl (${lock.ttlMin} min) or until removed with: ${remove}`;
 }
 
 export function baseTreeOf(cwd, ref) {
@@ -794,8 +817,14 @@ export async function runCommands(entries, dir, lock, cfg) {
   for (const { name, cmd } of entries) {
     const r = await runAsync(splitArgv(cmd), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(cfg.lockTtlMin) : 0, onTick, timeoutMs: limit });
     const what = `${name} \`${cmd}\``;
+    if (r.stuck) {
+      // It may still be running in the checkout: the lock must outlive it.
+      const summary = `${what} timed out after ${Math.round(limit / 60000) || '<1'} min and could not be stopped`;
+      if (lock) lock.keep(summary);
+      return { ok: false, timedOut: true, stuck: true, name, cmd, status: r.status, summary };
+    }
     if (lost) return { ok: false, lost: true, name, cmd, status: r.status, summary: `${what}: the landing lock was lost` };
-    if (r.timedOut) return { ok: false, timedOut: true, name, cmd, status: r.status, summary: `${what} timed out after ${Math.round(limit / 60000) || '<1'} min${r.stuck ? ' (it could not be stopped)' : ''}` };
+    if (r.timedOut) return { ok: false, timedOut: true, name, cmd, status: r.status, summary: `${what} timed out after ${Math.round(limit / 60000) || '<1'} min` };
     if (r.status !== 0) return { ok: false, name, cmd, status: r.status, summary: `${what} exit ${r.status}` };
   }
   return { ok: true };
@@ -823,6 +852,8 @@ export async function runSweep({ cfg, mainRoot, lock }) {
   fetchBranch(dir, cfg.base);
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
   const r = await runCommands([...named('setup', cfg.setup), ...named('wideSweep', cfg.wideSweep)], dir, lock, cfg);
+  // A command that could not be stopped may still use the checkout: leave it as it is.
+  if (r.stuck) return r;
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
   // A sweep can finish before any refresh noticed another lander: ownership is checked last.
   if (!r.lost && lock && !lock.stillHeld()) return { ...r, ok: false, lost: true, summary: 'the landing lock was lost' };
@@ -841,6 +872,12 @@ export async function dueSweep(ctx) {
   const r = await runSweep(ctx);
   const out = { ran: true, ok: r.ok, afterMerges };
   if (r.lost) { out.ok = false; out.lost = true; out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost; it stays due`; return out; }
+  if (r.stuck) {
+    // The caller stops; the lock is kept (runCommands) and the sweep stays due.
+    out.stop = true;
+    out.alert = `wide sweep on ${cfg.base}: ${r.summary}; it stays due`;
+    return out;
+  }
   markSwept(gh.repo);
   if (r.ok) return out;
   gh.setPaused(true);

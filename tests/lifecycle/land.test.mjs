@@ -60,6 +60,7 @@ if (process.env.OP_SERVICE_ACCOUNT_TOKEN) { console.log('token leaked into the g
 if (process.env.LAND_TEST_GATE_HANG === '1') {
   const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore' });
   fs.writeFileSync(f + '.child', String(c.pid));
+  fs.writeFileSync(f + '.self', String(process.pid));
   setInterval(() => {}, 1000);
 } else {
 const g = (...a) => spawnSync('git', ['-C', process.env.FAKE_GH_BARE, ...a], { encoding: 'utf8' }).stdout.trim();
@@ -1093,6 +1094,29 @@ describe('land-queue', () => {
     assert.doesNotMatch(sh(t.work, t.env, 'worktree', 'list', '--porcelain'), /land-queue lander checkout/, 'not locked by the lander');
     assert.deepEqual(prOf(t, 1).labels, ['queued']);
     assert.equal(lockExists(t), false);
+  });
+
+  test('run: a timed-out gate that cannot be stopped keeps the lock, leaves the checkout and stops the run', { timeout: 180000 }, () => {
+    const t = setup();
+    queuePr(t, 1, { priority: 1 });
+    queuePr(t, 2, { priority: 2 });
+    advanceMain(t, 'other.txt', 'x\n');
+    // The kill is simulated as failing (nothing is signalled); the test stops its own gate after.
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '2000', AGENT_LAND_STUCK_MS: '1500', AGENT_LAND_TEST_NO_KILL: '1' });
+    try {
+      const rep = runQueue(t);
+      assert.match(rep.bounced[0].reason, /timed out after .* and could not be stopped/);
+      assert.ok(rep.lockRetained?.sha, 'the lock is reported as kept');
+      assert.match(rep.alerts.join('\n'), /the landing lock is kept because .* could not be stopped; stop that command's processes/);
+      assert.equal(lockExists(t), true, 'the lock outlives the command');
+      assert.equal(rep.merged.length, 0);
+      assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the run stopped');
+      assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset under the running command');
+    } finally {
+      for (const f of ['.self', '.child']) {
+        try { process.kill(Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}${f}`, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
   });
 
   test('run: an unlocked checkout at the lander path holding an ignored user file is refused intact', () => {

@@ -179,6 +179,9 @@ async function landOne(ctx, pr) {
     let retried = false;
     if (!g.ok && !g.lost && !g.timedOut) { retried = true; g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg); }
     if (g.lost) { resetTo(dir, baseRef); return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push'); }
+    // A gate that could not be stopped may still use the checkout: no reset; the lock is kept
+    // (runCommands) and the run stops when it is not released.
+    if (g.stuck) return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}, after the rebase`) };
     if (!g.ok) {
       resetTo(dir, baseRef);
       return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}${retried ? ' (retried once)' : ''}, after the rebase`) };
@@ -294,7 +297,7 @@ async function sweepAfter(ctx, report) {
     report.sweep = { ran: true, ok: s.ok, afterMerges: s.afterMerges, lost: Boolean(s.lost) };
     if (s.alert) report.alerts.push(s.alert);
     if (s.paused) report.paused = true;
-    return Boolean(s.lost);
+    return Boolean(s.lost || s.stop);
   } catch (e) {
     report.sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
     report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}; it stays due and runs again next time`);
