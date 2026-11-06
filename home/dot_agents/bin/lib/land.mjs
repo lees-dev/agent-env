@@ -955,9 +955,17 @@ export async function dueSweep(ctx) {
     out.alert = `wide sweep on ${cfg.base}: ${r.summary}; it stays due`;
     return out;
   }
+  if (r.ok) { markSwept(gh.repo); return out; }
+  // Red: the pause must be recorded before the sweep counts as done. If it cannot be, the sweep
+  // stays due and the caller stops: nothing more lands until a sweep runs again and a pause holds.
+  try {
+    gh.setPaused(true);
+  } catch (e) {
+    out.stop = true;
+    out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (${r.summary}) and the pause could not be set (${firstLine(e?.message || e)}); nothing more lands, and the sweep runs again first next time`;
+    return out;
+  }
   markSwept(gh.repo);
-  if (r.ok) return out;
-  gh.setPaused(true);
   out.paused = true;
   out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (${r.summary}); the repo is paused (AGENT_LANDING_PAUSED=1). Open a ticket, fix ${cfg.base}, then run land-queue unpause.`;
   return out;

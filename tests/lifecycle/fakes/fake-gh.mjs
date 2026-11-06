@@ -186,6 +186,8 @@ function api(rest) {
       process.stdout.write(JSON.stringify({ name: v[1], value: s.variables[v[1]] }));
       return;
     }
+    // Test hook: writing repo variables fails (setting the pause cannot be recorded).
+    if (s.variablesWriteFail && method !== 'GET') { save(s); die('Server Error', 500); }
     if (method === 'POST') {
       if (o.f.name in s.variables) { save(s); die('Already exists', 409); }
       s.variables[o.f.name] = o.f.value;

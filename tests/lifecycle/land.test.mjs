@@ -1438,6 +1438,32 @@ describe('land-queue', () => {
     assert.equal(JSON.parse(q.out).busy, undefined);
   });
 
+  test('run: a red sweep whose pause cannot be set stays due, lands nothing more, and runs first next time', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1, { priority: 1 });
+    queuePr(t, 2, { priority: 2 });
+    t.env.LAND_TEST_SWEEP = 'fail';
+    let s = state(t); s.variablesWriteFail = true; saveState(t, s);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1], 'the merge before the sweep counts');
+    assert.equal(prOf(t, 1).state, 'MERGED');
+    assert.deepEqual(prOf(t, 1).labels, [], 'the merged PR is not put back in line');
+    assert.match(rep.alerts.join('\n'), /the pause could not be set.*sweep runs again first/);
+    assert.deepEqual(prOf(t, 2).labels, ['queued'], 'nothing more landed');
+    assert.equal(prOf(t, 2).state, 'OPEN');
+    const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].sinceSweep, 1, 'still due');
+    assert.equal(lockExists(t), false);
+    // Next run: the sweep runs before any landing; this time the pause holds.
+    s = state(t); delete s.variablesWriteFail; saveState(t, s);
+    const next = runQueue(t);
+    assert.equal(next.sweep.ran, true);
+    assert.equal(next.paused, true);
+    assert.equal(next.merged.length, 0);
+    assert.equal(prOf(t, 2).state, 'OPEN');
+    assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
+  });
+
   test('run: waiting PRs are admitted only under the landing lock', () => {
     const t = setup({ maxQueued: 2 });
     queuePr(t, 1);

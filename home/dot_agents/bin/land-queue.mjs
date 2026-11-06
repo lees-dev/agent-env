@@ -378,6 +378,14 @@ async function runRepo(t, opts) {
       try { resetLeftovers(gh, report); } finally { kept = !releaseLock(ctx, report); }
       if (kept) { fillQueueState(gh, report); return report; }
     }
+    // A sweep that is already due (one that failed to pause, or merges by land-pr) runs before
+    // anything else lands; if it stops or pauses, nothing lands in this run.
+    if (sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
+      if (!takeLock(ctx, report, opts)) { fillQueueState(gh, report); return report; }
+      let stop = false;
+      try { stop = await sweepAfter(ctx, report); } finally { if (!releaseLock(ctx, report)) stop = true; }
+      if (stop || report.paused) { fillQueueState(gh, report); return report; }
+    }
   }
   let lost = false;
   for (let i = 0; i < MAX_PRS_PER_RUN; i++) {
