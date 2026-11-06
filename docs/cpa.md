@@ -47,18 +47,20 @@ The harness area writes those settings. This area owns the helper paths and what
 
 ## 1Password vaults
 
-A 1Password service account is granted whole vaults, not single items (https://developer.1password.com/docs/service-accounts/). Service mode is the default on every device, including desktops, so agent work never needs a desktop or Windows Hello approval. The hub uses an owner-provisioned credential for client-key administration; other devices get their own vault and read-only service account.
+A 1Password service account is granted whole vaults, not single items (https://developer.1password.com/docs/service-accounts/). Service mode is the default on every device, including desktops, so agent work never needs a desktop or Windows Hello approval. The hub uses an owner-provisioned credential for client-key administration; other devices get their own vault and service account. That service account also gets read+write on the shared vault `agent-repos`, which holds the repositories' non-production credentials. One shared vault means a new repository never needs a new token on any device.
 
 | Vault | Holds | Who can read it |
 |---|---|---|
 | `agent-env` | Hub-side client keys and opt-in account-mode keys, field `credential` | The owner and hub |
 | `agent-env-<remark>` | That one device's `cpa-client-<remark>`, field `credential`, nothing else | The device's service account (read-only) and the owner |
+| `agent-repos` | Repositories' development and test credentials, items `<repo>-<service>-<env>` (`docs/lifecycle.md`). Never production values or client keys | Every device's service account (read+write) and the owner |
 | Owner-only admin vault | Private administration and restore material | Never shared with device service accounts |
 
 - **Hub service mode:** `role hub`, `AGENT_ENV_OP_MODE=service`, `opVault=agent-env`. The owner restores the hub service token privately when rebuilding.
-- **Other devices:** `AGENT_ENV_OP_MODE=service`, `opVault=agent-env-<remark>` by default. Never grant their service accounts any owner-only vault or `agent-env`. Keep one key and one service account per device, including BEAST's WSL, so revoking one device affects no other device.
+- **Other devices:** `AGENT_ENV_OP_MODE=service`, `opVault=agent-env-<remark>` by default. Grant their service accounts `agent-env-<remark>` read-only and `agent-repos` read+write, nothing else. Never grant them any owner-only vault or `agent-env`. Keep one key and one service account per device, including BEAST's WSL, so revoking one device affects no other device.
+- **Devices provisioned before `agent-repos`:** A service account's vault access cannot change after it is created ("Service account permissions, vault access, and Environment access are immutable", https://www.1password.dev/service-accounts/get-started/, checked 2026-11-06). Create a replacement service account with both grants as below, persist its token on the device in place of the old one, rerun preflight, then delete the old service account.
 - **Account mode** is an opt-in (`AGENT_ENV_OP_MODE=account`) using desktop CLI integration or `op signin`. Its vault defaults to `agent-env`. Clear the service token from that process before using account mode. Desktop approvals are an explicit tradeoff of this opt-in.
-- **Preflight** checks device service-account scope by counting accessible vaults and unexpected items, without reading fields or printing titles. The hub role is exempt from device scope restrictions. Owner-only vaults are never apply-time `opVault` values.
+- **Preflight** checks device service-account scope by counting accessible vaults and unexpected items, without reading fields or printing titles. It leaves `agent-repos` out of that count, does not scan its items, and warns when the device cannot reach it. The hub role is exempt from device scope restrictions. Owner-only vaults are never apply-time `opVault` values.
 
 ### Provision a device without recurring prompts
 
@@ -69,10 +71,10 @@ $null | op vault create agent-env-<remark> *> $null
 py -I ~/.cpa-tools/mint_client_key.py <remark> --vault agent-env-<remark>
 ```
 
-Check each exit status before continuing. The owner then creates the device's read-only service account on BEAST (https://developer.1password.com/docs/service-accounts/get-started/). This is the only 1Password approval needed for device provisioning. It needs the owner's account session, not a service token. In a separate owner terminal with `OP_SERVICE_ACCOUNT_TOKEN` removed from that process, capture the result in memory for private transfer to the new device, never in chat or terminal output:
+Check each exit status before continuing. The owner then creates the device's service account on BEAST, read-only on its own vault and read+write on `agent-repos` (https://developer.1password.com/docs/service-accounts/get-started/). This is the only 1Password approval needed for device provisioning. It needs the owner's account session, not a service token. In a separate owner terminal with `OP_SERVICE_ACCOUNT_TOKEN` removed from that process, capture the result in memory for private transfer to the new device, never in chat or terminal output:
 
 ```powershell
-$deviceToken = ($null | op service-account create agent-env-<remark> --vault agent-env-<remark>:read_items --raw 2>$null) -join ''
+$deviceToken = ($null | op service-account create agent-env-<remark> --vault agent-env-<remark>:read_items --vault agent-repos:read_items,write_items --raw 2>$null) -join ''
 ```
 
 If creation fails or returns an empty token, stop. Use a temporary item in the owner's private vault as the transfer channel. In the same owner terminal, pipe the item template on stdin, capturing the result without printing it:
@@ -291,7 +293,7 @@ Keep that inventory out of git. Preflight reports counts only.
 
 1. Install the pinned `op` CLI using AGENTS.md step 1. On a hub rebuild, the owner restores its service token with the no-echo procedure. Select service mode and client-key vault `agent-env`.
 2. Apply the tailnet policy snippet and tag Beast. Check that every client still gets HTTP 401 from the serve URL when it sends no key.
-3. On BEAST, apply to deploy `~/.cpa-tools` and the helpers. For every other device, create its vault and mint a separate key into it with the hub credential. The owner approves creation of its read-only service account once on BEAST and enters its token on that device. Rotate existing shared-vault keys as each device migrates.
+3. On BEAST, apply to deploy `~/.cpa-tools` and the helpers. For every other device, create its vault and mint a separate key into it with the hub credential. The owner approves creation of its service account (read-only on its vault, read+write on `agent-repos`) once on BEAST and enters its token on that device. Rotate existing shared-vault keys as each device migrates.
 4. Persist each device's token for its user, then preflight, init in service mode, backup, apply, and verify. Each machine's verify must show HTTP 200 for each harness. The runbook loads persisted tokens for each process without restarting the agent.
 5. Clean up the old wiring on each machine.
 6. Handle private integrations in their owning repositories.
