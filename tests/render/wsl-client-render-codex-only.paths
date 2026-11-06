@@ -1,6 +1,9 @@
 .agents/bin/agent-secret.mjs
 .agents/bin/agent-worktree.mjs
+.agents/bin/land-pr.mjs
+.agents/bin/land-queue.mjs
 .agents/bin/lib/hook-runner.mjs
+.agents/bin/lib/land.mjs
 .agents/bin/lib/ledger.mjs
 .agents/bin/lib/op.mjs
 .agents/bin/lib/proc.mjs
@@ -22,6 +25,7 @@
 .agents/skills/herdr/
 .agents/skills/how/
 .agents/skills/kun/
+.agents/skills/land-queue/
 .agents/skills/leaving-pr-comments/
 .agents/skills/maintain-verification-skill/
 .agents/skills/modernize/
@@ -36,6 +40,7 @@
 .agents/skills/principle-subtract-before-you-add/
 .agents/skills/principle-type-system-discipline/
 .agents/skills/react-best-practices/
+.agents/skills/repo-defaults/
 .agents/skills/sol-loop/
 .agents/skills/subagent-routing/
 .agents/skills/takeover/
