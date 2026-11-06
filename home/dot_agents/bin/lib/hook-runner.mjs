@@ -1,7 +1,8 @@
 // Runs one function of a repo's .agents/hooks.mjs in its own node process, so hook code never
 // shares a process (or an environment) with the 1Password token. agent-worktree.mjs starts it
 // with OP_SERVICE_ACCOUNT_TOKEN stripped and the context as JSON on stdin.
-// Exit codes: 0 ok, 1 the hook threw, 3 the hook file has no such function.
+// Exit codes: 0 ok, 1 the hook threw. A missing function is reported by writing "absent" to
+// the result file the engine names (exit codes alone are ambiguous: a hook may exit 3 itself).
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { addResource, normalizeTrack, removeResource, updateLedger } from './ledger.mjs';
@@ -9,11 +10,14 @@ import { stripToken } from './op.mjs';
 import { run, splitArgv } from './proc.mjs';
 
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-const { hookFile, fn, ctx: data, commonDir } = input;
+const { hookFile, fn, ctx: data, commonDir, resultFile } = input;
 const say = (msg) => process.stderr.write(`agent-worktree: [hook] ${msg}\n`);
 
 const mod = await import(pathToFileURL(hookFile).href);
-if (typeof mod[fn] !== 'function') process.exit(3);
+if (typeof mod[fn] !== 'function') {
+  if (resultFile) fs.writeFileSync(resultFile, 'absent');
+  process.exit(0);
+}
 
 const perWorktree = fn !== 'sweep' && data.wtId;
 const ctx = {

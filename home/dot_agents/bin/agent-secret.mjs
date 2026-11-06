@@ -66,7 +66,8 @@ function cwdRepo() {
 }
 
 function vaultOf(opts, repo) {
-  const v = opts.vault || (repo && repo.cfg.found && repo.cfg.vault) || 'agent-repos';
+  // repo.json's "vault" belongs to the landing tools; secrets default to agent-repos.
+  const v = opts.vault || 'agent-repos';
   if (!VAULT_RE.test(v)) throw new UsageError('invalid vault name');
   return v;
 }
@@ -86,10 +87,12 @@ export function parseEnvFile(text) {
   const out = new Map();
   const lines = String(text).replace(LEADING_BOM, '').split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*)$/);
+    const m = lines[i].match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=(.*)$/);
     if (!m) continue;
     const key = m[1];
-    let rest = m[2];
+    // `KEY= # note` is an empty value with a comment; `KEY=#x` keeps its literal value.
+    if (/^\s+#/.test(m[2])) { out.set(key, ''); continue; }
+    let rest = m[2].trimStart();
     const q = rest[0];
     if (q === '"' || q === "'" || q === '`') {
       let body = rest.slice(1);
@@ -204,6 +207,8 @@ function storeItem(vault, title, fields, o) {
     if (r.status !== 0) throw new Error(`op item create failed (exit ${r.status}): ${firstLine(r.stderr)}`);
     return { refused: [], written: fields.map((f) => f.name), created: true };
   }
+  // A JSON-template edit overwrites passkeys (1Password docs): never edit such an item.
+  if (/passkey/i.test(JSON.stringify(got.item))) throw new Error(`${title} holds a passkey; edit it in the 1Password app instead`);
   const merged = mergeFields(got.item, fields, o);
   if (!merged.changed) return { refused: merged.refused, written: [] };
   const id = got.item.id || title;
@@ -246,7 +251,9 @@ function retireSource(src) {
     fs.copyFileSync(src, dest, fs.constants.COPYFILE_EXCL);
   } catch (e) { return `could not create ${path.basename(dest)} (${e.code || e.message})`; }
   try { fs.chmodSync(dest, 0o600); } catch { /* Windows */ }
-  fs.unlinkSync(src);
+  try { fs.unlinkSync(src); } catch (e) {
+    return `copied to ${path.basename(dest)} but could not delete the source (${e.code || e.message}); delete one copy before retrying`;
+  }
   return null;
 }
 

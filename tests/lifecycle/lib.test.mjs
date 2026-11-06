@@ -143,6 +143,16 @@ describe('processes', () => {
     assert.deepEqual(procs.processesUnder(wt, list).map((p) => p.pid).sort(), [20, 21, 22]);
   });
 
+  test('a worktree folder named like a protected tool protects nothing inside it', () => {
+    const tb = `${root}${sep}toolbox`;
+    const exe = `${tb}${sep}bin${sep}server${isWin ? '.exe' : ''}`;
+    const list = [
+      proc1(70, 1, `${exe} --port 1`, { name: `server${isWin ? '.exe' : ''}`, exe }),
+      proc1(71, 1, `idea64 ${tb}`, { name: 'idea64.exe', exe: isWin ? 'C:\\JetBrains\\idea64.exe' : '/opt/jetbrains/idea64' }),
+    ];
+    assert.deepEqual(procs.processesUnder(tb, list).map((p) => p.pid), [70]);
+  });
+
   test('a "child" that started before its parent (reused parent pid) is not a descendant', () => {
     const list = [
       proc1(50, 1, `${node} ${wt}${sep}server.js`, { start: '5000' }),
@@ -181,12 +191,21 @@ describe('processes', () => {
     const psOut = { status: 0, stdout: '  1     0 Thu Nov  6 10:00:00 2026 /sbin/init\n', stderr: '' };
     assert.equal(procs.listPs({}, (cmd) => (cmd === 'ps' ? psOut : { status: 127, stdout: '', stderr: '', error: new Error('ENOENT') })), null);
     let psEnv;
-    const ok = procs.listPs({}, (cmd, args, o) => { if (cmd === 'ps') { psEnv = o.env; return psOut; } return { status: 0, stdout: 'p1\nn/\n', stderr: '' }; });
+    const comm = { status: 0, stdout: '  1 /Applications/IntelliJ IDEA.app/Contents/MacOS/idea\n', stderr: '' };
+    const lsof = { status: 0, stdout: 'p1\nn/\n', stderr: '' };
+    const runner = (main) => (cmd, args, o) => {
+      if (cmd !== 'ps') return lsof;
+      psEnv = o.env;
+      return args.includes('pid=,comm=') ? comm : main;
+    };
+    const ok = procs.listPs({}, runner(psOut));
     assert.equal(ok.length, 1);
     assert.equal(ok[0].cwd, '/');
     assert.equal(psEnv.LC_ALL, 'C');
+    assert.equal(ok[0].name, 'idea', 'the name comes from comm, even with spaces in the path');
+    assert.equal(ok[0].exe, '/Applications/IntelliJ IDEA.app/Contents/MacOS/idea');
     const odd = { status: 0, stdout: `${psOut.stdout}  2     1 jeu. 6 nov. 10:00:00 2026 /bin/x\n`, stderr: '' };
-    assert.equal(procs.listPs({}, (cmd) => (cmd === 'ps' ? odd : { status: 0, stdout: 'p1\nn/\n', stderr: '' })), null, 'an unreadable line makes the listing unknown');
+    assert.equal(procs.listPs({}, runner(odd)), null, 'an unreadable line makes the listing unknown');
   });
 
   test('stopProcesses re-checks a pid before SIGKILL', { skip: isWin }, async () => {

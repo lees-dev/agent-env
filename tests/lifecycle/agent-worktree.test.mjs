@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { after, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -213,6 +214,15 @@ describe('setup', () => {
     assert.equal(fs.readFileSync(path.join(elsewhere, '.env.local'), 'utf8'), 'keep\n');
   });
 
+  test('a refused env output the user created is left alone', () => {
+    const { s, repo } = fixture({ config: { env: { output: '.env.dev' } } });
+    write(path.join(repo.wt, '.env.dev'), 'MINE=1\n');
+    const r = engine(s, ['setup'], repo.wt);
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stderr, /is not git-ignored/);
+    assert.equal(fs.readFileSync(path.join(repo.wt, '.env.dev'), 'utf8'), 'MINE=1\n');
+  });
+
   test('a failing setup step fails setup', () => {
     const { s, repo } = fixture({ config: { setup: ['node -e "process.exit(3)"'] } });
     const r = engine(s, ['setup'], repo.wt);
@@ -390,6 +400,44 @@ describe('teardown', () => {
     assert.match(r.stderr, /remoteBranchDelete .* is not a valid pattern/);
     assert.equal(s.readState().docker.containers.length, 2);
     assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
+  test('a worktree port still in use keeps the worktree', async () => {
+    const { s, repo } = fixture({ config: { ports: { PORT: 41000 } } });
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    const port = ledgerOf(repo).ports.PORT;
+    const srv = net.createServer();
+    await new Promise((resolve) => srv.listen(port, '127.0.0.1', resolve));
+    try {
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 1, r.out);
+      assert.match(r.stderr, new RegExp(`1 port of this worktree still in use \\(PORT ${port}\\)`));
+      assert.equal(s.readState().docker.containers.length, 2);
+    } finally { await new Promise((resolve) => srv.close(resolve)); }
+  });
+
+  test('a hook that exits 3 is a failure, not a missing hook', () => {
+    const { s, repo } = fixture({ files: { '.agents/hooks.mjs': 'export function teardown() { process.exit(3); }\n' } });
+    merged(s, repo);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /hooks\.teardown failed \(exit 3\)/);
+    assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
+  test('an unreadable ledger is never replaced', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const f = path.join(repo.commonDir, 'agent-resources', `${repo.wtId}.json`);
+    write(f, '{ not json');
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /not valid JSON/);
+    assert.equal(fs.readFileSync(f, 'utf8'), '{ not json');
+    const sw = engine(s, ['sweep'], repo.main);
+    assert.equal(sw.status, 1, sw.out);
+    assert.equal(fs.readFileSync(f, 'utf8'), '{ not json');
   });
 
   test('a failing cr-review --cleanup keeps the worktree', () => {

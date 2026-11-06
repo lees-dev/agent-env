@@ -44,6 +44,18 @@ export function readJson(file, fallback = null) {
   }
 }
 
+/** A JSON file: its data, null when it does not exist; throws when it exists but is unreadable. */
+function readExisting(file) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw new Error(`${path.basename(file)} is unreadable (${e.code || e.message}); left as it is`);
+  }
+  try { return JSON.parse(text); } catch {
+    throw new Error(`${path.basename(file)} is not valid JSON; left as it is for a person to repair`);
+  }
+}
+
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
@@ -142,10 +154,10 @@ export function normalizeTrack(kind, id, worktreePath) {
 }
 
 export function readLedger(commonDir, wtId) {
-  return readJson(ledgerFile(commonDir, wtId), null);
+  return readExisting(ledgerFile(commonDir, wtId));
 }
 
-/** All ledgers of one repo: [{file, data}]. */
+/** All ledgers of one repo: [{file, wtId, data}]; an unreadable one has data null and error set. */
 export function listLedgers(commonDir) {
   let names = [];
   try {
@@ -153,15 +165,18 @@ export function listLedgers(commonDir) {
   } catch { return []; }
   return names.sort().map((n) => {
     const file = path.join(ledgerDir(commonDir), n);
-    return { file, wtId: n.slice(0, -5), data: readJson(file, null) };
-  }).filter((l) => l.data);
+    try {
+      return { file, wtId: n.slice(0, -5), data: readExisting(file) };
+    } catch (e) { return { file, wtId: n.slice(0, -5), data: null, error: e.message }; }
+  }).filter((l) => l.data || l.error);
 }
 
 /** Read-modify-write a ledger under its lock. fn gets the current object (or a fresh one). */
 export function updateLedger(commonDir, wtId, fn, init = {}) {
   const file = ledgerFile(commonDir, wtId);
   return withLock(file, () => {
-    const cur = readJson(file, null) || {
+    // Never replace a ledger that exists but cannot be read: its resource records matter.
+    const cur = readExisting(file) || {
       repo: null, repoRoot: null, worktreePath: null, branch: null, ticket: null,
       ports: {}, createdAt: new Date().toISOString(), state: 'active', prNumber: null,
       resources: [], ...init,

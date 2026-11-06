@@ -204,6 +204,13 @@ function envIgnore(dir, out) {
   return linkedAncestor(dir, out) ? [] : [out];
 }
 
+/** True when setup wrote this env output (its managed block, or the ledger records it). */
+function managedOutput(ctx, out) {
+  try { if (fs.readFileSync(out, 'utf8').includes(BEGIN)) return true; } catch { return false; }
+  const l = readLedger(ctx.commonDir, ctx.wtId);
+  return Boolean(l && (l.resources || []).some((r) => r.kind === 'env-file' && samePath(r.id, out)));
+}
+
 function removeFile(file) {
   try { fs.unlinkSync(file); return true; } catch { return false; }
 }
@@ -224,11 +231,19 @@ function runHook(fn, dir, data, commonDir) {
   const hookFile = path.join(dir, '.agents', 'hooks.mjs');
   if (!fs.existsSync(hookFile)) return null;
   const cwd = fs.existsSync(data.worktreePath || '') && !data.worktreeGone ? data.worktreePath : data.repoRoot;
-  const r = run(process.execPath, [HOOK_RUNNER], {
-    cwd, env: stripToken(process.env), input: JSON.stringify({ hookFile, fn, ctx: data, commonDir }), inherit: true,
-    stdoutToStderr: Boolean(jsonMode),
-  });
-  if (r.status === 3) return null;
+  // The runner reports a missing function in a result file, so no exit code a hook can
+  // produce (process.exit(3) included) is mistaken for "no such hook".
+  const resultFile = path.join(os.tmpdir(), `agent-hook-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+  let r;
+  let result = '';
+  try {
+    r = run(process.execPath, [HOOK_RUNNER], {
+      cwd, env: stripToken(process.env), input: JSON.stringify({ hookFile, fn, ctx: data, commonDir, resultFile }), inherit: true,
+      stdoutToStderr: Boolean(jsonMode),
+    });
+    try { result = fs.readFileSync(resultFile, 'utf8'); } catch { /* none written */ }
+  } finally { removeFile(resultFile); }
+  if (result === 'absent') return null;
   if (r.status !== 0) throw new Error(`hooks.${fn} failed (exit ${r.status})`);
   return 'ok';
 }
@@ -267,7 +282,7 @@ async function cmdSetup(opts) {
 
   // Ports: read, allocate and record under one repo-wide lock.
   const ports = await withLockAsync(path.join(ledgerDir(ctx.commonDir), 'ports'), async () => {
-    const others = listLedgers(ctx.commonDir).filter((l) => l.wtId !== ctx.wtId && l.data.state !== 'torn-down');
+    const others = listLedgers(ctx.commonDir).filter((l) => l.data && l.wtId !== ctx.wtId && l.data.state !== 'torn-down');
     const taken = new Set(others.flatMap((l) => Object.values(l.data.ports || {})));
     const prev = readLedger(ctx.commonDir, ctx.wtId);
     const p = await allocatePorts(ctx.cfg.ports, ctx.wtId, (prev && prev.ports) || {}, taken);
@@ -290,7 +305,8 @@ async function cmdSetup(opts) {
   const badRefs = fs.existsSync(tpl) ? foreignRefs(fs.readFileSync(tpl, 'utf8'), prefix) : 0;
   const outputUsable = !problem;
   if (problem) {
-    if (!linkedAncestor(ctx.worktreePath, out) && (isSymlink(out) || !isTracked(ctx.worktreePath, out))) removeFile(out);
+    // Remove only a link, or a file setup made earlier: never a file the user created.
+    if (!linkedAncestor(ctx.worktreePath, out) && (isSymlink(out) || (!isTracked(ctx.worktreePath, out) && managedOutput(ctx, out)))) removeFile(out);
     loud([`${path.basename(out)} ${problem}: nothing written to it.`, 'Make it a plain, git-ignored, untracked file, then rerun setup.']);
     envNote = `env file refused (${problem})`;
   } else if (badRefs) {
@@ -563,6 +579,16 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
       if (r.listFailed) { s.errors.push('process list failed: nothing stopped'); return s; }
       if (r.failed) { s.errors.push(`${plural(r.failed, 'process')} under the worktree could not be stopped`); return s; }
     }
+    // Windows does not expose a process's working directory, so a server started inside the
+    // worktree by an unrelated parent can escape the match above. Its port still shows it.
+    const busy = [];
+    for (const [name, port] of Object.entries((ledger && ledger.ports) || {})) {
+      if (Number.isInteger(port) && !(await isPortFree(port))) busy.push(`${name} ${port}`);
+    }
+    if (busy.length) {
+      s.errors.push(`${plural(busy.length, 'port')} of this worktree still in use (${busy.join(', ')}): a process may still run in it`);
+      return s;
+    }
   }
 
   try {
@@ -807,7 +833,8 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
   };
 
   // 1. Ledgers whose worktree is gone (not listed and not on disk).
-  for (const { wtId, data } of listLedgers(id.commonDir)) {
+  for (const { wtId, data, error } of listLedgers(id.commonDir)) {
+    if (error) { r.errors.push(`${wtId}: ${error}`); continue; }
     const p = data.worktreePath;
     if (p && (liveKeys.has(canonKey(p)) || fs.existsSync(p))) continue;
     if (data.branch && liveBranches.has(data.branch)) { r.kept.push(`${wtId}: branch checked out in another worktree`); continue; }
@@ -901,7 +928,7 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
     const checkedOut = new Set(worktrees.map((w) => w.branch).filter(Boolean));
     // A ledger that is not finished still needs its branch to prove, later, that it was pushed.
     const pending = new Set(listLedgers(id.commonDir)
-      .filter(({ wtId, data: d }) => d.state !== 'torn-down' && d.branch && !finished.has(wtId))
+      .filter(({ wtId, data: d }) => d && d.state !== 'torn-down' && d.branch && !finished.has(wtId))
       .map(({ data: d }) => d.branch));
     const refs = (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
     for (const line of refs) {
@@ -926,7 +953,7 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
     const data = {
       repo, repoRoot, worktreePath: repoRoot, wtId: null, branch: null, ticket: null, ports: {},
       dryRun: Boolean(dryRun), worktreeGone: false,
-      ledgers: listLedgers(id.commonDir).map(({ wtId, data: d }) => ({ wtId, branch: d.branch, state: d.state, worktreePath: d.worktreePath, resources: d.resources || [] })),
+      ledgers: listLedgers(id.commonDir).filter((l) => l.data).map(({ wtId, data: d }) => ({ wtId, branch: d.branch, state: d.state, worktreePath: d.worktreePath, resources: d.resources || [] })),
     };
     r.hook = runHook('sweep', repoRoot, data, id.commonDir);
   } catch (e) { r.errors.push(e.message); }
@@ -968,7 +995,8 @@ function cmdStatus(opts) {
   for (const root of knownRepos(opts)) {
     const id = gitIdentity(root);
     if (!id) continue;
-    for (const { wtId, data } of listLedgers(id.commonDir)) {
+    for (const { wtId, data: d, error } of listLedgers(id.commonDir)) {
+      const data = d || { state: 'unreadable', keptReason: error };
       rows.push({
         repo: data.repo, wtId, branch: data.branch, state: data.state, pr: data.prNumber || null,
         prState: data.prState || null, resources: (data.resources || []).length, ports: data.ports || {},

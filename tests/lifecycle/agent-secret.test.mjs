@@ -24,6 +24,10 @@ describe('units', () => {
     const m = parseEnvFile('# c\nexport A=1\nB="two words # not a comment"\nC=three # comment\nD=\'$literal\'\nE="multi\nline"\nF="esc\\nape"\n');
     assert.deepEqual(Object.fromEntries(m), { A: '1', B: 'two words # not a comment', C: 'three', D: '$literal', E: 'multi\nline', F: 'esc\nape' });
   });
+  test('parseEnvFile: a comment after an empty value is not the value', () => {
+    const m = parseEnvFile('A= # note\nB=#literal\nC="# quoted"\nD=\n');
+    assert.deepEqual(Object.fromEntries(m), { A: '', B: '#literal', C: '# quoted', D: '' });
+  });
   test('mergeFields refuses foreign fields unless replace', () => {
     const item = { id: 'i', fields: [{ id: 'X', label: 'X', value: 'old' }, { id: 'Y', label: 'Y', value: 'o', section: { id: 'agent-secret' } }] };
     const a = mergeFields(item, [{ name: 'X', value: 'n' }, { name: 'Y', value: 'n' }, { name: 'Z', value: 'n' }]);
@@ -135,6 +139,24 @@ describe('put', () => {
     const add = secret(s, ['put', 'demo-db-dev', 'DB_USER'], repo.wt, 'u', T);
     assert.equal(add.status, 0, add.out);
     assert.equal(s.readState().op.items[0].fields.length, 2);
+  });
+
+  test('never edits an item that holds a passkey', () => {
+    const { s, repo } = fixture();
+    s.writeState((st) => { st.op.items.push({ id: 'i8', vault: 'agent-repos', title: 'demo-site-dev', passkeys: [{ id: 'pk' }], fields: [] }); });
+    const r = secret(s, ['put', 'demo-site-dev', 'TOKEN'], repo.wt, 'v', T);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /holds a passkey/);
+    assert.ok(!s.calls('op').some((c) => c.args[1] === 'edit'));
+  });
+
+  test('stores in agent-repos even when repo.json names another vault', () => {
+    const s = scratch();
+    cleanups.push(s.cleanup);
+    const repo = makeRepo(s, { config: { vault: 'landing-only' } });
+    const r = secret(s, ['put', 'demo-api-dev', 'K', '--repo', 'demo'], repo.wt, 'v', T);
+    assert.equal(r.status, 0, r.out);
+    assert.equal(s.readState().op.items[0].vault, 'agent-repos');
   });
 
   test('a read-back mismatch fails', () => {

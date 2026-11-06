@@ -9,11 +9,18 @@ import path from 'node:path';
 import { envGet, isWindows, run, sleepMs } from './proc.mjs';
 import { canonical, isUnder } from './repo.mjs';
 
-const PROTECTED = [
+// Matched against the executable's file name only, so a worktree folder named "toolbox" or
+// "t3code" never protects what runs inside it.
+const PROTECTED_NAMES = [
   /jetbrains/i, /toolbox/i, /fsnotifier/i,
-  /(^|[\\/])(idea|idea64|webstorm|webstorm64|pycharm|pycharm64|goland|goland64|rider|rider64|clion|clion64|datagrip|datagrip64|rubymine|rubymine64|phpstorm|phpstorm64|rustrover|rustrover64|fleet)(\.exe|\.sh)?$/i,
-  /(^|[\\/])t3( code)?(\.exe)?$/i, /t3-?code/i, /[\\/]\.t3[\\/](?!worktrees[\\/])/i,
+  /^(idea|idea64|webstorm|webstorm64|pycharm|pycharm64|goland|goland64|rider|rider64|clion|clion64|datagrip|datagrip64|rubymine|rubymine64|phpstorm|phpstorm64|rustrover|rustrover64|fleet)(\.exe|\.sh)?$/i,
+  /^t3( code)?(\.exe)?$/i, /t3[ -]?code/i,
 ];
+// T3 Code's own files: anything under ~/.t3 except the worktrees it hands to agents.
+const PROTECTED_PATH = /[\\/]\.t3[\\/](?!worktrees[\\/])/i;
+const baseName = (p) => String(p || '').split(/[\\/]/).pop();
+const isProtected = (p) => PROTECTED_NAMES.some((re) => re.test(baseName(p.exe)) || re.test(p.name || ''))
+  || PROTECTED_PATH.test(p.exe || '');
 const OWN_TOOLS = /(^|[\\/\s"'])(agent-worktree|agent-secret|hook-runner)\.mjs/i;
 
 /**
@@ -87,6 +94,15 @@ export function listPs(env, runner = run) {
     procs.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[2]), start: m[3], name: path.basename(m[4].split(' ')[0]), exe: '', cmd: m[4], args: [], cwd: '', psOnly: true });
   }
   if (!procs.size) return null;
+  // The executable path on its own (comm), so a path with spaces such as
+  // "/Applications/IntelliJ IDEA.app/Contents/MacOS/idea" yields the right name.
+  const c = runner('ps', ['-axww', '-o', 'pid=,comm='], { env: { ...env, LC_ALL: 'C', LANG: 'C' } });
+  if (c.status !== 0) return null;
+  for (const line of String(c.stdout || '').split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(.+)$/);
+    const p = m && procs.get(Number(m[1]));
+    if (p) { p.exe = m[2].trim(); p.name = baseName(p.exe); }
+  }
   // Without working directories the listing cannot tell what runs inside a worktree.
   const l = runner('lsof', ['-a', '-d', 'cwd', '-Fpn'], { env });
   if (l.error || l.status === 127 || !String(l.stdout || '').trim()) return null;
@@ -212,7 +228,7 @@ export function processesUnder(dir, procs) {
   const dirs = [...new Set([path.resolve(dir), canonical(dir)])];
   const skip = ancestors(procs, process.pid);
   const excluded = (p) => skip.has(p.pid) || OWN_TOOLS.test(p.cmd)
-    || PROTECTED.some((re) => re.test(p.exe) || re.test(p.name));
+    || isProtected(p);
   const hit = new Map();
   for (const p of procs) {
     if (!p.pid || excluded(p)) continue;
