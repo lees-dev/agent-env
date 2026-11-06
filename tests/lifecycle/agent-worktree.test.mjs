@@ -640,17 +640,18 @@ describe('teardown', () => {
     ].join('\n'));
     const parent = spawn(process.execPath, [path.join(scratchDir, 'parent.js')], { stdio: 'ignore', windowsHide: true });
     const pidFile = path.join(scratchDir, 'child.pid');
-    const killQuietly = (pid) => { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } };
+    // Only a real pid: process.kill(0) would signal the whole process group.
+    const killQuietly = (pid) => { if (Number.isInteger(pid) && pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } } };
     // Stop everything this test starts even when an assertion fails first.
     cleanups.unshift(() => {
-      killQuietly(parent.pid);
-      try { killQuietly(Number(fs.readFileSync(pidFile, 'utf8'))); } catch { /* no pid file */ }
+      try { parent.kill('SIGKILL'); } catch { /* gone */ }
+      try { killQuietly(Number(fs.readFileSync(pidFile, 'utf8').trim())); } catch { /* no pid file */ }
     });
     // A sibling folder whose name starts with the worktree's name.
     const copy = `${repo.wt} copy`;
     write(path.join(copy, 'server.js'), 'setInterval(() => {}, 1000);\n');
     const sibling = spawn(process.execPath, [path.join(copy, 'server.js')], { stdio: 'ignore', windowsHide: true });
-    cleanups.unshift(() => killQuietly(sibling.pid));
+    cleanups.unshift(() => { try { sibling.kill('SIGKILL'); } catch { /* gone */ } });
     for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await sleep(100);
     const childPid = Number(fs.readFileSync(pidFile, 'utf8'));
     await sleep(200);
