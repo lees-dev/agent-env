@@ -788,7 +788,7 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
     if (p && (liveKeys.has(canonKey(p)) || fs.existsSync(p))) continue;
     if (data.branch && liveBranches.has(data.branch)) { r.kept.push(`${wtId}: branch checked out in another worktree`); continue; }
     if (data.state === 'torn-down') {
-      const d = dockerCleanup(wtId, [], dryRun);
+      const d = dockerCleanup(wtId, data.resources || [], dryRun);
       r.containersRemoved += d.containers || 0;
       if (d.errors.length) { r.errors.push(`${wtId}: ${d.errors.join('; ')}`); continue; }
       if (!dryRun) deleteLedger(id.commonDir, wtId);

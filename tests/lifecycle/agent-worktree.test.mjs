@@ -703,6 +703,30 @@ describe('sweep, status, track, gate', () => {
     assert.equal(s.readState().docker.containers.length, 2);
   });
 
+  test('setup after teardown reactivates the ledger and resets remoteBranchDeleted', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    assert.equal(engine(s, ['teardown'], repo.wt).status, 0);
+    assert.equal(ledgerOf(repo).remoteBranchDeleted, true);
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    const l = ledgerOf(repo);
+    assert.equal(l.state, 'active');
+    assert.equal(l.remoteBranchDeleted, false);
+  });
+
+  test('a torn-down ledger\'s tracked Docker ids are removed before it is forgotten', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    assert.equal(engine(s, ['teardown'], repo.wt).status, 0);
+    assert.equal(engine(s, ['track', 'docker-container', 'late1'], repo.wt).status, 0);
+    s.writeState((st) => { st.docker.containers.push({ id: 'late1', labels: {} }); });
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    const r = engine(s, ['sweep', '--quick'], repo.main);
+    assert.equal(r.status, 0, r.out);
+    assert.deepEqual(s.readState().docker.containers.map((c) => c.id), ['c2']);
+    assert.equal(ledgerOf(repo), null);
+  });
+
   test('torn-down ledger is forgotten only after its Docker cleanup succeeds', () => {
     const { s, repo } = fixture();
     merged(s, repo);
