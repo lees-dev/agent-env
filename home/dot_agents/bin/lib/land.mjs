@@ -9,7 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { readJson, readRegistry, withLock, writeJsonAtomic } from './ledger.mjs';
 import { captureToken, homeDir, stripToken } from './op.mjs';
-import { listProcesses, processesUnder, stopProcesses } from './processes.mjs';
+import { bornAfter, listProcesses, stopProcesses } from './processes.mjs';
 import { isWindows, prepare, run as procRun, sleepMs, splitArgv as procSplitArgv } from './proc.mjs';
 import { baseBranch, canonKey, gitIdentity, loadConfig } from './repo.mjs';
 
@@ -84,9 +84,11 @@ export function run(argv, { cwd, env = childEnv(), input } = {}) {
 
 // Run a repo command asynchronously. Its output is discarded, never kept: gate output can hold
 // secret values, and only an exit status leaves this function. onTick runs every tickMs while it
-// runs (the lock refresh). After timeoutMs the command and every process it started are stopped
-// (Unix: its own process group; Windows: taskkill /T on its process tree), and this resolves
-// only once the command has exited: { status, timedOut, stuck }.
+// runs (the lock refresh). After timeoutMs the processes the command provably owns are stopped
+// (see ownedTree) and its process group or tree is signalled, and this waits (bounded) for the
+// command to exit. A timeout always reports `stuck`: a process the command started and
+// orphaned earlier (detached, its parent gone) cannot be found, so nothing proves the checkout
+// is free, and the caller keeps the landing lock. { status, timedOut, stuck }.
 export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
     let prepared;
@@ -97,34 +99,31 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
     let stuck = false;
     const timers = [];
     if (tickMs > 0 && onTick) timers.push(setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs));
-    let owned = null;
     if (timeoutMs > 0) {
       timers.push(setTimeout(() => {
         timedOut = true;
-        // Snapshot what the command owns while its tree is intact (a detached child is still
-        // linked to its parent here), then stop it all.
-        owned = ownedProcesses(child.pid, cwd, env);
-        killTree(child.pid, 'SIGTERM');
-        stopOwned(owned, env);
-        timers.push(setTimeout(() => killTree(child.pid, 'SIGKILL'), 3000));
-        // A command that does not exit is not waited on forever: `stuck` tells the caller it may
-        // still run, so it keeps the landing lock and touches nothing more.
-        timers.push(setTimeout(() => done(124, true), stuckMs()));
+        // Snapshot what the command provably owns while its tree is intact, then stop it.
+        const procs = listProcesses(env);
+        stopOwned(procs ? ownedTree(procs, child.pid, process.pid) : [], env);
+        killTree(child, 'SIGTERM');
+        timers.push(setTimeout(() => killTree(child, 'SIGKILL'), 3000));
+        // A command that does not exit is not waited on forever.
+        timers.push(setTimeout(() => done(124), stuckMs()));
       }, timeoutMs));
     }
     let finished = false;
-    const done = (status, forced = false) => {
+    const done = (status) => {
       if (finished) return;
       finished = true;
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
       if (timedOut) {
-        // The command is gone; on Unix, anything left in its group goes with it. Then prove
-        // that nothing it owned survives; when that cannot be shown, it counts as stuck.
-        if (!isWindows) killTree(child.pid, 'SIGKILL');
-        stuck = forced || !ownedGone(owned, cwd, env);
+        // On Unix, anything left in its group goes with it. Whatever was stopped, a timeout
+        // cannot prove that nothing the command started survives: it is stuck.
+        if (!isWindows) killTree(child, 'SIGKILL');
+        stuck = true;
+        // A command still running must not keep this process from exiting.
+        child.unref();
       }
-      // One that could not be stopped must not keep this process from exiting.
-      if (stuck) child.unref();
       resolve({ status, timedOut, stuck });
     };
     child.on('error', () => done(127));
@@ -132,21 +131,23 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
   });
 }
 
-// What a timed-out command provably owns: the command and every descendant by parent pid
-// (detached ones included, while they are still linked to it), snapshotted while its tree is
-// intact. Only these are ever signalled. null when the process list cannot be read.
-function ownedProcesses(pid, cwd, env) {
-  const procs = listProcesses(env);
-  if (!procs) return null;
-  const owned = new Map();
-  const seen = new Set();
-  const queue = procs.filter((p) => p.pid === pid);
+// The processes a command provably owns, from one process snapshot: the command itself, only
+// when that pid's parent is this process (a reused pid is not); then each child of an owned
+// process, only when it was created after that parent (a pid reused by an older, unrelated
+// process is not a child). Unknown start times prove nothing, so those are left out. Nothing
+// else (cwd, arguments, names) ever makes a process the command's.
+export function ownedTree(procs, rootPid, selfPid) {
+  const root = procs.find((p) => p.pid === rootPid);
+  if (!root || root.ppid !== selfPid) return [];
+  const owned = new Map([[root.pid, root]]);
+  const queue = [root];
   while (queue.length) {
-    const p = queue.shift();
-    if (seen.has(p.pid)) continue;
-    seen.add(p.pid);
-    owned.set(p.pid, p);
-    for (const c of procs) if (c.ppid === p.pid) queue.push(c);
+    const parent = queue.shift();
+    for (const c of procs) {
+      if (c.ppid !== parent.pid || owned.has(c.pid) || !bornAfter(c, parent)) continue;
+      owned.set(c.pid, c);
+      queue.push(c);
+    }
   }
   return [...owned.values()];
 }
@@ -158,38 +159,16 @@ function stopOwned(list, env) {
   stopProcesses(list, env);
 }
 
-// True only when a fresh process list shows none of the owned processes still running (one
-// more stop of those is tried) and nothing else running inside the directory. A process that
-// only runs in the checkout (its cwd or an argument is inside it) is not provably the
-// command's, so it is never signalled: it makes this false, and the caller keeps the lock.
-function ownedGone(owned, cwd, env) {
-  if (!owned) return false;
-  const check = () => {
-    const now = listProcesses(env);
-    if (!now) return null;
-    const byPid = new Map(now.map((p) => [p.pid, p]));
-    const left = owned.filter((p) => { const q = byPid.get(p.pid); return q && q.start === p.start && q.cmd === p.cmd; });
-    const inDir = processesUnder(cwd, now).filter((p) => !left.some((x) => x.pid === p.pid));
-    return { left, inDir };
-  };
-  let r = check();
-  if (r === null) return false;
-  if (r.left.length) { stopOwned(r.left, env); r = check(); }
-  return r !== null && r.left.length === 0 && r.inDir.length === 0;
-}
-
-// Stop a process and everything it started. Unix: the child leads its own process group
-// (spawned detached), so the group is signalled. Windows: taskkill /T /F on the tree.
-function killTree(pid, signal) {
-  if (!pid) return;
+// Signal the command itself. Unix: its own process group (it was spawned detached, so it leads
+// one; a group id is not reused while the group exists). Windows: only the command, through our
+// own process handle: a tree kill by parent pid (taskkill /T) could reach a process that merely
+// reuses a pid, so the rest of the tree goes only through ownedTree's identity checks.
+function killTree(child, signal) {
+  if (!child?.pid) return;
   // Test hook: simulate a process tree that cannot be stopped (nothing is signalled).
   if (process.env.AGENT_LAND_TEST_NO_KILL === '1') return;
-  if (isWindows) {
-    const taskkill = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe');
-    procRun(taskkill, ['/PID', String(pid), '/T', '/F'], { env: childEnv() });
-    return;
-  }
-  try { process.kill(-pid, signal); } catch { /* already gone */ }
+  if (isWindows) { try { child.kill(); } catch { /* already gone */ } return; }
+  try { process.kill(-child.pid, signal); } catch { /* already gone */ }
 }
 
 // How long a timed-out command may take to exit after it was signalled (AGENT_LAND_STUCK_MS
@@ -213,12 +192,13 @@ export function pollMs() {
   return Number.isFinite(v) && v >= 0 ? v : 3000;
 }
 
-// How often the lock is refreshed while a repo command runs: a third of its ttl, at least a
-// minute (AGENT_LAND_TICK_MS overrides it for tests).
+// How often the lock is refreshed while a repo command runs: a third of its ttl (lockTtlMin is
+// at least 1, so at least every 20 s), well inside the ttl (AGENT_LAND_TICK_MS overrides it for
+// tests).
 export function tickMs(ttlMin) {
   const v = Number(process.env.AGENT_LAND_TICK_MS);
   if (Number.isFinite(v) && v > 0) return v;
-  return Math.max(60000, Math.floor((ttlMin * 60000) / 3));
+  return Math.floor((Math.max(1, Number(ttlMin) || 45) * 60000) / 3);
 }
 
 // ---------------------------------------------------------------- redaction
@@ -303,7 +283,7 @@ export function loadRepoConfig(root, { needGate = true } = {}) {
   if (!cfg.affectedGate.length) cfg.affectedGate = cfg.gate;
   if (!['squash', 'merge', 'rebase'].includes(cfg.mergeMethod)) throw new LandError('mergeMethod must be squash, merge or rebase', 2);
   const num = (v, d) => (Number(v) > 0 ? Number(v) : d);
-  cfg.lockTtlMin = num(cfg.lockTtlMin, 45);
+  cfg.lockTtlMin = Math.max(1, num(cfg.lockTtlMin, 45));
   cfg.maxQueued = num(cfg.maxQueued, MAX_QUEUED);
   cfg.sweepEveryMerges = num(cfg.sweepEveryMerges, 5);
   for (const k of ['setup', 'gate', 'affectedGate']) {
@@ -541,7 +521,7 @@ export class LandingLock {
 
   // True when the lock is no longer ours (deleted, or another lander owns the ref now). False
   // when it could not be deleted and still points at our commit: `retained` then says why, and
-  // the caller must report it (it stays until its ttl or until deleted by hand). The delete is
+  // the caller must report it (it blocks landers until deleted, or reclaimed as stale). The delete is
   // lock plumbing, not repo content, so it skips the repo's pre-push hook (--no-verify); every
   // push of PR content keeps the hooks.
   // Never release: a command started under the lock may still be running (see runCommands).
@@ -577,7 +557,7 @@ export function retainedLockMessage(lock) {
   if (lock.keepReason) {
     return `the landing lock is kept because ${lock.keepReason}; stop that command's processes in the lander checkout first, then remove the lock with: ${remove}`;
   }
-  return `the landing lock could not be released (${lock.retained?.reason}); it stays until its ttl (${lock.ttlMin} min) or until removed with: ${remove}`;
+  return `the landing lock could not be released (${lock.retained?.reason}); it blocks every lander until it is deleted, or reclaimed as stale after its ttl (${lock.ttlMin} min); once no lander run is active, remove it with: ${remove}`;
 }
 
 export function baseTreeOf(cwd, ref) {
@@ -617,11 +597,15 @@ export function parseLanding(body) {
   const { lines } = splitLanding(body);
   const gates = [];
   const bounces = [];
+  // `Gate: pending @ <sha>`: the lander rebased and gated <sha>, then started its push; it
+  // becomes `pass` once the push is recorded (see land-queue landOne).
+  const pending = [];
   let queuedAt = null;
   for (const raw of lines) {
     const l = strip(raw);
     let m;
     if ((m = l.match(/^Gate:\s*pass\s*@\s*([0-9a-f]{7,40})\b\s*(.*)$/i))) gates.push({ sha: m[1], note: m[2].replace(/^\(|\)$/g, '') });
+    else if ((m = l.match(/^Gate:\s*pending\s*@\s*([0-9a-f]{40})\b/i))) pending.push(m[1]);
     else if ((m = l.match(/^Queued:\s*(\S+)/i))) queuedAt = m[1];
     else if ((m = l.match(/^Bounced:\s*(\S+)\s*(.*)$/i))) bounces.push({ at: m[1], reason: m[2] });
   }
@@ -633,7 +617,14 @@ export function parseLanding(body) {
   for (const m of text.matchAll(/^[ \t]*(?:[-*][ \t]+)?Depends-on:[ \t]*(.+)$/gim)) {
     for (const d of m[1].matchAll(/#(\d+)/g)) dependsOn.push(Number(d[1]));
   }
-  return { gates, gatedSha: gates.length ? gates[gates.length - 1].sha : null, queuedAt, bounces, priority, dependsOn };
+  return { gates, gatedSha: gates.length ? gates[gates.length - 1].sha : null, pending, queuedAt, bounces, priority, dependsOn };
+}
+
+// Turn the lander's `Gate: pending @ <sha>` line into `Gate: pass @ <sha> (lander rebase)`.
+export function confirmPending(body, sha) {
+  const text = String(body || '').replace(/\r\n/g, '\n');
+  return text.split('\n').map((l) => (new RegExp(`^([-*][ \\t]+)?Gate:\\s*pending\\s*@\\s*${sha}\\b.*$`, 'i').test(l.trim())
+    ? `- Gate: pass @ ${sha} (lander rebase)` : l)).join('\n');
 }
 
 // Write the section for a fresh enqueue by land-pr: one Gate line, Queued time, earlier bounces kept.
@@ -877,13 +868,12 @@ export async function runCommands(entries, dir, lock, cfg) {
     const r = await runAsync(splitArgv(cmd), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(cfg.lockTtlMin) : 0, onTick, timeoutMs: limit });
     const what = `${name} \`${cmd}\``;
     if (r.stuck) {
-      // It may still be running in the checkout: the lock must outlive it.
-      const summary = `${what} timed out after ${Math.round(limit / 60000) || '<1'} min and could not be stopped`;
+      // Something it started may still run in the checkout: the lock must outlive it.
+      const summary = `${what} timed out after ${Math.round(limit / 60000) || '<1'} min; its known processes were stopped, but one it started may still run, so the landing lock is kept`;
       if (lock) lock.keep(summary);
       return { ok: false, timedOut: true, stuck: true, name, cmd, status: r.status, summary };
     }
     if (lost) return { ok: false, lost: true, name, cmd, status: r.status, summary: `${what}: the landing lock was lost` };
-    if (r.timedOut) return { ok: false, timedOut: true, name, cmd, status: r.status, summary: `${what} timed out after ${Math.round(limit / 60000) || '<1'} min` };
     if (r.status !== 0) return { ok: false, name, cmd, status: r.status, summary: `${what} exit ${r.status}` };
   }
   return { ok: true };

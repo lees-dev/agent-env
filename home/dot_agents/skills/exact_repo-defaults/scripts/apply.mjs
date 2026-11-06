@@ -40,9 +40,33 @@ function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return
 // but cannot be read (a directory, no read permission) throws Unreadable: the item is then
 // invalid and nothing is written, so an existing file is never replaced unseen.
 class Unreadable extends Error {}
-function readOwned(p) {
+
+// Where p really is: the existing part resolved through every link (its parent folders
+// included), plus the part that does not exist yet.
+function realLocation(p) {
+  const rest = [];
+  let cur = path.resolve(p);
+  for (;;) {
+    try { return path.join(fs.realpathSync(cur), ...rest.reverse()); } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p);
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+// A repo cannot make this script read or write outside itself: a managed file, or a folder on
+// its way, that links outside the repo makes the item invalid. Links inside the repo are fine.
+function inside(root, p) {
+  const rel = path.relative(fs.realpathSync(root), realLocation(p));
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) throw new Unreadable('resolves outside the repo (a link): fix by hand');
+}
+
+function readOwned(p, root) {
+  inside(root, p);
   try { return fs.readFileSync(p, 'utf8'); } catch (e) {
-    if (e.code !== 'ENOENT') throw new Unreadable(`exists but cannot be read (${e.code || e.message}): fix by hand`);
+    if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw new Unreadable(`exists but cannot be read (${e.code || e.message}): fix by hand`);
     // A link to nothing exists too: never write through it or replace it.
     let link = false;
     try { link = fs.lstatSync(p).isSymbolicLink(); } catch { /* really missing */ }
@@ -60,7 +84,12 @@ function writeFile(p, text) {
   // The final file behind every link in a chain; links themselves are never replaced. (A link
   // to nothing never gets here: readOwned makes that item invalid.)
   let target = p;
-  try { target = fs.realpathSync(p); } catch { /* p does not exist yet */ }
+  try { target = fs.realpathSync(p); } catch {
+    // Missing, or a link to nothing: a link is never replaced by a file.
+    let link = false;
+    try { link = fs.lstatSync(p).isSymbolicLink(); } catch { /* really missing */ }
+    if (link) throw new Unreadable('is a link to a file that does not exist: fix by hand');
+  }
   fs.mkdirSync(path.dirname(target), { recursive: true });
   let st = null;
   try { st = fs.statSync(target); } catch { st = null; }
@@ -76,6 +105,11 @@ function writeFile(p, text) {
     try { fs.unlinkSync(tmp); } catch { /* never created */ }
     throw e;
   }
+}
+// Every fix writes through this: inside the repo, and never replacing a link.
+function writeIn(root, p, text) {
+  inside(root, p);
+  writeFile(p, text);
 }
 function json(text) { try { return { ok: true, value: JSON.parse(text) }; } catch (e) { return { ok: false, error: e.message }; } }
 // A JSON object (not null, not an array, not a scalar).
@@ -104,11 +138,11 @@ export const BLOCK_VERSION = Number(BLOCK.match(/agent-standard v(\d+)/)[1]);
 
 function agentsBlock(root) {
   const p = path.join(root, 'AGENTS.md');
-  const text = readOwned(p);
+  const text = readOwned(p, root);
   if (text === null) {
     return {
       name: 'AGENTS.md block', status: 'missing', detail: 'no AGENTS.md',
-      fix: () => { writeFile(p, `${BLOCK}\n\n<!-- Repo-specific rules go below the block. Facts: docs/agents/repo.md and .agents/repo.json. -->\n`); return 'created AGENTS.md'; },
+      fix: () => { writeIn(root, p, `${BLOCK}\n\n<!-- Repo-specific rules go below the block. Facts: docs/agents/repo.md and .agents/repo.json. -->\n`); return 'created AGENTS.md'; },
     };
   }
   const eol = eolOf(text);
@@ -119,7 +153,7 @@ function agentsBlock(root) {
   if (!blocks.length) {
     return {
       name: 'AGENTS.md block', status: 'missing', detail: 'no managed block',
-      fix: () => { writeFile(p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
+      fix: () => { writeIn(root, p, `${withEol(BLOCK, eol)}${eol}${eol}${text}`); return 'inserted the block at the top of AGENTS.md'; },
     };
   }
   const found = blocks.map((b) => `v${b[1]}`).join(', ');
@@ -133,7 +167,7 @@ function agentsBlock(root) {
     fix: () => {
       // Replace exactly the block's span; every other byte of the file stays as it was.
       const b = blocks[0];
-      writeFile(p, `${text.slice(0, b.index)}${withEol(BLOCK, eol)}${text.slice(b.index + b[0].length)}`);
+      writeIn(root, p, `${text.slice(0, b.index)}${withEol(BLOCK, eol)}${text.slice(b.index + b[0].length)}`);
       return `refreshed the block in AGENTS.md (was ${found})`;
     },
   };
@@ -143,7 +177,8 @@ function claudeMd(root) {
   const p = path.join(root, 'CLAUDE.md');
   let st = null;
   try { st = fs.lstatSync(p); } catch { st = null; }
-  if (!st) return { name: 'CLAUDE.md', status: 'missing', detail: 'no CLAUDE.md', fix: () => { writeFile(p, '@AGENTS.md\n'); return 'created CLAUDE.md (@AGENTS.md)'; } };
+  if (!st) inside(root, p);
+  if (!st) return { name: 'CLAUDE.md', status: 'missing', detail: 'no CLAUDE.md', fix: () => { writeIn(root, p, '@AGENTS.md\n'); return 'created CLAUDE.md (@AGENTS.md)'; } };
   // One file under two names (a link to it, or a hard link): already the same rules.
   if (sameFile(p, path.join(root, 'AGENTS.md'))) return { name: 'CLAUDE.md', status: 'ok', detail: 'same file as AGENTS.md' };
   if (st.isSymbolicLink()) {
@@ -154,12 +189,12 @@ function claudeMd(root) {
       ? { name: 'CLAUDE.md', status: 'ok', detail: 'link to AGENTS.md' }
       : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${raw}, not this repo's AGENTS.md: fix by hand` };
   }
-  const text = readOwned(p) ?? '';
+  const text = readOwned(p, root) ?? '';
   if (/^@AGENTS\.md\s*$/m.test(text)) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
   const eol = eolOf(text);
   return {
     name: 'CLAUDE.md', status: 'missing', detail: 'does not import @AGENTS.md',
-    fix: () => { writeFile(p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
+    fix: () => { writeIn(root, p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
   };
 }
 
@@ -169,8 +204,8 @@ const isTeardown = (s) => /agent-worktree\.mjs"?\s+teardown\b/.test(s?.command |
 function t3Json(root) {
   const p = path.join(root, 't3.json');
   const want = JSON.parse(asset('t3.json'));
-  const text = readOwned(p);
-  if (text === null) return { name: 't3.json', status: 'missing', detail: 'no t3.json', fix: () => { writeFile(p, `${JSON.stringify(want, null, 2)}\n`); return 'created t3.json'; } };
+  const text = readOwned(p, root);
+  if (text === null) return { name: 't3.json', status: 'missing', detail: 'no t3.json', fix: () => { writeIn(root, p, `${JSON.stringify(want, null, 2)}\n`); return 'created t3.json'; } };
   const cur = jsonObject(text);
   if (!cur) return { name: 't3.json', status: 'invalid', detail: 'not a JSON object: fix by hand' };
   if (cur.scripts !== undefined && (!Array.isArray(cur.scripts) || cur.scripts.some((s) => s === null || typeof s !== 'object' || Array.isArray(s)))) {
@@ -202,7 +237,7 @@ function t3Json(root) {
         return c;
       });
       const out = { ...cur, defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, ...others] };
-      writeFile(p, `${JSON.stringify(out, null, 2)}\n`);
+      writeIn(root, p, `${JSON.stringify(out, null, 2)}\n`);
       const kept = scripts.filter((s) => !isCanonical(s));
       const demoted = kept.filter((s) => s.runOnWorktreeCreate || s.runOnSettle).length;
       const custom = kept.filter((s) => isSetup(s) || isTeardown(s)).length;
@@ -219,7 +254,7 @@ function t3Json(root) {
 const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ');
 function isCanonical(s) {
   return JSON.parse(asset('t3.json')).scripts.some((w) => norm(w.command) === norm(s?.command)
-    && Object.keys(s).every((k) => k in w));
+    && Object.keys(s).every((k) => Object.hasOwn(w, k)));
 }
 
 // ------------------------------------------------------------------ detection
@@ -263,13 +298,13 @@ export function repoJsonFromDetection(d) {
 
 function repoJson(root) {
   const p = path.join(root, '.agents', 'repo.json');
-  const text = readOwned(p);
+  const text = readOwned(p, root);
   const d = detect(root);
   if (text === null) {
     return {
       name: '.agents/repo.json', status: 'missing', detail: 'no .agents/repo.json',
       fix: () => {
-        writeFile(p, `${JSON.stringify(repoJsonFromDetection(d), null, 2)}\n`);
+        writeIn(root, p, `${JSON.stringify(repoJsonFromDetection(d), null, 2)}\n`);
         return `created .agents/repo.json (${d.pm || 'no package manager'}, base ${d.base || 'main'}${d.gate ? '' : `, gate ${TODO}`})`;
       },
     };
@@ -289,7 +324,7 @@ function repoJson(root) {
       fix: () => {
         const out = { ...cur };
         for (const k of missing) out[k] = tmpl[k];
-        writeFile(p, `${JSON.stringify(out, null, 2)}\n`);
+        writeIn(root, p, `${JSON.stringify(out, null, 2)}\n`);
         return `added ${missing.length} key(s) to .agents/repo.json`;
       },
     };
@@ -310,14 +345,14 @@ function gitignore(root) {
   const p = path.join(root, '.gitignore');
   const missing = GITIGNORE_LINES.filter((l) => !ignoredByRepo(root, l));
   if (!missing.length) return { name: '.gitignore', status: 'ok', detail: GITIGNORE_LINES.join(', ') };
-  const current = readOwned(p) ?? '';
+  const current = readOwned(p, root) ?? '';
   return {
     name: '.gitignore', status: 'missing', detail: `not ignored: ${missing.join(', ')}`,
     fix: () => {
       const text = current;
       const eol = text ? eolOf(text) : '\n';
       const sep = text && !text.endsWith('\n') ? eol : '';
-      writeFile(p, `${text}${sep}${text ? eol : ''}# agent-standard: secrets injected from 1Password (repo-defaults)${eol}${missing.join(eol)}${eol}`);
+      writeIn(root, p, `${text}${sep}${text ? eol : ''}# agent-standard: secrets injected from 1Password (repo-defaults)${eol}${missing.join(eol)}${eol}`);
       return `added ${missing.length} line(s) to .gitignore`;
     },
   };
@@ -325,8 +360,8 @@ function gitignore(root) {
 
 function repoMd(root) {
   const p = path.join(root, 'docs', 'agents', 'repo.md');
-  if (fs.existsSync(p)) return { name: 'docs/agents/repo.md', status: 'ok', detail: 'present' };
-  return { name: 'docs/agents/repo.md', status: 'missing', detail: 'no repo facts page', fix: () => { writeFile(p, asset('repo.md')); return 'created docs/agents/repo.md'; } };
+  if (readOwned(p, root) !== null) return { name: 'docs/agents/repo.md', status: 'ok', detail: 'present' };
+  return { name: 'docs/agents/repo.md', status: 'missing', detail: 'no repo facts page', fix: () => { writeIn(root, p, asset('repo.md')); return 'created docs/agents/repo.md'; } };
 }
 
 // ------------------------------------------------------------------ reports (never drift)

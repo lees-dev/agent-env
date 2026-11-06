@@ -64,6 +64,20 @@ function refusal(gh, pr, { ignoreHold = false } = {}) {
   return '';
 }
 
+// Whether queue-hold was removed from PR n at or after `at` (the caller's Hold-By time, less a
+// minute for clock skew), from the issue events. null when that cannot be told.
+function holdRemovedSince(gh, n, at) {
+  const since = Date.parse(at || '');
+  if (!Number.isFinite(since)) return null;
+  for (let page = 1; page <= 20; page++) {
+    const r = gh.api('GET', `repos/${gh.repo}/issues/${n}/events?per_page=100&page=${page}`);
+    if (!r.ok || !Array.isArray(r.data)) return null;
+    if (r.data.some((e) => e?.event === 'unlabeled' && e?.label?.name === 'queue-hold' && Date.parse(e.created_at || '') >= since - 60000)) return true;
+    if (r.data.length < 100) return false;
+  }
+  return null;
+}
+
 // Other PRs in line: queued, landing or queue-waiting (held ones included: fairness).
 function othersInLine(gh, n) {
   const active = listQueue(gh).filter((p) => p.number !== n);
@@ -144,11 +158,19 @@ async function main() {
     const prev = parseLanding(pr.body);
     const inLine = labelNames(pr).some((l) => l === 'queued' || l === 'queue-waiting');
     const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString() });
-    if (others.length) {
+    // The label is the caller's only while nobody removed it since the caller's hold: a removal
+    // after that (the owner cleared it, maybe set it again) makes the current label someone
+    // else's. Unknown (the timeline cannot be read) counts as someone else's.
+    const mine = holds.find((h) => h.holder === holder);
+    const relabelled = labelNames(pr).includes('queue-hold') ? holdRemovedSince(gh, n, mine.at) : false;
+    if (others.length || relabelled !== false) {
       // Only the caller's own hold is released (its Hold-By line goes, the new gated sha is
-      // recorded); queue-hold stays for the other holders, so REFUSED: nothing lands or queues.
+      // recorded); queue-hold stays, so REFUSED: nothing lands or queues.
       gh.prEdit(n, { body });
-      return refuse(`queue-hold is still set by ${others.length} other holder(s); your hold line was removed and the gated sha recorded`);
+      const why = others.length ? `queue-hold is still set by ${others.length} other holder(s)`
+        : relabelled === null ? 'the queue-hold label history could not be read, so the label is left in place'
+          : 'queue-hold was removed and set again after your hold, so it is not yours';
+      return refuse(`${why}; your hold line was removed and the gated sha recorded`);
     }
     const held = labelNames(pr).includes('queue-hold');
     gh.prEdit(n, { body, remove: held ? ['queue-hold'] : [] });

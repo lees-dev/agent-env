@@ -12,11 +12,11 @@ The global rule `repo-defaults` (`~/.agents/docs/agents/repo-defaults.md`) says 
 1. Work in a T3 worktree on a branch such as `agent/<TICKET>-repo-defaults`.
 2. Look first; this writes nothing:
    ```sh
-   node ~/.agents/skills/repo-defaults/scripts/apply.mjs --inspect
+   node "$HOME/.agents/skills/repo-defaults/scripts/apply.mjs" --inspect
    ```
 3. Apply:
    ```sh
-   node ~/.agents/skills/repo-defaults/scripts/apply.mjs --apply
+   node "$HOME/.agents/skills/repo-defaults/scripts/apply.mjs" --apply
    ```
    It never rewrites repo-owned text. It:
    - inserts the managed block (`assets/agents-block.md`, `agent-standard v1`) at the top of `AGENTS.md`, or replaces exactly an older block's text in place (two blocks are reported for you to fix by hand);
@@ -27,12 +27,12 @@ The global rule `repo-defaults` (`~/.agents/docs/agents/repo-defaults.md`) says 
    - creates `docs/agents/repo.md` from `assets/repo.md`.
 4. Fill in every `TODO(repo-defaults)` in `.agents/repo.json` and `docs/agents/repo.md` from the repo itself: the gate and affected-tests commands, sensitive paths, size limit, merge method and identity (`mergeCmd` / `ghWrapper`), release step, per-worktree resources, wide sweep. A repo without a single gate command gets one (for example a `gate` script that runs lint, typecheck, build and the affected tests) in this PR. Commands are argv strings without shell features; point at a script when you need them.
 5. Move repo text that contradicts the global rules on process (CI waits, merge queues, agent tooling, worktrees, cleanup, credentials, landing) out of `AGENTS.md`/`CLAUDE.md`, or reword it as a fact. Keep facts and stricter checks.
-6. Verify: `node ~/.agents/skills/repo-defaults/scripts/apply.mjs --check` exits 0. Run the repo's gate, then open and land the PR per `pr-workflow`.
+6. Verify: `node "$HOME/.agents/skills/repo-defaults/scripts/apply.mjs" --check` exits 0. Run the repo's gate, then open and land the PR per `pr-workflow`.
 
 ## Left for separate PRs (from `--inspect`)
 
 - **PR-gating CI**: workflows triggered by `pull_request`, `pull_request_target` or `merge_group`, and rulesets with required checks or a merge queue. Remove them in their own PR (`pr-standards`); keep release and deploy workflows and non-gating backstops. Ruleset edits are the owner's.
-- **Secrets**: env files with values (`.env`, `.env.production`, ...; not templates such as `.env.example`, and not `.env.local`, which worktree setup writes from `.env.op`). Move them into the 1Password vault `agent-repos` with `node ~/.agents/bin/agent-secret.mjs import` and commit `.env.op` (format: `assets/env.op.example`). A tracked env file holding values means a leaked secret: tell the owner and rotate it.
+- **Secrets**: env files with values (`.env`, `.env.production`, ...; not templates such as `.env.example`, and not `.env.local`, which worktree setup writes from `.env.op`). Move them into the 1Password vault `agent-repos` with `node "$HOME/.agents/bin/agent-secret.mjs" import` and commit `.env.op` (format: `assets/env.op.example`). A tracked env file holding values means a leaked secret: tell the owner and rotate it.
 
 ## Assets
 

@@ -54,7 +54,13 @@ function pr(sub, rest) {
   const s = load();
   const o = opts(rest);
   const find = (n) => s.prs.find((p) => p.number === Number(n)) || die(`no pull requests found for ${n}`);
-  if (sub === 'view') { process.stdout.write(JSON.stringify(view(find(o._[0])))); return; }
+  if (sub === 'view') {
+    const p = find(o._[0]);
+    // Test hook: the first read of PR n after it merged fails (the merge itself went through).
+    if (s.failViewAfterMerge === p.number && p.state === 'MERGED') { delete s.failViewAfterMerge; save(s); die('HTTP 502: Bad Gateway'); }
+    process.stdout.write(JSON.stringify(view(p)));
+    return;
+  }
   if (sub === 'list') {
     const out = s.prs.filter((p) => (p.state || 'OPEN') === 'OPEN' && (!o.label || (p.labels || []).includes(o.label))).map(view);
     process.stdout.write(JSON.stringify(out));
@@ -65,8 +71,17 @@ function pr(sub, rest) {
     const add = o['add-label'] ? o['add-label'].split(',') : [];
     const remove = o['remove-label'] ? o['remove-label'].split(',') : [];
     for (const l of remove) if (!(p.labels || []).includes(l)) die(`label ${l} is not on the PR`);
+    const newBody = o['body-file'] === '-' ? readStdin() : null;
+    // Test hook: one body edit whose new text matches failBodyEditMatching fails (nothing is changed).
+    if (newBody !== null && s.failBodyEditMatching && newBody.includes(s.failBodyEditMatching)) {
+      delete s.failBodyEditMatching; save(s); die('HTTP 502: Bad Gateway');
+    }
+    const at = new Date().toISOString();
+    s.events = s.events || [];
+    for (const l of add) if (!(p.labels || []).includes(l)) s.events.push({ pr: p.number, event: 'labeled', label: { name: l }, created_at: at });
+    for (const l of remove) s.events.push({ pr: p.number, event: 'unlabeled', label: { name: l }, created_at: at });
     p.labels = [...new Set([...(p.labels || []).filter((l) => !remove.includes(l)), ...add])];
-    if (o['body-file'] === '-') p.body = readStdin();
+    if (newBody !== null) p.body = newBody;
     // Test hook: queue-hold appears right after the lander records its rebase gate line.
     // Test hook: the base moves once, right after the lander records its rebase gate line.
     if (s.advanceBaseAfterLanderGate === p.number && /lander rebase/.test(p.body || '')) {
@@ -83,6 +98,8 @@ function pr(sub, rest) {
   }
   if (sub === 'comment') {
     const p = find(o._[0]);
+    // Test hook: comments on PR n fail.
+    if (s.failComment === p.number) die('HTTP 502: Bad Gateway');
     s.comments = s.comments || [];
     s.comments.push({ pr: p.number, body: readStdin() });
     save(s);
@@ -166,6 +183,15 @@ function api(rest) {
       delete s.variables[v[1]];
     }
     save(s);
+    return;
+  }
+  const ev = route.match(/^repos\/[^/]+\/[^/]+\/issues\/(\d+)\/events(?:\?(.*))?$/);
+  if (ev && method === 'GET') {
+    const s = load();
+    if (s.eventsFail) die('Server Error', 500);
+    const page = Number(new URLSearchParams(ev[2] || '').get('page') || 1);
+    const list = (s.events || []).filter((e) => e.pr === Number(ev[1]));
+    process.stdout.write(JSON.stringify(page === 1 ? list : []));
     return;
   }
   const m = route.match(/^repos\/[^/]+\/[^/]+\/git\/(.*)$/) || die(`fake gh: unsupported api ${route}`);

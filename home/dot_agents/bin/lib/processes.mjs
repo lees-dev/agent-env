@@ -205,7 +205,7 @@ function startKey(s) {
 }
 
 /** A child started before its "parent" has a reused parent pid: not a real descendant. */
-function bornAfter(child, parent) {
+export function bornAfter(child, parent) {
   const c = startKey(child.start);
   const p = startKey(parent.start);
   return c !== null && p !== null && c >= p;

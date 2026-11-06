@@ -380,6 +380,49 @@ describe('repo-defaults apply.mjs', () => {
     assert.equal(read(r, 'docs/RULES.md'), `${BLOCK}\n\nOwned.\n`);
   });
 
+  test('links that lead outside the repo (a file, or a folder on the way) are invalid; nothing outside changes', (t) => {
+    const r = repo();
+    const outside = path.join(path.dirname(r.work), 'outside.md');
+    const outDir = path.join(path.dirname(r.work), 'outdir');
+    fs.writeFileSync(outside, 'not the repo\n');
+    fs.mkdirSync(outDir);
+    try {
+      fs.symlinkSync(path.join('..', 'outside.md'), path.join(r.work, 'AGENTS.md'), 'file');
+      fs.symlinkSync(path.join('..', 'outdir'), path.join(r.work, 'docs'), 'dir');
+    } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    const st = Object.fromEntries(a.json.items.map((i) => [i.name, i]));
+    assert.equal(st['AGENTS.md block'].status, 'invalid');
+    assert.match(st['AGENTS.md block'].detail, /outside the repo/);
+    assert.equal(st['docs/agents/repo.md'].status, 'invalid');
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'not the repo\n');
+    assert.deepEqual(fs.readdirSync(outDir), [], 'nothing created outside');
+  });
+
+  test('a dangling docs/agents/repo.md link is invalid and left as it is', (t) => {
+    const r = repo();
+    fs.mkdirSync(path.join(r.work, 'docs', 'agents'), { recursive: true });
+    try { fs.symlinkSync(path.join('..', '..', 'missing-facts.md'), path.join(r.work, 'docs', 'agents', 'repo.md'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    assert.equal(a.json.items.find((i) => i.name === 'docs/agents/repo.md').status, 'invalid');
+    assert.ok(fs.lstatSync(path.join(r.work, 'docs', 'agents', 'repo.md')).isSymbolicLink());
+    assert.equal(fs.existsSync(path.join(r.work, 'missing-facts.md')), false);
+  });
+
+  test('skill commands use "$HOME/..." (PowerShell 5.1 passes ~ to node literally)', () => {
+    for (const f of [path.join(SKILL, 'SKILL.md'), path.join(SKILL, 'assets', 'agents-block.md'), path.join(SKILL, '..', 'exact_land-queue', 'SKILL.md')]) {
+      assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /node ~\//, f);
+    }
+  });
+
   test('a link to nothing is invalid and left as it is', (t) => {
     const r = repo();
     try { fs.symlinkSync(path.join('docs', 'missing.md'), path.join(r.work, 'AGENTS.md'), 'file'); } catch (e) {
@@ -423,6 +466,14 @@ describe('repo-defaults apply.mjs', () => {
     assert.equal(t3.scripts[2].icon, 'rocket');
     assert.equal(t3.scripts[3].async, true);
     assert.match(a.json.actions.join('\n'), /custom script\(s\) that call agent-worktree kept/);
+  });
+
+  test('t3.json: a field named like an Object prototype member (constructor) still counts as extra', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'local', scripts: [{ ...want.scripts[0], constructor: 'repo field' }] }) });
+    assert.equal(run(r, '--apply').status, 0);
+    const t3 = JSON.parse(read(r, 't3.json'));
+    assert.ok(t3.scripts.some((s) => Object.hasOwn(s, 'constructor') && s.constructor === 'repo field'), 'kept');
   });
 
   test('apply.mjs runs when started through a linked skill folder (junction or symlink)', () => {

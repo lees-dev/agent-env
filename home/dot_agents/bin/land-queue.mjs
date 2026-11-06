@@ -39,7 +39,7 @@
 import path from 'node:path';
 import {
   BOUNCE_MARKER, Gh, LandError, LandingLock,
-  appendLanding, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
+  appendLanding, baseTreeOf, clearQueueLabels, confirmPending, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
   named, retainedLockMessage, runCommands, runSweep, scrub, setLabels, slugFromRemote, sweepDue, unmetDeps, waitForPr,
@@ -121,7 +121,15 @@ function abort(gh, pr, r, stage) {
 async function landOne(ctx, pr) {
   const { gh, cfg, mainRoot, lock, root } = ctx;
   setLabels(gh, pr, { add: ['landing'], remove: ['queued'] });
-  const gated = parseLanding(pr.body).gatedSha;
+  let gated = parseLanding(pr.body).gatedSha;
+  // A head that this lander rebased, gated and pushed, whose `pass` line was never written (the
+  // edit after the push failed), is the gated head: its `pending` line says so.
+  if (parseLanding(pr.body).pending.includes(pr.headRefOid) && (!gated || !pr.headRefOid.startsWith(gated))) {
+    const body = confirmPending(pr.body, pr.headRefOid);
+    gh.prEdit(pr.number, { body });
+    pr.body = body;
+    gated = pr.headRefOid;
+  }
   if (!gated) return { bounced: bounce(gh, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section') };
   if (!pr.headRefOid.startsWith(gated)) {
     return { bounced: bounce(gh, pr, `head changed after the gate (head ${pr.headRefOid.slice(0, 12)}, gated ${gated.slice(0, 12)})`) };
@@ -189,10 +197,15 @@ async function landOne(ctx, pr) {
     landSha = rebasedSha;
     const pre = recheck(gh, pr, want, head, lock);
     if (pre) { resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
+    // Record the gated rebased head before pushing it, as pending: if recording `pass` after the
+    // push fails, the next run recognises the pushed head as this lander's gated one.
+    const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started)`);
+    gh.prEdit(pr.number, { body: pendingBody });
+    pr.body = pendingBody;
     const push = git(['push', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${pr.headRefName}:${head}`, 'origin', `${landSha}:refs/heads/${pr.headRefName}`], { cwd: dir });
     resetTo(dir, baseRef);
     if (push.status !== 0) return { bounced: bounce(gh, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`) };
-    const body = appendLanding(pr.body, `Gate: pass @ ${landSha} (lander rebase)`);
+    const body = confirmPending(pr.body, landSha);
     gh.prEdit(pr.number, { body });
     pr.body = body;
     const seen = waitForPr(gh, pr.number, (p) => p.headRefOid === landSha);
@@ -289,6 +302,27 @@ function resetLeftovers(gh, report) {
   }
 }
 
+// After an error mid-landing, settle the PR from a fresh read: never leave `landing`, and never
+// put a bounced (queue-blocked) or merged PR back in line. A merge that went through (the error
+// came after it, for example while reading the PR back) is counted: returns { merged }.
+function settleAfterError(gh, pr, res, report) {
+  if (!pr || res?.merged) return null;
+  let fresh;
+  try { fresh = gh.prView(pr.number); } catch { return null; }
+  if (fresh.state === 'MERGED') {
+    const merged = { pr: pr.number, sha: fresh.headRefOid, mergeSha: fresh.mergeCommit?.oid || null, rebased: null };
+    clearQueueLabels(gh, fresh);
+    report.merged.push(merged);
+    try { bumpMergeCount(gh.repo); } catch { /* the merge stands; only the sweep count is off */ }
+    return { merged };
+  }
+  try {
+    if (fresh.state !== 'OPEN' || labelNames(fresh).includes('queue-blocked')) setLabels(gh, fresh, { remove: ['landing'] });
+    else setLabels(gh, fresh, { add: ['queued'], remove: ['landing'] });
+  } catch { /* the error itself is reported */ }
+  return null;
+}
+
 // A due sweep, caught on its own: a sweep that throws never touches a merged PR.
 async function sweepAfter(ctx, report) {
   try {
@@ -325,15 +359,18 @@ async function runRepo(t, opts) {
   let lost = false;
   for (let i = 0; i < MAX_PRS_PER_RUN; i++) {
     if (gh.isPaused()) { report.paused = true; break; }
-    if (!opts.dryRun) admitWaiting(ctx, report);
     let q = fillQueueState(gh, report);
-    if (!q.eligible.length) break;
-    if (opts.dryRun) { report.plan = q.eligible.map((p) => p.number); break; }
+    if (opts.dryRun) { if (q.eligible.length) report.plan = q.eligible.map((p) => p.number); break; }
+    // Nothing to land and nothing waiting for a slot: done, without taking the lock.
+    if (!q.eligible.length && !report.queueWaiting.length) break;
     if (!takeLock(ctx, report, opts)) break;
     let res = null;
     let pr = null;
     try {
+      // Under the lock: crash leftovers, then admission (so two landers never both fill the
+      // same free slots), then one PR.
       resetLeftovers(gh, report);
+      admitWaiting(ctx, report);
       q = fillQueueState(gh, report);
       if (q.eligible.length) {
         pr = q.eligible[0];
@@ -351,9 +388,12 @@ async function runRepo(t, opts) {
         if (await sweepAfter(ctx, report)) lost = true;
       }
     } catch (e) {
-      // Never leave `landing` behind; a merged PR is never put back in line.
-      if (pr && !res?.merged) { try { setLabels(gh, gh.prView(pr.number), { add: ['queued'], remove: ['landing'] }); } catch { /* reported below */ } }
-      throw e;
+      // Settle the PR from a fresh read. A merge that went through is counted and the run goes
+      // on; anything else is reported as the error.
+      const settled = settleAfterError(gh, pr, res, report);
+      if (!settled) throw e;
+      res = settled;
+      report.alerts.push(`#${pr.number} merged, but reading it back failed (${firstLine(e?.message || e)}); confirmed merged from a fresh read`);
     } finally {
       if (!releaseLock(ctx, report)) lost = true;
     }

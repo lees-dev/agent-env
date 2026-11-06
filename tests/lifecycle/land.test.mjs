@@ -57,7 +57,15 @@ const f = process.env.LAND_TEST_GATE;
 if (f) fs.appendFileSync(f + '.runs', 'x');
 console.log('debug: config value plainword-SHOULD-NOT-LEAK-7f3a');
 if (process.env.OP_SERVICE_ACCOUNT_TOKEN) { console.log('token leaked into the gate'); process.exit(1); }
-if (process.env.LAND_TEST_GATE_HANG) {
+if (process.env.LAND_TEST_GATE_HANG === 'orphan') {
+  // An intermediate child starts a detached worker (cwd outside the checkout) and exits at once:
+  // by the timeout the worker is no longer linked to the gate at all.
+  const worker = 'setTimeout(() => {}, 600000)';
+  const mid = "const {spawn}=require('node:child_process');const fs=require('node:fs');const w=spawn(process.execPath,['-e'," + JSON.stringify(worker) + "],{cwd:require('node:os').tmpdir(),detached:true,stdio:'ignore'});w.unref();fs.writeFileSync(process.argv[1],String(w.pid));";
+  spawn(process.execPath, ['-e', mid, f + '.child'], { stdio: 'ignore' });
+  fs.writeFileSync(f + '.self', String(process.pid));
+  setInterval(() => {}, 1000);
+} else if (process.env.LAND_TEST_GATE_HANG) {
   // =detached: the child gets its own session/process group (it escapes a group kill).
   const detached = process.env.LAND_TEST_GATE_HANG === 'detached';
   const c = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { stdio: 'ignore', detached });
@@ -274,6 +282,33 @@ describe('lib/land.mjs', () => {
     const r = rangeDiffChanges(out);
     assert.equal(r.total, 3);
     assert.equal(r.changed.length, 2);
+  });
+
+  test('ownedTree: only the command (child of this process) and children created after their parent', async () => {
+    const { ownedTree } = await import('../../home/dot_agents/bin/lib/land.mjs');
+    assert.equal(typeof ownedTree, 'function');
+    const self = 9;
+    const procs = [
+      { pid: 100, ppid: self, start: '200', cmd: 'gate' },
+      { pid: 101, ppid: 100, start: '100', cmd: 'older process that reused the parent pid' },
+      { pid: 102, ppid: 100, start: '300', cmd: 'real child' },
+      { pid: 103, ppid: 102, start: '', cmd: 'unknown start time' },
+      { pid: 104, ppid: 102, start: '400', cmd: 'grandchild' },
+    ];
+    assert.deepEqual(ownedTree(procs, 100, self).map((p) => p.pid).sort(), [100, 102, 104]);
+    assert.deepEqual(ownedTree(procs, 100, 7), [], 'a root that is not our child is not ours (reused pid)');
+  });
+
+  test('the lock refresh interval stays well inside the ttl, even at lockTtlMin 1', async () => {
+    const { tickMs } = await import('../../home/dot_agents/bin/lib/land.mjs');
+    const saved = process.env.AGENT_LAND_TICK_MS;
+    delete process.env.AGENT_LAND_TICK_MS;
+    try {
+      assert.ok(tickMs(1) < 30000, `tick ${tickMs(1)} ms for a 1 min ttl`);
+      assert.ok(tickMs(45) <= 15 * 60000);
+    } finally {
+      if (saved !== undefined) process.env.AGENT_LAND_TICK_MS = saved;
+    }
   });
 
   test('splitArgv refuses shell syntax, as the worktree engine does', () => {
@@ -524,6 +559,31 @@ describe('land-pr', () => {
     const again = tool(t, LAND_PR, 'hold', '1', '--holder', 'x', '--repo', 'o/r');
     assert.equal(again.status, 2);
     assert.match(again.out, /^REFUSED queue-hold already set/);
+  });
+
+  test('--release-hold leaves a queue-hold that was removed and set again after the caller\'s hold', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const later = new Date(Date.now() + 5000).toISOString();
+    const s = state(t);
+    s.events.push({ pr: 1, event: 'unlabeled', label: { name: 'queue-hold' }, created_at: later });
+    s.events.push({ pr: 1, event: 'labeled', label: { name: 'queue-hold' }, created_at: later });
+    saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED queue-hold was removed and set again after your hold/);
+    assert.ok(prOf(t, 1).labels.includes('queue-hold'), 'the owner\'s label stays');
+    assert.doesNotMatch(prOf(t, 1).body, new RegExp(`Hold-By: ${HOLDER}`));
+  });
+
+  test('--release-hold leaves queue-hold when its history cannot be read', () => {
+    const t = setup();
+    const head = heldPr(t);
+    const s = state(t); s.eventsFail = true; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /history could not be read/);
+    assert.ok(prOf(t, 1).labels.includes('queue-hold'));
   });
 
   test('hold and --release-hold need a stable holder: no --holder and no $T3CODE_THREAD_ID refuses', () => {
@@ -852,7 +912,9 @@ describe('land-queue', () => {
     let alive = true;
     try { process.kill(child, 0); } catch { alive = false; }
     assert.equal(alive, false, 'the gate\'s child process was stopped too');
-    assert.equal(lockExists(t), false);
+    // A timeout cannot prove nothing else the gate started survives: the lock is kept.
+    assert.ok(rep.lockRetained?.sha);
+    assert.equal(lockExists(t), true);
   });
 
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {
@@ -1113,8 +1175,8 @@ describe('land-queue', () => {
       // Either it was stopped and the lock released, or (never both) it survived and the lock was kept.
       assert.equal(alive, false, 'the detached child was stopped');
       assert.match(rep.bounced[0].reason, /timed out after/);
-      assert.equal(rep.lockRetained, undefined);
-      assert.equal(lockExists(t), false);
+      assert.ok(rep.lockRetained?.sha, 'every timeout keeps the lock');
+      assert.equal(lockExists(t), true);
     } finally {
       for (const f of ['.self', '.child']) {
         try { process.kill(Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}${f}`, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
@@ -1153,6 +1215,74 @@ describe('land-queue', () => {
     }
   });
 
+  test('run: a timeout keeps the lock even when a detached worker escaped before it (orphaned by its parent)', { timeout: 180000 }, () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: 'orphan', AGENT_LAND_CMD_TIMEOUT_MS: '4000' });
+    try {
+      const rep = runQueue(t);
+      assert.match(rep.bounced[0].reason, /timed out after/);
+      assert.ok(rep.lockRetained?.sha, 'the lock is kept: the orphaned worker cannot be ruled out');
+      assert.equal(lockExists(t), true);
+      assert.match(rep.alerts.join('\n'), /landing lock is kept/);
+    } finally {
+      for (const f of ['.self', '.child']) {
+        try { process.kill(Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}${f}`, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
+  test('run: a failed bounce comment leaves the PR blocked, never queued again', () => {
+    const t = setup();
+    queuePr(t, 1, { file: 'README.md', content: 'line one\nPR EDIT\nline three\n' });
+    advanceMain(t, 'README.md', 'line one\nMAIN EDIT\nline three\n');
+    const s = state(t); s.failComment = 1; saveState(t, s);
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1);
+    assert.deepEqual(prOf(t, 1).labels, ['queue-blocked']);
+    assert.equal(lockExists(t), false);
+  });
+
+  test('run: a merge whose read-back fails is still counted as merged, not requeued', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t); s.failViewAfterMerge = 1; saveState(t, s);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /#1 merged, but reading it back failed/);
+    assert.equal(prOf(t, 1).state, 'MERGED');
+    assert.deepEqual(prOf(t, 1).labels, []);
+    const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].merges, 1);
+  });
+
+  test('run: a pushed rebased head whose gate line was not written is recognised next run (no bounce)', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const s = state(t); s.failBodyEditMatching = '(lander rebase)'; saveState(t, s);
+    const first = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(first.status, 1, 'the run reports the failed edit');
+    assert.deepEqual(prOf(t, 1).labels, ['queued'], 'back in line, not blocked');
+    assert.match(prOf(t, 1).body, /Gate: pending @ [0-9a-f]{40}/);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.bounced, []);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0, 'no fix attempt used');
+  });
+
+  test('run: waiting PRs are admitted only under the landing lock', () => {
+    const t = setup({ maxQueued: 2 });
+    queuePr(t, 1);
+    const s = state(t); s.prs.find((p) => p.number === 1).labels = ['queue-waiting']; saveState(t, s);
+    setLock(t, 1);
+    const rep = runQueue(t);
+    assert.equal(rep.busy, true);
+    assert.deepEqual(rep.admitted, []);
+    assert.deepEqual(prOf(t, 1).labels, ['queue-waiting']);
+  });
+
   test('run: a PR whose base is not fetched yet creates the lander checkout on that base', () => {
     const t = setup();
     sh(t.bare, t.env, 'branch', 'other', 'main');
@@ -1179,9 +1309,9 @@ describe('land-queue', () => {
     Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '2000', AGENT_LAND_STUCK_MS: '1500', AGENT_LAND_TEST_NO_KILL: '1' });
     try {
       const rep = runQueue(t);
-      assert.match(rep.bounced[0].reason, /timed out after .* and could not be stopped/);
+      assert.match(rep.bounced[0].reason, /timed out after .* the landing lock is kept/);
       assert.ok(rep.lockRetained?.sha, 'the lock is reported as kept');
-      assert.match(rep.alerts.join('\n'), /the landing lock is kept because .* could not be stopped; stop that command's processes/);
+      assert.match(rep.alerts.join('\n'), /the landing lock is kept because .* may still run.*; stop that command's processes/);
       assert.equal(lockExists(t), true, 'the lock outlives the command');
       assert.equal(rep.merged.length, 0);
       assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the run stopped');
