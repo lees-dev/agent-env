@@ -1,3 +1,10 @@
+.agents/bin/agent-secret.mjs
+.agents/bin/agent-worktree.mjs
+.agents/bin/lib/ledger.mjs
+.agents/bin/lib/op.mjs
+.agents/bin/lib/proc.mjs
+.agents/bin/lib/processes.mjs
+.agents/bin/lib/repo.mjs
 .agents/docs/agents/domain.md
 .agents/docs/agents/issue-tracker.md
 .agents/docs/agents/pr-standards.md
