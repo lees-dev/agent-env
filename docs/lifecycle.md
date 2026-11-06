@@ -5,14 +5,14 @@ Two Node scripts deploy to `~/.agents/bin/` (source: `home/dot_agents/bin/`). Th
 - `agent-worktree.mjs` prepares each agent worktree and cleans it up after its PR merges or closes.
 - `agent-secret.mjs` stores credentials in 1Password and writes the references a repo's `.env.op` needs.
 
-T3 Code runs the engine through two project scripts (global `defaultProjectScripts`, or a repo's `t3.json`):
+T3 Code runs the engine through two project scripts (global `defaultProjectScripts`, or a repo's `t3.json`). T3 may run project scripts in sh, pwsh, powershell or cmd, and cmd does not expand `$HOME`, so the commands find the engine through Node's `os.homedir()` and work in all of them (the `repo-defaults` skill's `assets/t3.json`):
 
 ```sh
-node "$HOME/.agents/bin/agent-worktree.mjs" setup      # runOnWorktreeCreate, async false
-node "$HOME/.agents/bin/agent-worktree.mjs" teardown   # runOnSettle
+node -e "process.argv.splice(1,0,require('path').join(require('os').homedir(),'.agents','bin','agent-worktree.mjs'));import(require('url').pathToFileURL(process.argv[1]).href)" setup      # runOnWorktreeCreate, async false
+node -e "process.argv.splice(1,0,require('path').join(require('os').homedir(),'.agents','bin','agent-worktree.mjs'));import(require('url').pathToFileURL(process.argv[1]).href)" teardown   # runOnSettle
 ```
 
-On Windows, write the absolute path to the script instead of `$HOME`: T3 runs project scripts in pwsh, powershell or cmd.
+The engine still starts as its own entry point (`process.argv[1]` is its path). In a shell of your own, `node "$HOME/.agents/bin/agent-worktree.mjs" <command>` is the same.
 
 ## Repo config
 

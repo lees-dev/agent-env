@@ -749,6 +749,55 @@ describe('repo-defaults apply.mjs', () => {
     assert.doesNotMatch(txt.stdout, /ruleset r2 /, 'a ruleset with no gating rule is not reported');
   });
 
+  test('CLAUDE.md: every documented form of the import counts; look-alikes and code do not', () => {
+    for (const text of ['@./AGENTS.md\n', 'See @AGENTS.md for the rules.\n', '# Rules\n\n- shared @AGENTS.md\n', '@AGENTS.md\t\n']) {
+      const r = repo({ 'CLAUDE.md': text });
+      assert.equal(run(r, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'ok', JSON.stringify(text));
+      assert.equal(run(r, '--apply').status, 0);
+      assert.equal(read(r, 'CLAUDE.md'), text, `${JSON.stringify(text)}: no second import`);
+    }
+    for (const text of ['`@AGENTS.md`\n', '@AGENTS.md-old\n', 'Read @AGENTS.md.\n', '(@AGENTS.md)\n','"@AGENTS.md"\n', '@AGENTS.mdx\n']) {
+      const r = repo({ 'CLAUDE.md': text });
+      assert.equal(run(r, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'missing', JSON.stringify(text));
+    }
+  });
+
+  test('t3.json: the legacy $HOME engine scripts (cmd.exe cannot expand them) are replaced', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const legacy = want.scripts.map((s, i) => ({ ...s, command: `node "$HOME/.agents/bin/agent-worktree.mjs" ${['setup', 'teardown'][i]}` }));
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: legacy }) });
+    const item = run(r, '--inspect', '--json').json.items.find((i) => i.name === 't3.json');
+    assert.equal(item.status, 'outdated');
+    assert.match(item.detail, /\$HOME, which cmd\.exe does not expand/);
+    assert.equal(run(r, '--apply').status, 0);
+    assert.deepEqual(JSON.parse(read(r, 't3.json')).scripts, want.scripts, 'legacy copies dropped, nothing kept as custom');
+  });
+
+  // The asset's commands, run by each shell T3 may use, reach the engine as its direct entry
+  // point with the right command (a stub engine in a fake home records what it saw).
+  test('t3.json commands run the engine from cmd.exe, PowerShell and sh alike', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'repo defaults home '));
+    temps.push(home);
+    fs.mkdirSync(path.join(home, '.agents', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.agents', 'bin', 'agent-worktree.mjs'), [
+      "import fs from 'node:fs';",
+      "import { fileURLToPath } from 'node:url';",
+      'const direct = Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));',
+      'process.stdout.write(JSON.stringify({ direct, args: process.argv.slice(2) }));',
+    ].join('\n'));
+    const onPath = (exe) => spawnSync(process.platform === 'win32' ? 'where.exe' : 'sh', process.platform === 'win32' ? [exe] : ['-c', `command -v ${exe}`], { encoding: 'utf8' }).status === 0;
+    const shells = process.platform === 'win32' ? [true, 'powershell.exe', 'pwsh.exe'].filter((s) => s === true || onPath(s)) : ['/bin/sh', 'pwsh'].filter((s) => s === '/bin/sh' || onPath(s));
+    assert.ok(shells.length >= (process.platform === 'win32' ? 2 : 1));
+    for (const shell of shells) {
+      for (const [i, word] of [[0, 'setup'], [1, 'teardown']]) {
+        const r = spawnSync(want.scripts[i].command, { shell, cwd: home, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+        assert.equal(r.status, 0, `${shell} ${word}: ${r.stderr}`);
+        assert.deepEqual(JSON.parse(r.stdout), { direct: true, args: [word] }, `${shell} ${word}`);
+      }
+    }
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

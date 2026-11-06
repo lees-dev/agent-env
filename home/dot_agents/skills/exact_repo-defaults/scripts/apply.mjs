@@ -229,12 +229,21 @@ function claudeMd(root) {
   }
   const text = readOwned(p, root) ?? '';
   const [bom, body] = splitBom(text);
-  if (/^@AGENTS\.md\s*$/m.test(outsideFences(body))) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
+  if (importsAgents(body)) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
   const eol = eolOf(text);
   return {
     name: 'CLAUDE.md', status: 'missing', detail: 'does not import @AGENTS.md',
     fix: () => { writeIn(root, p, `${bom}@AGENTS.md${eol}${eol}${body}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
   };
+}
+
+// Claude Code imports `@path` anywhere in the text, relative to the file (so `@./AGENTS.md` is
+// the same file); the path ends at the first space; code spans and fenced code blocks are
+// skipped (code.claude.com/docs/en/memory, "Import additional files"). The token must stand
+// alone: `@AGENTS.md-old`, `@AGENTS.md.` or `(@AGENTS.md)` name other paths.
+function importsAgents(text) {
+  const prose = outsideFences(text).replace(/(`+)[\s\S]*?\1/g, ' ');
+  return /(?:^|\s)@(?:\.\/)?AGENTS\.md(?=\s|$)/m.test(prose);
 }
 
 // The text outside fenced code blocks (``` or ~~~, closed by the same character, at least as
@@ -254,8 +263,15 @@ function outsideFences(text) {
   return out.join('\n');
 }
 
-const isSetup = (s) => /agent-worktree\.mjs"?\s+setup\b/.test(s?.command || '');
-const isTeardown = (s) => /agent-worktree\.mjs"?\s+teardown\b/.test(s?.command || '');
+// An engine script: `node "<path>/agent-worktree.mjs" <cmd>`, or the shell-neutral launcher in
+// assets/t3.json (`node -e "...'agent-worktree.mjs')...;import(...)" <cmd>`), which finds the
+// engine through os.homedir() because T3 may run project scripts in cmd.exe, PowerShell or sh,
+// and cmd.exe does not expand $HOME.
+const engineCall = (word) => new RegExp(`agent-worktree\\.mjs(?:"?|'\\)[^"]*")\\s+${word}\\b`);
+const isSetup = (s) => engineCall('setup').test(s?.command || '');
+const isTeardown = (s) => engineCall('teardown').test(s?.command || '');
+// The earlier canonical commands: `$HOME` is not expanded by cmd.exe, so they fail on Windows.
+const LEGACY_COMMANDS = ['setup', 'teardown'].map((w) => `node "$HOME/.agents/bin/agent-worktree.mjs" ${w}`);
 
 function t3Json(root) {
   const p = path.join(root, 't3.json');
@@ -278,6 +294,9 @@ function t3Json(root) {
   const tdIdx = scripts.findIndex(isTeardown);
   if (tdIdx < 0 || scripts[tdIdx].runOnSettle !== true) problems.push('no Agent teardown script');
   else if (firstSettle !== tdIdx) problems.push('another runOnSettle script comes first (T3 runs only the first)');
+  if ([setupIdx, tdIdx].some((i) => i >= 0 && LEGACY_COMMANDS.includes(norm(scripts[i].command)))) {
+    problems.push('engine scripts use $HOME, which cmd.exe does not expand (Windows)');
+  }
   if (!problems.length) return { name: 't3.json', status: 'ok', detail: 'worktree mode, engine scripts first' };
   return {
     name: 't3.json', status: 'outdated', detail: problems.join('; '),
@@ -309,7 +328,8 @@ function t3Json(root) {
 // field the canonical script lacks. One with extra repo fields is kept (and reported).
 const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ');
 function isCanonical(s) {
-  return JSON.parse(asset('t3.json')).scripts.some((w) => norm(w.command) === norm(s?.command)
+  // An exact copy of a current or an earlier (legacy $HOME) engine script.
+  return JSON.parse(asset('t3.json')).scripts.some((w, i) => [norm(w.command), LEGACY_COMMANDS[i]].includes(norm(s?.command))
     && Object.keys(s).every((k) => Object.hasOwn(w, k)));
 }
 
