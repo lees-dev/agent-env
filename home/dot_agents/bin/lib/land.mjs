@@ -726,16 +726,18 @@ export async function runSweep({ cfg, mainRoot, lock }) {
 }
 
 // The sweep that is due after `sinceSweep` merges (call while holding the lock). Returns null
-// when none is due, else { ran, ok, afterMerges, alert? }; a red sweep pauses the repo.
+// when none is due, else { ran, ok, afterMerges, alert? }; a red sweep pauses the repo. The
+// counter resets only when the sweep finished (green or red): a sweep that throws (a checkout
+// error, a bad command) or loses the lock stays due, so the next run tries it again.
 export async function dueSweep(ctx) {
   const { gh, cfg } = ctx;
   if (!sweepDue(gh.repo, cfg)) return null;
   const afterMerges = sweepState(gh.repo).sinceSweep || 0;
-  markSwept(gh.repo);
   const r = await runSweep(ctx);
   const out = { ran: true, ok: r.ok, afterMerges };
+  if (r.lost) { out.ok = false; out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost; it stays due`; return out; }
+  markSwept(gh.repo);
   if (r.ok) return out;
-  if (r.lost) { out.alert = `wide sweep on ${cfg.base} stopped: the landing lock was lost`; return out; }
   gh.setPaused(true);
   out.paused = true;
   out.alert = `wide sweep on ${cfg.base} failed after ${afterMerges} merges (\`${r.cmd}\` exit ${r.status}); the repo is paused (AGENT_LANDING_PAUSED=1). Open a ticket, fix ${cfg.base}, then run land-queue unpause.`;

@@ -533,6 +533,45 @@ describe('land-pr', () => {
     assert.deepEqual(prOf(t, 1).labels, ['landing', 'queue-hold']);
   });
 
+  test('--release-hold with other holders: a pause or an unmerged Depends-on refuses before any edit', () => {
+    for (const blocker of ['pause', 'dep']) {
+      const t = setup();
+      const head = heldPr(t);
+      const s = state(t);
+      const p0 = s.prs.find((p) => p.number === 1);
+      p0.body += '\nHold-By: owner 2026-11-06T09:00:00Z\n';
+      if (blocker === 'pause') s.variables = { AGENT_LANDING_PAUSED: '1' }; else p0.body += 'Depends-on: #99\n';
+      saveState(t, s);
+      const body = prOf(t, 1).body;
+      const before = state(t).calls.length;
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+      assert.equal(r.status, 2, r.err);
+      assert.match(r.out, blocker === 'pause' ? /^REFUSED repo paused/ : /^REFUSED Depends-on #99 not merged/);
+      assert.equal(prOf(t, 1).body, body, `${blocker}: both hold lines stay`);
+      assert.deepEqual(prOf(t, 1).labels, ['queued', 'queue-hold']);
+      assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit'), false);
+    }
+  });
+
+  for (const [what, mutate, expect] of [
+    ['a retarget', { base: 'other' }, (r) => { assert.equal(r.status, 1); assert.match(r.err, /now targets other/); }],
+    ['a new Depends-on', { appendBody: '\nDepends-on: #99\n' }, (r) => { assert.equal(r.status, 2); assert.match(r.out, /^REFUSED Depends-on #99 not merged/); }],
+  ]) {
+    test(`merge-now: ${what} seen only by the last read before the merge stops it`, () => {
+      const t = setup();
+      const head = makePr(t, 1);
+      // Repo-variable reads: #1 before the lock, #2 in the first read under the lock; the change
+      // lands right after #2, so only the last read before the merge sees it.
+      const s = state(t); s.mutateAfter = { kind: 'varGet', n: 2, pr: 1, ...mutate }; saveState(t, s);
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+      expect(r);
+      assert.equal(state(t).mutateAfter.seen >= 2, true, 'the change happened under the lock');
+      assert.equal(prOf(t, 1).state, 'OPEN');
+      assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+      assert.equal(lockExists(t), false);
+    });
+  }
+
   test('capacity: a queue-hold PR does not use a slot (it still counts for fairness)', () => {
     const t = setup({ maxQueued: 2 });
     queuePr(t, 1, { labels: ['queue-hold'] });
@@ -998,16 +1037,54 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), false);
   });
 
-  test('run: a wide sweep that throws is reported; the merged PR stays merged', () => {
+  test('run: a wide sweep that throws is reported, stays due and runs on the next run; the merge stands', () => {
     const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs | tee x' });
     queuePr(t, 1);
     const rep = runQueue(t);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
-    assert.match(rep.alerts.join('\n'), /wide sweep could not run/);
+    assert.match(rep.alerts.join('\n'), /wide sweep could not run.*stays due/);
+    assert.equal(rep.paused, false);
     assert.equal(prOf(t, 1).state, 'MERGED');
     assert.deepEqual(prOf(t, 1).labels, []);
     assert.equal(lockExists(t), false);
+    const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].sinceSweep, 1, 'still due');
+    // Fixed config: the idle lander retries the overdue sweep.
+    const cfgFile = path.join(t.work, '.agents', 'repo.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(cfgFile, 'utf8')), wideSweep: 'node scripts/sweep.mjs' }));
+    const again = runQueue(t);
+    assert.equal(again.sweep.ran, true);
+    assert.equal(again.sweep.ok, true);
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].sinceSweep, 0);
   });
+
+  for (const [what, mutate, check] of [
+    ['a retarget', { base: 'other' }, (t, rep, mainBefore) => {
+      assert.match(rep.aborted[0].reason, /base changed to other before the merge/);
+      assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/main'), mainBefore, 'nothing merged into main');
+    }],
+    ['a new Depends-on', { appendBody: '\nDepends-on: #99\n' }, (t, rep, mainBefore) => {
+      assert.match(rep.aborted[0].reason, /Depends-on #99 not merged before the merge/);
+      assert.equal(rep.merged.length, 0);
+      assert.deepEqual(prOf(t, 1).labels, ['queued']);
+      assert.deepEqual(rep.waiting, [{ pr: 1, dependsOn: [99] }]);
+      assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/main'), mainBefore);
+    }],
+  ]) {
+    test(`run: ${what} seen only by the last read before the merge aborts the landing`, () => {
+      const t = setup();
+      queuePr(t, 1);
+      sh(t.bare, t.env, 'branch', 'other', 'main');
+      const mainBefore = sh(t.bare, t.env, 'rev-parse', 'refs/heads/main');
+      // Lock reads: #1 in the first full re-check before the merge; the change lands right after
+      // it, so only the last read before the merge sees it.
+      const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 1, pr: 1, ...mutate }; saveState(t, s);
+      const rep = runQueue(t);
+      assert.equal(state(t).mutateAfter.seen >= 1, true);
+      check(t, rep, mainBefore);
+      assert.equal(lockExists(t), false);
+    });
+  }
 
   test('unpause takes the landing lock for its sweep and refuses while it is busy', () => {
     const t = setup({ wideSweep: 'node scripts/sweep.mjs' });

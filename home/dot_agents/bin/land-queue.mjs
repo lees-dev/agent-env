@@ -83,28 +83,22 @@ function bounce(gh, pr, reason, tail = []) {
 
 // ---------------------------------------------------------------- re-checks
 
-// The PR still targets the same base from the same branch, and every Depends-on is merged.
-function recheckShape(gh, pr, want) {
+// One fresh read of the PR, every check on that same object: still open, the same base and
+// head branch as validated, every Depends-on merged, no queue-hold, the expected head; then
+// the pause flag and lock ownership. Used before the push and twice before the merge (around
+// the final base check), so no read that a merge relies on goes unchecked.
+function recheck(gh, pr, want, expectHead, lock) {
   const p = gh.prView(pr.number);
   if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
   pr.labels = p.labels;
   pr.body = p.body;
-  if (p.baseRefName && p.baseRefName !== want.base) return { requeue: `base changed to ${p.baseRefName}` };
+  if ((p.baseRefName || want.base) !== want.base) return { requeue: `base changed to ${p.baseRefName}` };
   if (p.headRefName !== want.headRef) return { requeue: `head branch changed to ${p.headRefName}` };
+  if (p.headRefOid !== expectHead) return { requeue: `head changed to ${p.headRefOid.slice(0, 12)}` };
+  if (labelNames(p).includes('queue-hold')) return { requeue: 'queue-hold appeared' };
   const deps = unmetDeps(gh, p);
   if (deps.length) return { requeue: `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged` };
-  return null;
-}
-
-// The last step before a push or a merge: labels, head, pause flag and lock ownership.
-function recheckFinal(gh, pr, expectHead, lock) {
-  const p = gh.prView(pr.number);
-  if (p.state !== 'OPEN') return { stop: `PR is ${p.state}` };
-  pr.labels = p.labels;
-  pr.body = p.body;
-  if (labelNames(p).includes('queue-hold')) return { requeue: 'queue-hold appeared' };
   if (gh.isPaused()) return { requeue: 'repo paused', paused: true };
-  if (p.headRefOid !== expectHead) return { requeue: `head changed to ${p.headRefOid.slice(0, 12)}` };
   if (!lock.stillHeld()) return { requeue: 'the landing lock was lost', lost: true };
   return null;
 }
@@ -118,11 +112,6 @@ function abort(gh, pr, r, stage) {
   }
   setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
   return { aborted: { pr: pr.number, reason: `${r.requeue} before ${stage}` }, paused: Boolean(r.paused), lost: Boolean(r.lost) };
-}
-
-// Both re-checks, shape first; null when the push or merge may go ahead.
-function recheck(gh, pr, want, expectHead, lock) {
-  return recheckShape(gh, pr, want) || recheckFinal(gh, pr, expectHead, lock);
 }
 
 // ---------------------------------------------------------------- one PR
@@ -203,14 +192,13 @@ async function landOne(ctx, pr) {
     if (seen.headRefOid !== landSha) return { retry: true, note: 'GitHub has not seen the pushed head yet' };
   }
 
-  // Right before the merge: same base and branch, dependencies merged; then the final base
-  // check (a moved base means the caller redoes the rebase and validation); then, last, the
-  // labels, head, pause flag and lock.
-  const shape = recheckShape(gh, pr, want);
-  if (shape) return abort(gh, pr, shape, 'the merge');
+  // Right before the merge: the full re-check; then the final base check (a moved base means
+  // the caller redoes the rebase and validation); then the full re-check again, the last read.
+  const first = recheck(gh, pr, want, landSha, lock);
+  if (first) return abort(gh, pr, first, 'the merge');
   fetchBranch(dir, base);
   if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
-  const last = recheckFinal(gh, pr, landSha, lock);
+  const last = recheck(gh, pr, want, landSha, lock);
   if (last) return abort(gh, pr, last, 'the merge');
   const m = mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root });
   if (!m.ok) return { bounced: bounce(gh, pr, `merge failed: ${m.message}`) };
@@ -295,7 +283,7 @@ async function sweepAfter(ctx, report) {
     if (s.paused) report.paused = true;
   } catch (e) {
     report.sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
-    report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}`);
+    report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}; it stays due and runs again next time`);
   }
 }
 

@@ -128,27 +128,27 @@ async function main() {
     throw new LandError(`PR #${n} head is ${pr.headRefOid}, the gated sha is ${sha}: push the gated commit or re-run the gate on the PR head`);
   }
 
-  // Release the caller's own hold and record the new gated sha in one edit. Read-only checks
-  // first (only the caller's own queue-hold is excepted; `landing` refuses outright), then the
-  // edit, then the normal checks again on a fresh read.
+  // Release the caller's own hold and record the new gated sha in one edit. Every read-only
+  // check runs first, whoever else holds the PR (only queue-hold itself is excepted; `landing`,
+  // an unmerged Depends-on or a pause refuses with no edit at all); then the edit; then the
+  // normal checks again on a fresh read.
   let released = false;
   if (args['release-hold']) {
     const holder = holderId(args.holder);
     const holds = parseHolds(pr.body);
     if (!holds.some((h) => h.holder === holder)) return refuse(`queue-hold was not set by ${holder} (no "Hold-By: ${holder} ..." line)`);
     const others = holds.filter((h) => h.holder !== holder);
-    if (labelNames(pr).includes('landing')) return refuse('landing (the lander is landing it now)');
-    if (!others.length) {
-      const why = refusal(gh, pr, { ignoreHold: true });
-      if (why) return refuse(why);
-    }
+    const why = refusal(gh, pr, { ignoreHold: true });
+    if (why) return refuse(why);
     if (args['dry-run']) return out({ result: 'WOULD-RELEASE', pr: n, sha, line: 'WOULD-RELEASE' }, 0);
     const prev = parseLanding(pr.body);
     const inLine = labelNames(pr).some((l) => l === 'queued' || l === 'queue-waiting');
     const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString() });
     if (others.length) {
+      // Only the caller's own hold is released (its Hold-By line goes, the new gated sha is
+      // recorded); queue-hold stays for the other holders, so REFUSED: nothing lands or queues.
       gh.prEdit(n, { body });
-      return refuse(`queue-hold is still set by ${others.length} other holder(s)`);
+      return refuse(`queue-hold is still set by ${others.length} other holder(s); your hold line was removed and the gated sha recorded`);
     }
     const held = labelNames(pr).includes('queue-hold');
     gh.prEdit(n, { body, remove: held ? ['queue-hold'] : [] });
@@ -179,25 +179,29 @@ async function main() {
     const got = lock.acquire(baseTreeOf(root, `refs/remotes/origin/${base}`));
     if (got.held) {
       try {
-        // Under the lock: the same PR (state, head, base, branch), nothing refusing it, nobody
-        // else in line; then the base; then, last, labels, head, pause and the lock itself.
+        // Under the lock, every fresh read of the PR gets every check, on that same object:
+        // open, the gated head, the validated base and branch, and no refusal (hold, landing,
+        // unmerged Depends-on, pause). Read, check the queue and the base, then read again
+        // (the last read before the merge) and check the lock.
+        const validate = (p) => {
+          if (p.state === 'MERGED') return { done: mergedOut(p) };
+          if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
+          if (p.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${p.headRefOid} while landing; re-run the gate`);
+          if ((p.baseRefName || base) !== base || p.headRefName !== headRef) {
+            throw new LandError(`PR #${n} now targets ${p.baseRefName} from ${p.headRefName}; re-run the gate and land-pr`);
+          }
+          const why = refusal(gh, p);
+          return why ? { done: refuse(why) } : null;
+        };
         pr = gh.prView(n);
-        if (pr.state === 'MERGED') return mergedOut(pr);
-        if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
-        if (pr.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${pr.headRefOid} while landing; re-run the gate`);
-        if ((pr.baseRefName || base) !== base || pr.headRefName !== headRef) {
-          throw new LandError(`PR #${n} now targets ${pr.baseRefName} from ${pr.headRefName}; re-run the gate and land-pr`);
-        }
-        const again = refusal(gh, pr);
-        if (again) return refuse(again);
+        const firstRead = validate(pr);
+        if (firstRead) return firstRead.done;
         line = othersInLine(gh, n);
         fetchBranch(root, base);
         const stillCurrent = isAncestor(`refs/remotes/origin/${base}`, sha, root);
         if (stillCurrent && line.count === 0) {
-          const last = gh.prView(n);
-          if (last.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${last.headRefOid} while landing; re-run the gate`);
-          const why = refusal(gh, last);
-          if (why) return refuse(why);
+          const lastRead = validate(gh.prView(n));
+          if (lastRead) return lastRead.done;
           if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
           const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root });
           if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);

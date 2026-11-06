@@ -125,6 +125,19 @@ function label(sub, rest) {
   die(`fake gh: unsupported label ${sub}`);
 }
 
+// Test hook: right after the n-th call of one kind ('varGet': a repo variable read, 'lockGet':
+// a landing-lock ref read), change one PR once, so only the reads after it see the change:
+// s.mutateAfter = { kind, n, pr, base?, appendBody? }.
+function countAndMutate(s, kind) {
+  const m = s.mutateAfter;
+  if (!m || m.kind !== kind) return;
+  m.seen = (m.seen || 0) + 1;
+  if (m.seen !== m.n) return;
+  const p = s.prs.find((x) => x.number === m.pr);
+  if (m.base) p.baseRefName = m.base;
+  if (m.appendBody) p.body = `${p.body || ''}${m.appendBody}`;
+}
+
 function api(rest) {
   const o = opts(rest);
   const method = o.method || 'GET';
@@ -135,6 +148,7 @@ function api(rest) {
     s.variables = s.variables || {};
     log(s, { cmd: 'api', method, route: `variables/${v[1] || ''}` });
     if (method === 'GET') {
+      countAndMutate(s, 'varGet');
       save(s);
       if (!(v[1] in s.variables)) die('Not Found', 404);
       process.stdout.write(JSON.stringify({ name: v[1], value: s.variables[v[1]] }));
@@ -179,6 +193,7 @@ function api(rest) {
     return;
   }
   if ((mm = p.match(/^ref\/(heads\/.+)$/)) && method === 'GET') {
+    if (mm[1] === 'heads/agent-landing-lock') { countAndMutate(s, 'lockGet'); save(s); }
     const r = git('rev-parse', '--verify', `refs/${mm[1]}`);
     if (!r.ok) die('Not Found', 404);
     process.stdout.write(JSON.stringify({ ref: `refs/${mm[1]}`, object: { sha: r.out } }));
