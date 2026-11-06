@@ -1572,7 +1572,9 @@ describe('land-queue', () => {
     const q = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
     assert.equal(q.status, 1);
     assert.match(JSON.parse(q.out).error, /could not create the landing lock ref/);
-    assert.equal(JSON.parse(q.out).busy, undefined);
+    // The run's report is kept with the error: not a busy lock, nothing merged.
+    assert.equal(JSON.parse(q.out).busy, false);
+    assert.deepEqual(JSON.parse(q.out).merged, []);
   });
 
   test('run: an overdue sweep that cannot run stops the run before any merge, stays due, and is retried first', () => {
