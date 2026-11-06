@@ -51,6 +51,14 @@ const MAX_PRS_PER_RUN = 50;
 const MAX_BASE_RETRIES = 3;
 const MAX_AUTO_FIXES = 2;
 
+// The branch's head on origin, read with git (not the GitHub API); null when it cannot be read.
+function remoteHead(cwd, branch) {
+  const r = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], { cwd });
+  if (r.status !== 0) return null;
+  const sha = r.stdout.trim().split(/\s+/)[0];
+  return /^[0-9a-f]{40}$/.test(sha || '') ? sha : null;
+}
+
 function changedPaths(dir, from, to) {
   return new Set(gitOk(['diff', '--name-only', '--no-renames', from, to], { cwd: dir }).split(/\r?\n/).filter(Boolean));
 }
@@ -133,6 +141,16 @@ async function landOne(ctx, pr) {
   }
   if (!gated) return { bounced: bounce(gh, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section') };
   if (!pr.headRefOid.startsWith(gated)) {
+    // GitHub can lag behind a push: it may still show the head this lander replaced (the gate
+    // before its last `lander rebase` gate). The branch itself decides: if origin already has the
+    // gated head, the PR goes back to queued for the next run, with no bounce. Any other head is
+    // a change after the gate.
+    const gates = parseLanding(pr.body).gates;
+    const last = gates[gates.length - 1];
+    if (gates.length >= 2 && /lander rebase/.test(last.note) && pr.headRefOid === gates[gates.length - 2].sha
+      && remoteHead(mainRoot, pr.headRefName) === last.sha) {
+      return { ...abort(gh, pr, { requeue: `GitHub still shows the head before the lander rebase (${pr.headRefOid.slice(0, 12)}; the branch has ${last.sha.slice(0, 12)})` }, 'landing'), stop: true };
+    }
     return { bounced: bounce(gh, pr, `head changed after the gate (head ${pr.headRefOid.slice(0, 12)}, gated ${gated.slice(0, 12)})`) };
   }
   const head = pr.headRefOid;
@@ -210,7 +228,9 @@ async function landOne(ctx, pr) {
     gh.prEdit(pr.number, { body });
     pr.body = body;
     const seen = waitForPr(gh, pr.number, (p) => p.headRefOid === landSha);
-    if (seen.headRefOid !== landSha) return { retry: true, note: 'GitHub has not seen the pushed head yet' };
+    // GitHub lagging behind the push is not the PR's fault: back to queued, no bounce; the next
+    // run recognises the pushed head (see the gate check above).
+    if (seen.headRefOid !== landSha) return { ...abort(gh, pr, { requeue: 'GitHub has not shown the pushed head yet' }, 'the merge'), stop: true };
   }
 
   // Right before the merge: the full re-check; then the final base check (a moved base means
@@ -406,6 +426,8 @@ async function runRepo(t, opts) {
       report.aborted.push(res.aborted);
       if (res.paused) report.paused = true;
       if (res.lost) { lost = true; report.alerts.push(`the landing lock was lost while landing #${res.aborted.pr}; stopped`); }
+      // GitHub lagging behind a push: this run stops here; the next one picks the PR up again.
+      if (res.stop) break;
     }
     if (report.paused || lost) break;
   }

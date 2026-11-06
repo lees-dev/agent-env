@@ -625,6 +625,18 @@ describe('repo-defaults apply.mjs', () => {
     assert.equal(read(r, 'AGENTS.md'), text);
   });
 
+  test('a complete block followed by an unmatched BEGIN: invalid, untouched', () => {
+    const text = `${BLOCK}\n\nRepo text.\n\n<!-- BEGIN agent-standard v1 -->\nhalf a block\n`;
+    const r = repo({ 'AGENTS.md': text });
+    const a = run(r, '--check', '--json');
+    assert.equal(a.status, 1);
+    const item = a.json.items.find((i) => i.name === 'AGENTS.md block');
+    assert.equal(item.status, 'invalid');
+    assert.match(item.detail, /2 BEGIN markers but 1 complete block/);
+    assert.equal(run(r, '--apply').status, 1);
+    assert.equal(read(r, 'AGENTS.md'), text);
+  });
+
   test('CLI: --repo without a path and two modes at once exit 2 before any write', () => {
     const r = repo();
     for (const args of [['--apply', '--repo'], ['--repo', '--apply'], ['--apply', '--check']]) {

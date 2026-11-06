@@ -173,6 +173,11 @@ function agentsBlock(root) {
   if (blocks.some((b) => b[0].slice(1).includes('<!-- BEGIN agent-standard'))) {
     return { name: 'AGENTS.md block', status: 'invalid', detail: 'a BEGIN marker without its END before the next block: fix by hand' };
   }
+  // Every BEGIN must belong to one complete block (an unmatched BEGIN after a block, too).
+  const begins = (text.match(/<!-- BEGIN agent-standard/g) || []).length;
+  if (blocks.length && begins !== blocks.length) {
+    return { name: 'AGENTS.md block', status: 'invalid', detail: `${begins} BEGIN markers but ${blocks.length} complete block(s): fix by hand` };
+  }
   if (/<!-- BEGIN agent-standard/.test(text) && !blocks.length) {
     return { name: 'AGENTS.md block', status: 'invalid', detail: 'BEGIN marker without END: fix by hand' };
   }

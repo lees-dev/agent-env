@@ -1395,6 +1395,49 @@ describe('land-queue', () => {
     assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0, 'no fix attempt used');
   });
 
+  test('run: GitHub still showing the head before the lander rebase is never a bounce', () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    // After the lander's push, GitHub keeps showing the old head for a long while.
+    const s = state(t); s.staleHead = { pr: 1, sha: head, n: 1000 }; saveState(t, s);
+    const first = runQueue(t);
+    assert.match(first.aborted[0].reason, /GitHub has not shown the pushed head yet/);
+    // The next run still sees the old head; the branch on origin has the gated one.
+    const second = runQueue(t);
+    assert.match(second.aborted[0].reason, /GitHub still shows the head before the lander rebase/);
+    for (const rep of [first, second]) assert.deepEqual(rep.bounced, []);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0, 'no fix attempt used');
+    // GitHub catches up: it lands.
+    const s2 = state(t); delete s2.staleHead; saveState(t, s2);
+    assert.deepEqual(runQueue(t).merged.map((m) => m.pr), [1]);
+  });
+
+  test('a 422 with no lock present: retried, and an error (not a busy lock) when it persists', () => {
+    const t = setup();
+    const head = makePr(t, 1);
+    t.env.AGENT_LAND_LOCK_WAIT_MS = '200';
+    // One 422 with no holder (it released between create and read): the next try takes the lock.
+    let s = state(t); s.refFail422 = 1; saveState(t, s);
+    const ok = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(ok.status, 0, ok.err);
+    assert.match(ok.out, /^MERGED/);
+    // A create that keeps failing is a config/API error, reported at once, not a busy lock.
+    const head2 = makePr(t, 2);
+    s = state(t); s.refFail422 = 99; saveState(t, s);
+    const bad = tool(t, LAND_PR, '2', '--sha', head2, '--repo', 'o/r');
+    assert.equal(bad.status, 1, bad.out);
+    assert.match(bad.err, /could not create the landing lock ref \(HTTP 422 with no lock present, 3 tries\)/);
+    assert.doesNotMatch(bad.out, /busy/);
+    s = state(t); s.refFail422 = 99; saveState(t, s);
+    queuePr(t, 3);
+    const q = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(q.status, 1);
+    assert.match(JSON.parse(q.out).error, /could not create the landing lock ref/);
+    assert.equal(JSON.parse(q.out).busy, undefined);
+  });
+
   test('run: waiting PRs are admitted only under the landing lock', () => {
     const t = setup({ maxQueued: 2 });
     queuePr(t, 1);

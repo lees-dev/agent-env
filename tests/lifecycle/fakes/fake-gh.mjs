@@ -58,13 +58,25 @@ function pr(sub, rest) {
     const p = find(o._[0]);
     // Test hook: the first read of PR n after it merged fails (the merge itself went through).
     if (s.failViewAfterMerge === p.number && p.state === 'MERGED') { delete s.failViewAfterMerge; save(s); die('HTTP 502: Bad Gateway'); }
+    // Test hook: GitHub lags behind a push. Once the PR body records a lander rebase, the next
+    // staleHead.n reads of PR staleHead.pr still show staleHead.sha (the branch itself moved).
+    const lag = s.staleHead;
+    if (lag && lag.pr === p.number && lag.n > 0 && /\(lander rebase\)/.test(p.body || '')) {
+      lag.n -= 1;
+      save(s);
+      process.stdout.write(JSON.stringify({ ...view(p), headRefOid: lag.sha }));
+      return;
+    }
     process.stdout.write(JSON.stringify(view(p)));
     // mutateAfter kind 'prView': counts the reads of that one PR.
     if (s.mutateAfter?.kind === 'prView' && s.mutateAfter.pr === p.number) { countAndMutate(s, 'prView'); save(s); }
     return;
   }
   if (sub === 'list') {
-    const out = s.prs.filter((p) => (p.state || 'OPEN') === 'OPEN' && (!o.label || (p.labels || []).includes(o.label))).map(view);
+    // The staleHead lag shows in lists too (without using up its count).
+    const lagged = (p) => (s.staleHead && s.staleHead.pr === p.number && s.staleHead.n > 0 && /\(lander rebase\)/.test(p.body || '')
+      ? { ...view(p), headRefOid: s.staleHead.sha } : view(p));
+    const out = s.prs.filter((p) => (p.state || 'OPEN') === 'OPEN' && (!o.label || (p.labels || []).includes(o.label))).map(lagged);
     process.stdout.write(JSON.stringify(out));
     return;
   }
@@ -216,6 +228,8 @@ function api(rest) {
   }
   if (p === 'refs' && method === 'POST') {
     if (s.lockApiDown) die('Server Error', 500);
+    // Test hook: the next refFail422 creates fail with 422 and create nothing (not contention).
+    if (s.refFail422 > 0) { s.refFail422 -= 1; save(s); die('Validation Failed', 422); }
     const r = git('update-ref', o.f.ref, o.f.sha, '');
     if (!r.ok) die('Reference already exists', 422);
     process.stdout.write(JSON.stringify({ ref: o.f.ref, object: { sha: o.f.sha } }));

@@ -464,13 +464,22 @@ export class LandingLock {
   }
 
   // Returns { held: true } or { held: false, holder, stale }.
+  // A 422 is contention only when a lock ref is there to read. With none, either the holder
+  // released it between the create and the read (try again, a few times), or the create failed
+  // for another reason (a token that cannot create refs, a protected name): that is an error to
+  // fix, not a busy lock. Only the HTTP status is reported, never the API's own message.
   acquire({ baseSha, baseTree }) {
-    const sha = this.makeCommit(baseTree, baseSha);
-    const r = this.gh.api('POST', this.route('refs'), { fields: { ref: `refs/heads/${LOCK_REF}`, sha } });
-    if (r.ok) { this.commit = sha; return { held: true }; }
-    if (r.status !== 422) throw new LandError(`could not create the lock ref (HTTP ${r.status})`);
-    const holder = this.read();
-    return { held: false, holder, stale: holder ? isStale(holder, this.ttlMin) : false };
+    for (let attempt = 1; ; attempt++) {
+      const sha = this.makeCommit(baseTree, baseSha);
+      const r = this.gh.api('POST', this.route('refs'), { fields: { ref: `refs/heads/${LOCK_REF}`, sha } });
+      if (r.ok) { this.commit = sha; return { held: true }; }
+      if (r.status !== 422) throw new LandError(`could not create the lock ref (HTTP ${r.status})`);
+      const holder = this.read();
+      if (holder) return { held: false, holder, stale: isStale(holder, this.ttlMin) };
+      if (attempt >= 3) {
+        throw new LandError(`could not create the landing lock ref (HTTP 422 with no lock present, ${attempt} tries): check that the GitHub token can create refs/heads/${LOCK_REF} in ${this.gh.repo}`);
+      }
+    }
   }
 
   // The current holder, or null when the lock is free.
