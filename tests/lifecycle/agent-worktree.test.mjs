@@ -200,6 +200,19 @@ describe('setup', () => {
     }
   });
 
+  test('refuses an env output under a linked folder and leaves the link target alone', () => {
+    const { s, repo } = fixture({ files: { '.env.op': 'A=op://agent-repos/demo-api-dev/A\n' }, config: { env: { output: 'scratch/link/.env.local' } } });
+    const elsewhere = path.join(s.dir, 'elsewhere');
+    write(path.join(elsewhere, '.env.local'), 'keep\n');
+    fs.mkdirSync(path.join(repo.wt, 'scratch'), { recursive: true });
+    dirLink(elsewhere, path.join(repo.wt, 'scratch', 'link'));
+    const r = engine(s, ['setup'], repo.wt, { OP_SERVICE_ACCOUNT_TOKEN: DUMMY_TOKEN });
+    assert.equal(r.status, 0, r.out);
+    assert.match(r.stderr, /has a linked folder in its path/);
+    assert.equal(s.calls('op').length, 0);
+    assert.equal(fs.readFileSync(path.join(elsewhere, '.env.local'), 'utf8'), 'keep\n');
+  });
+
   test('a failing setup step fails setup', () => {
     const { s, repo } = fixture({ config: { setup: ['node -e "process.exit(3)"'] } });
     const r = engine(s, ['setup'], repo.wt);
@@ -335,6 +348,41 @@ describe('teardown', () => {
     assert.deepEqual(s.readState().gh.deleted, ['repos/{owner}/{repo}/git/refs/heads/agent/LEE-9-a%23b']);
   });
 
+  test('a remote branch delete that fails (not "already gone") keeps the worktree', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    s.writeState((st) => { st.gh.deleteStatus = 'invalid'; });
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /remote branch not deleted/);
+    const l = ledgerOf(repo);
+    assert.equal(l.state, 'kept');
+    assert.equal(Boolean(l.remoteBranchDeleted), false);
+  });
+
+  test('a failing cr-review --cleanup keeps the worktree', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const cr = path.join(s.bin, isWin ? 'cr-review.cmd' : 'cr-review');
+    fs.writeFileSync(cr, isWin ? '@exit /b 1\r\n' : '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(cr, 0o755);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /cr-review --cleanup LEE-1 exited 1/);
+    assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
+  test('a tracked env output with a staged change counts as dirty', () => {
+    const { s, repo } = fixture({ config: { env: { output: 'README.md' } } });
+    merged(s, repo);
+    write(path.join(repo.wt, 'README.md'), 'changed\n');
+    gitIn(s, repo.wt, 'add', 'README.md');
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /keep: 1 changed or untracked file/);
+    assert.equal(fs.readFileSync(path.join(repo.wt, 'README.md'), 'utf8'), 'changed\n');
+  });
+
   test('closed (not merged): resources removed, remote branch kept', () => {
     const { s, repo } = fixture();
     merged(s, repo, { state: 'CLOSED' });
@@ -383,6 +431,15 @@ describe('teardown', () => {
     const r = engine(s, ['teardown'], repo.wt);
     assert.equal(r.status, 1, r.out);
     assert.match(r.stderr, /detached HEAD with 1 commit on no branch, remote or tag/);
+  });
+
+  test('detached HEAD with uncommitted files: kept', () => {
+    const { s, repo } = fixture();
+    gitIn(s, repo.wt, 'checkout', '-q', '--detach');
+    write(path.join(repo.wt, 'notes.txt'), 'wip\n');
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /detached HEAD with 1 changed or untracked file/);
   });
 
   test('squash merged: HEAD equals the PR head but is on no remote branch: eligible', () => {
@@ -508,6 +565,19 @@ describe('teardown', () => {
     for (const t of targets.slice(0, 5)) assert.ok(fs.existsSync(t), `kept ${t}`);
     assert.equal(fs.existsSync(okDir), false, 'allowed path deleted');
     assert.equal(ledgerOf(repo).state, 'kept');
+  });
+
+  test('a tracked file inside a worktree nested in this one is refused', () => {
+    const { s, repo } = fixture();
+    merged(s, repo);
+    const nested = path.join(repo.wt, 'scratch', 'nested');
+    gitIn(s, repo.main, 'worktree', 'add', '-q', '-b', 'agent/LEE-6-nested', nested);
+    const f = path.join(nested, 'README.md');
+    assert.equal(engine(s, ['track', 'file', f], repo.wt).status, 0);
+    const r = engine(s, ['teardown'], repo.wt);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /inside another worktree/);
+    assert.ok(fs.existsSync(f));
   });
 
   test('a second teardown while one runs exits 1; a dead holder is ignored', () => {
@@ -644,6 +714,41 @@ describe('sweep, status, track, gate', () => {
     s.writeState((st) => { st.docker.fail = false; });
     assert.equal(engine(s, ['sweep', '--quick'], repo.main).status, 0);
     assert.equal(ledgerOf(repo), null);
+  });
+
+  test('a failed gone-ledger cleanup keeps the branch, so a later sweep can finish it', () => {
+    const { s, repo } = fixture();
+    assert.equal(engine(s, ['setup'], repo.wt).status, 0);
+    merged(s, repo);
+    gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
+    s.writeState((st) => { st.docker.fail = true; });
+    const r = engine(s, ['sweep'], repo.main);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stdout, /an unfinished ledger still needs it/);
+    assert.notEqual(gitIn(s, repo.main, 'branch', '--list', repo.branch), '');
+    assert.equal(ledgerOf(repo).state, 'kept');
+    s.writeState((st) => { st.docker.fail = false; });
+    const again = engine(s, ['sweep'], repo.main);
+    assert.equal(again.status, 0, again.out);
+    assert.match(again.stdout, /1 finished/);
+    assert.deepEqual(s.readState().docker.containers.map((c) => c.id), ['c2']);
+    assert.equal(ledgerOf(repo).state, 'torn-down');
+  });
+
+  test('sweep --json stays valid when hooks.sweep prints', () => {
+    const { s, repo } = fixture({ files: { '.agents/hooks.mjs': 'export function sweep() { console.log("hook says hi"); }\n' } });
+    const r = engine(s, ['sweep', '--quick', '--json'], repo.main);
+    assert.equal(r.status, 0, r.out);
+    assert.equal(JSON.parse(r.stdout).repos.length, 1);
+    assert.match(r.stderr, /hook says hi/);
+  });
+
+  test('an invalid repo.json fails the sweep without leaving its lock', () => {
+    const { s, repo } = fixture();
+    write(path.join(repo.main, '.agents', 'repo.json'), JSON.stringify({ version: 2 }));
+    const r = engine(s, ['sweep'], repo.main);
+    assert.equal(r.status, 1, r.out);
+    assert.equal(fs.existsSync(path.join(repo.commonDir, 'agent-resources', 'sweep.lock')), false);
   });
 
   test('hand-made worktree outside the T3 root: removed when eligible; T3 worktrees (also via a link) left to T3', () => {

@@ -229,6 +229,16 @@ describe('import, ref, check', () => {
     assert.ok(fs.existsSync(env));
   });
 
+  test('refused fields make import exit 1', () => {
+    const { s, repo } = fixture();
+    s.writeState((st) => { st.op.items.push({ id: 'i9', vault: 'agent-repos', title: 'demo-api-dev', fields: [{ id: 'API_KEY', label: 'API_KEY', type: 'CONCEALED', value: 'owner-value' }] }); });
+    const { env, mapFile } = files(repo, { API_KEY: 'demo-api-dev' });
+    const r = secret(s, ['import', '--env', env, '--map', mapFile], repo.wt, undefined, T);
+    assert.equal(r.status, 1, r.out);
+    assert.match(r.stderr, /1 fields refused/);
+    assert.equal(s.readState().op.items[0].fields[0].value, 'owner-value');
+  });
+
   test('ref prints the reference', () => {
     const { s, repo } = fixture();
     const r = secret(s, ['ref', 'demo-api-dev', 'API_KEY'], repo.wt);

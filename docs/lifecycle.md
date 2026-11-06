@@ -52,15 +52,15 @@ node ~/.agents/bin/agent-worktree.mjs track dir .cache/build          # relative
 node ~/.agents/bin/agent-worktree.mjs track neon-branch <id> --where neon   # left to hooks.teardown
 ```
 
-The engine removes `docker-container`, `docker-volume` and `docker-network` ids, every Docker object labelled `agent.wt=<wtId>` (so label containers you start), and local `file`, `dir`, `cache` and `path` entries. A tracked path is deleted only when, after resolving links and junctions, it lies inside this worktree, the temp folder or `~/.cache`. It is never the worktree itself, never inside the main checkout, the git dir or another worktree, and never contains any of those or the home folder. A refused path keeps the worktree (exit 1). Hooks remove any other kind.
+The engine removes `docker-container`, `docker-volume` and `docker-network` ids, every Docker object labelled `agent.wt=<wtId>` (so label containers you start), and local `file`, `dir`, `cache` and `path` entries. A tracked path is deleted only when, after resolving links and junctions, it lies inside this worktree, the temp folder or `~/.cache`. It is never the worktree itself, never inside the main checkout, the git dir or another worktree (including one nested inside this worktree), and never contains any of those or the home folder. A refused path keeps the worktree (exit 1). Hooks remove any other kind.
 
-Locks: one lock per ledger (with an owner token; a lock is broken only when its holder's pid is dead), one repo-wide lock around port allocation, one per worktree around teardown (a second teardown exits 1), and one per repo around sweep (a second sweep skips the repo).
+Locks: one lock per ledger, one repo-wide lock around port allocation, one per worktree around teardown (a second teardown exits 1), and one per repo around sweep (a second sweep skips the repo). Each lock file holds an owner token. A lock is stale when its holder's pid is dead or the lock is over two hours old; a stale lock is broken only under a separate `<lock>.recover` lock, so two processes never both break it.
 
 ## Setup
 
 1. Records the worktree in its ledger (reactivating a torn-down one) and in `~/.agents/state/repos.json`.
 2. Allocates the ports.
-3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<itemPrefix>-<item>/<field>`. The output must be untracked, git-ignored and not a link. When any of that fails, or `op` or the service token is missing, setup warns loudly, writes nothing and removes a stale untracked output, so a stale secret is never left behind.
+3. Runs `op inject` from the template into the output file (mode 0600). Every reference must be `op://agent-repos/<itemPrefix>-<item>/<field>`. The output must be untracked, git-ignored, not a link, and not under a linked folder. When any of that fails, or `op` or the service token is missing, setup warns loudly, writes nothing and removes a stale untracked output, so a stale secret is never left behind.
 4. Writes a managed footer (`AGENT_WT_ID` and the ports) into the output file.
 5. Runs the `setup` commands. A failing command is the only failure that makes setup exit non-zero.
 6. Runs `hooks.setup` and the `repo-defaults` drift check (warnings only), then starts `sweep --quick` in the background.
@@ -74,23 +74,23 @@ Teardown is idempotent. Exit 0 means T3 may remove the worktree; exit 1 means ke
 | Any PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` | Keep, exit 1 |
 | No PR, or an open PR | Nothing removed, exit 0 |
 | An open PR uses this branch as its base | Keep, exit 1 |
-| Uncommitted or untracked files (ignored files are fine) | Keep, exit 1 |
+| Uncommitted or untracked files (ignored files and an untracked env output are fine) | Keep, exit 1 |
 | Unpushed work | Keep, exit 1 |
-| Detached HEAD with commits on no branch, remote or tag | Keep, exit 1 |
+| Detached HEAD with commits on no branch, remote or tag, or with uncommitted files | Keep, exit 1 |
 | Merged or closed, clean, pushed | Clean up, exit 0 |
 
 HEAD counts as pushed when any of these is true: it equals the PR head; a `Gate: pass @ <sha>` line in the PR body names it; no commit on it is outside the remotes; or `git range-diff` pairs every commit with the PR head's as identical. A squash merge therefore never looks unpushed.
 
-Clean-up first lists processes. If the listing fails, nothing is removed and the worktree is kept. Otherwise it stops processes whose working directory, executable or a complete path argument is inside the worktree, and their descendants. It never stops this process, its parents, the lifecycle tools, JetBrains IDEs or T3, and re-checks each pid's start time before stopping it. It then runs `hooks.teardown` and `cr-review --cleanup <ticket>` when present, removes Docker objects and tracked paths, and deletes the env output file. For a merged PR whose branch matches `remoteBranchDelete`, it deletes the remote branch only while it still points at the PR head. Any failure (GitHub unreadable, Docker erroring, a hook or `cr-review` failing, a refused path) keeps the worktree and exits 1.
+Clean-up first lists processes. If the listing fails (including a missing `lsof` on macOS), nothing is removed and the worktree is kept. Otherwise it stops processes whose working directory, executable or a complete path argument is inside the worktree, and their descendants (a process that started before its recorded parent is not one). It never stops this process, its parents, the lifecycle tools, JetBrains IDEs or T3, and re-checks each pid's start time and command line before each signal. It then runs `hooks.teardown` and `cr-review --cleanup <ticket>` when present, removes Docker objects and tracked paths, and deletes the env output file. For a merged PR whose branch matches `remoteBranchDelete`, it deletes the remote branch only while it still points at the PR head (a branch already gone counts as deleted; any other delete failure keeps the worktree). Any failure (GitHub unreadable, Docker erroring, a hook or `cr-review` failing, a refused path) keeps the worktree and exits 1.
 
 ## Sweep
 
 `sweep` runs from an OS scheduler (daily, `--all`) and in the background after each setup (`--quick`). It:
 
 - prunes stale worktree entries, and stops if `git worktree list` fails;
-- finishes ledgers whose worktree is gone: not listed by git and not on disk (compared after resolving links). The local branch must still exist and pass the same rules as teardown (eligible PR, nothing unpushed); otherwise the ledger and its resources stay. A torn-down ledger is forgotten once its labelled Docker objects are gone;
+- finishes ledgers whose worktree is gone: not listed by git and not on disk (compared after resolving links). The local branch must still exist and pass the same rules as teardown (eligible PR, nothing unpushed); otherwise the ledger and its resources stay. A failed clean-up marks the ledger kept, and the next sweep retries it. A torn-down ledger is forgotten once its labelled Docker objects are gone;
 - removes hand-made worktrees outside `~/.t3/worktrees` (compared after resolving links) by the teardown rules, with `git worktree remove` and never `--force` (T3 removes its own worktrees; `--quick` skips this step);
-- deletes local branches whose PR merged or closed and that have nothing unpushed;
+- deletes local branches whose PR merged or closed and that have nothing unpushed, except a branch an unfinished ledger still needs;
 - runs the repo's `hooks.sweep(ctx)` once.
 
 It reads every PR in one `gh` call. When that list fills its limit (1000, or `AGENT_WORKTREE_PR_LIMIT`), each branch is re-queried on its own. Sweep never touches the lander checkout `<repoRoot>-lander`. `status [--all] [--json]` lists the ledgers and why each was kept. `gate [--affected]` runs the repo's gate commands.
@@ -107,7 +107,7 @@ node ~/.agents/bin/agent-secret.mjs check
 ```
 
 - `put` reads the value from stdin, never from arguments. It creates or edits the item through a JSON template on stdin, reads the value back and compares hashes, and prints the reference. With `--repo`, the item name must start with `<itemPrefix>-`, and the reference is added to that repo's `.env.op` when you run it inside the repo. It refuses `--env prod` and any `-prod` item, whatever `--env` says. It refuses to overwrite a field it did not create (fields it creates sit in the item's `agent-secret` section) unless you pass `--replace`.
-- `import` parses an env file as data and stores each mapped key. The map is `{"ENV_NAME": "<item>" | {"item": "...", "field": "..."} | "skip"}`, with the same prod and prefix rules. It prints `migrated N, skipped M, mismatches K`. With `--retire-source` and no mismatches, it moves the source to `<file>.pre-op` (mode 0600). It refuses when that file already exists or would not be git-ignored.
+- `import` parses an env file as data and stores each mapped key. The map is `{"ENV_NAME": "<item>" | {"item": "...", "field": "..."} | "skip"}`, with the same prod and prefix rules. It prints `migrated N, skipped M, mismatches K`, and exits 1 on any mismatch or refused field. With `--retire-source` and no mismatches, it moves the source to `<file>.pre-op` (mode 0600). It refuses when that file already exists or would not be git-ignored.
 - `check` prints the account type and whether the vault is visible.
 
 `op` is found on PATH, then (on Windows) in the WinGet package and links folders. The token comes from the process environment, then the Windows user environment or the mode-0600 `~/.config/op/agent-env-token` file. It is read once per process and given only to `op`.

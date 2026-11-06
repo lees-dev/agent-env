@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { captureToken, opStatus, runOp } from './lib/op.mjs';
 import { git, gitOut } from './lib/proc.mjs';
-import { loadConfig, repoName, samePath } from './lib/repo.mjs';
+import { canonKey, loadConfig, repoName } from './lib/repo.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const NAME = 'agent-secret';
@@ -373,7 +373,7 @@ function cmdImport(opts) {
       else log(`source renamed to ${path.basename(src)}.pre-op`);
     }
   }
-  return mismatches || !retired ? 1 : 0;
+  return mismatches || refused || !retired ? 1 : 0;
 }
 
 function cmdRef(opts) {
@@ -424,6 +424,7 @@ export async function main(argv) {
   }
 }
 
-if (process.argv[1] && samePath(process.argv[1], SELF)) {
+// Compare canonical paths: Node resolves links in import.meta.url but not in argv[1].
+if (process.argv[1] && canonKey(process.argv[1]) === canonKey(SELF)) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

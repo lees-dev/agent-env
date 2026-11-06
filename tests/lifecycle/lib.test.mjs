@@ -1,10 +1,11 @@
 // node --test tests/lifecycle/
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { after, describe, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { BIN, isWin, scratch } from './helpers.mjs';
+import { BIN, isWin, run, scratch, write } from './helpers.mjs';
 
 const lib = (n) => import(pathToFileURL(path.join(BIN, 'lib', n)).href);
 const proc = await lib('proc.mjs');
@@ -107,7 +108,7 @@ describe('processes', () => {
   const wt = `${root}${sep}wt`;
   const node = isWin ? '"C:\\Program Files\\nodejs\\node.exe"' : '/usr/bin/node';
   const proc1 = (pid, ppid, cmd, extra = {}) => ({
-    pid, ppid, name: 'node', exe: '', cmd, cwd: '', start: 's',
+    pid, ppid, name: 'node', exe: '', cmd, cwd: '', start: String(1000 + pid),
     args: isWin ? procs.splitWindowsArgs(cmd) : cmd.split(' '), ...extra,
   });
 
@@ -140,6 +141,70 @@ describe('processes', () => {
     list[3].cmd = `${node} ${root}${sep}bin${sep}agent-worktree.mjs teardown --repo ${wt}`;
     list[3].args = isWin ? procs.splitWindowsArgs(list[3].cmd) : list[3].cmd.split(' ');
     assert.deepEqual(procs.processesUnder(wt, list).map((p) => p.pid).sort(), [20, 21, 22]);
+  });
+
+  test('a "child" that started before its parent (reused parent pid) is not a descendant', () => {
+    const list = [
+      proc1(50, 1, `${node} ${wt}${sep}server.js`, { start: '5000' }),
+      proc1(60, 50, `${node} unrelated.js`, { start: '4000' }),
+      proc1(61, 50, `${node} child.js`, { start: '6000' }),
+      proc1(62, 50, `${node} unknown.js`, { start: '' }),
+    ];
+    assert.deepEqual(procs.processesUnder(wt, list).map((p) => p.pid).sort(), [50, 61]);
+  });
+
+  test('a path split at its spaces matches only where the joined path really is', () => {
+    const s = tmp();
+    const dir = path.join(s.dir, 'wt');
+    write(path.join(dir, 'b.js'), '');
+    write(path.join(s.dir, 'wt copy', 'a.js'), '');
+    const mk = (cmd) => (isWin ? { cmd, args: procs.splitWindowsArgs(cmd) } : { cmd, psOnly: true });
+    assert.equal(procs.argsUnder(mk(`node ${path.join(s.dir, 'wt copy', 'a.js')}`), [dir]), false);
+    assert.equal(procs.argsUnder(mk(`node ${path.join(dir, 'b.js')}`), [dir]), true);
+  });
+
+  test('ps output: a path must start a word and end at a separator', { skip: isWin }, () => {
+    const ps = (cmd) => ({ cmd, psOnly: true });
+    assert.equal(procs.argsUnder(ps('node /foreign/project/wt/server.js'), ['/project/wt']), false);
+    assert.equal(procs.argsUnder(ps('node /var/tmp/wt/server.js'), ['/tmp/wt']), false);
+    assert.equal(procs.argsUnder(ps('make -C /tmp/wt all'), ['/tmp/wt']), true);
+    assert.equal(procs.argsUnder(ps('node --require=/tmp/wt/x.js app.js'), ['/tmp/wt']), true);
+  });
+
+  test('the ps listing fails when lsof cannot give working directories', () => {
+    const psOut = { status: 0, stdout: '  1     0 Thu Nov  6 10:00:00 2026 /sbin/init\n', stderr: '' };
+    assert.equal(procs.listPs({}, (cmd) => (cmd === 'ps' ? psOut : { status: 127, stdout: '', stderr: '', error: new Error('ENOENT') })), null);
+    const ok = procs.listPs({}, (cmd) => (cmd === 'ps' ? psOut : { status: 0, stdout: 'p1\nn/\n', stderr: '' }));
+    assert.equal(ok.length, 1);
+    assert.equal(ok[0].cwd, '/');
+  });
+
+  test('stopProcesses re-checks a pid before SIGKILL', { skip: isWin }, async () => {
+    const child = spawn(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});console.log("ready");setInterval(()=>{},1000)'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    await new Promise((resolve) => child.stdout.once('data', resolve));
+    try {
+      const entry = { pid: child.pid, start: 'a', cmd: 'c' };
+      let calls = 0;
+      const lister = () => (++calls === 1 ? [entry] : [{ ...entry, start: 'b' }]);
+      procs.stopProcesses([entry], process.env, 300, lister);
+      assert.equal(calls, 2);
+      assert.doesNotThrow(() => process.kill(child.pid, 0), 'a reused pid is not killed');
+    } finally { child.kill('SIGKILL'); }
+  });
+});
+
+describe('entry points', () => {
+  test('both scripts run when started through a linked folder', () => {
+    const s = scratch();
+    cleanups.push(s.cleanup);
+    const linked = path.join(s.dir, 'linked bin');
+    fs.symlinkSync(BIN, linked, isWin ? 'junction' : 'dir');
+    const ref = run(path.join(linked, 'agent-secret.mjs'), ['ref', 'demo-api-dev', 'API_KEY'], s.dir, s.env);
+    assert.equal(ref.status, 0, ref.out);
+    assert.match(ref.stdout, /op:\/\/agent-repos\/demo-api-dev\/API_KEY/);
+    const st = run(path.join(linked, 'agent-worktree.mjs'), ['status'], s.dir, s.env);
+    assert.equal(st.status, 0, st.out);
+    assert.match(st.stdout, /no ledgers/);
   });
 });
 
@@ -177,6 +242,26 @@ describe('repo and ledger', () => {
     assert.ok(again);
     again();
     assert.equal(fs.existsSync(lock), false);
+  });
+
+  test('tryLock: a stale lock is broken only under the recovery lock; very old locks are stale', () => {
+    const s = tmp();
+    const lock = path.join(s.dir, 'y.lock');
+    fs.writeFileSync(lock, '2147480000 dead');
+    fs.writeFileSync(`${lock}.recover`, `${process.pid} recovering`);
+    assert.equal(ledger.tryLock(lock), null, 'another live process is recovering');
+    assert.equal(fs.readFileSync(lock, 'utf8'), '2147480000 dead');
+    fs.writeFileSync(`${lock}.recover`, '2147480001 crashed');
+    const got = ledger.tryLock(lock);
+    assert.ok(got, 'a crashed recoverer does not block forever');
+    got();
+    assert.equal(fs.existsSync(`${lock}.recover`), false);
+    fs.writeFileSync(lock, `${process.pid} long-ago`);
+    const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    fs.utimesSync(lock, old, old);
+    const ttl = ledger.tryLock(lock);
+    assert.ok(ttl, 'a lock older than the TTL is stale even if its pid is in use');
+    ttl();
   });
 
   test('loadConfig merges defaults and rejects other versions', () => {

@@ -54,6 +54,7 @@ function gh() {
     g.deleted = [...(g.deleted || []), args[3]];
     save();
     if (g.deleteStatus === 422) fail('gh: Reference does not exist (HTTP 422)');
+    if (g.deleteStatus === 'invalid') fail('gh: Validation Failed (HTTP 422)');
     out('');
     return;
   }

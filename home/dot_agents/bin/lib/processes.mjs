@@ -72,18 +72,21 @@ function listProc() {
   return out;
 }
 
-function listPs(env) {
-  const r = run('ps', ['-axww', '-o', 'pid=,ppid=,lstart=,command='], { env });
-  if (r.status !== 0) return null;
+/** ps + lsof listing (macOS and other Unix). Exported for tests, with an injectable runner. */
+export function listPs(env, runner = run) {
+  const r = runner('ps', ['-axww', '-o', 'pid=,ppid=,lstart=,command='], { env });
+  if (r.status !== 0 || !String(r.stdout || '').trim()) return null;
   const procs = new Map();
   for (const line of r.stdout.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\w+\s+\w+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/);
     if (!m) continue;
-    // ps loses argument boundaries: keep the whole command as one "argument" and match a
-    // path only when it is followed by a separator or the end (see pathArgUnder).
+    // ps loses argument boundaries: keep the whole command and match it word by word
+    // (see argsUnder).
     procs.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[2]), start: m[3], name: path.basename(m[4].split(' ')[0]), exe: '', cmd: m[4], args: [], cwd: '', psOnly: true });
   }
-  const l = run('lsof', ['-a', '-d', 'cwd', '-Fpn'], { env });
+  // Without working directories the listing cannot tell what runs inside a worktree.
+  const l = runner('lsof', ['-a', '-d', 'cwd', '-Fpn'], { env });
+  if (l.error || l.status === 127 || !String(l.stdout || '').trim()) return null;
   let pid = null;
   for (const line of (l.stdout || '').split('\n')) {
     if (line[0] === 'p') pid = Number(line.slice(1));
@@ -123,27 +126,52 @@ export function splitWindowsArgs(cmd) {
 
 const isAbs = (s) => (isWindows ? /^([A-Za-z]:[\\/]|\\\\)/.test(s) : s.startsWith('/'));
 
+const exists = (p) => { try { fs.lstatSync(p); return true; } catch { return false; } };
+
+/**
+ * The path an absolute word starts, when words may have been split at spaces inside it
+ * (an unquoted Windows path, or ps output): the longest run of words that exists on disk,
+ * else the word itself.
+ */
+function widestPath(words, i, first) {
+  let best = first;
+  let cur = first;
+  for (let j = i + 1; j < words.length && j < i + 16; j++) {
+    cur = `${cur} ${words[j]}`;
+    if (exists(cur)) best = cur;
+  }
+  return best;
+}
+
 /** True when one complete argument (or the value of --flag=value) is a path inside a dir. */
 export function argsUnder(p, dirs) {
-  if (p.psOnly) {
-    // Whole command string: require a separator or the end after the directory.
-    return dirs.some((d) => {
-      const needle = d.replace(/[\\/]+$/, '');
-      let i = p.cmd.indexOf(needle);
-      while (i >= 0) {
-        const next = p.cmd[i + needle.length];
-        if (next === undefined || next === '/') return true;
-        i = p.cmd.indexOf(needle, i + 1);
-      }
-      return false;
-    });
-  }
-  for (const a of p.args || []) {
+  // /proc gives exact arguments; Windows and ps output may split an unquoted path at spaces.
+  const exact = !p.psOnly && !isWindows;
+  const words = p.psOnly ? String(p.cmd || '').split(/\s+/).filter(Boolean).map((w) => w.replace(/^["']+|["']+$/g, '')) : (p.args || []);
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i];
     for (const v of [a, a.includes('=') ? a.slice(a.indexOf('=') + 1) : null]) {
-      if (v && isAbs(v) && dirs.some((d) => isUnder(v, d))) return true;
+      if (!v || !isAbs(v)) continue;
+      const full = exact ? v : widestPath(words, i, v);
+      if (dirs.some((d) => isUnder(full, d))) return true;
     }
   }
   return false;
+}
+
+/** Comparable start time (ISO date, ps lstart, or /proc clock ticks), or null. */
+function startKey(s) {
+  if (s === undefined || s === null || s === '') return null;
+  if (/^\d+$/.test(String(s))) return Number(s);
+  const t = Date.parse(String(s));
+  return Number.isNaN(t) ? null : t;
+}
+
+/** A child started before its "parent" has a reused parent pid: not a real descendant. */
+function bornAfter(child, parent) {
+  const c = startKey(child.start);
+  const p = startKey(parent.start);
+  return c !== null && p !== null && c >= p;
 }
 
 function ancestors(procs, pid) {
@@ -177,8 +205,9 @@ export function processesUnder(dir, procs) {
   }
   const queue = [...hit.values()];
   while (queue.length) {
-    for (const c of children.get(queue.shift().pid) || []) {
-      if (hit.has(c.pid) || excluded(c)) continue;
+    const parent = queue.shift();
+    for (const c of children.get(parent.pid) || []) {
+      if (hit.has(c.pid) || excluded(c) || !bornAfter(c, parent)) continue;
       hit.set(c.pid, c);
       queue.push(c);
     }
@@ -202,20 +231,25 @@ function alive(pid) {
   return !zombie(pid);
 }
 
-/**
- * Stop the given processes (TERM, then KILL after a grace period). Each pid is re-checked
- * first: a pid whose start time or command line changed was reused and is left alone.
- * Returns {stopped, failed, listFailed}.
- */
-export function stopProcesses(list, env = process.env, graceMs = 3000) {
-  if (!list.length) return { stopped: 0, failed: 0 };
-  const now = listProcesses(env);
-  if (!now) return { stopped: 0, failed: list.length, listFailed: true };
+/** The entries of list whose pid still runs the same process (same start time and command). */
+function unchanged(list, now) {
   const byPid = new Map(now.map((p) => [p.pid, p]));
-  const targets = list.filter((p) => {
+  return list.filter((p) => {
     const q = byPid.get(p.pid);
     return q && q.start === p.start && q.cmd === p.cmd;
   });
+}
+
+/**
+ * Stop the given processes (TERM, then KILL after a grace period). Each pid is re-checked
+ * before each signal: a pid whose start time or command line changed was reused and is left
+ * alone. Returns {stopped, failed, listFailed}. lister is injectable for tests.
+ */
+export function stopProcesses(list, env = process.env, graceMs = 3000, lister = listProcesses) {
+  if (!list.length) return { stopped: 0, failed: 0 };
+  const now = lister(env);
+  if (!now) return { stopped: 0, failed: list.length, listFailed: true };
+  const targets = unchanged(list, now);
   for (const p of targets) { try { process.kill(p.pid, 'SIGTERM'); } catch { /* gone */ } }
   const until = Date.now() + graceMs;
   let left = targets.filter((p) => alive(p.pid));
@@ -223,8 +257,15 @@ export function stopProcesses(list, env = process.env, graceMs = 3000) {
     sleepMs(100);
     left = left.filter((p) => alive(p.pid));
   }
-  for (const p of left) { try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ } }
-  if (left.length) sleepMs(300);
-  const failed = targets.filter((p) => alive(p.pid)).length;
+  if (left.length) {
+    const again = lister(env);
+    if (!again) return { stopped: targets.length - left.length, failed: left.length, listFailed: true };
+    const still = unchanged(left, again);
+    for (const p of still) { try { process.kill(p.pid, 'SIGKILL'); } catch { /* gone */ } }
+    if (still.length) sleepMs(300);
+    // A pid that now belongs to another process is no longer ours to wait for.
+    left = still;
+  }
+  const failed = left.filter((p) => alive(p.pid)).length;
   return { stopped: targets.length - failed, failed };
 }

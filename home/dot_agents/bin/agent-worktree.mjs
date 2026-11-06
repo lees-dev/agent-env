@@ -173,12 +173,32 @@ function isTracked(dir, file) {
   return git(['ls-files', '--error-unmatch', '--', file], { cwd: dir }).status === 0;
 }
 
+/**
+ * True when a folder between dir and file is a link or junction, or the file's folder does not
+ * resolve inside dir: writing or deleting there would land somewhere else.
+ */
+function linkedAncestor(dir, file) {
+  const root = path.resolve(dir);
+  let cur = path.dirname(path.resolve(file));
+  while (isUnder(cur, root) && !samePath(cur, root)) {
+    if (isSymlink(cur)) return true;
+    cur = path.dirname(cur);
+  }
+  return !isUnder(canonical(path.dirname(path.resolve(file))), canonical(root));
+}
+
 /** Why the env output file is unsafe to write secrets into, or null. */
 function envOutputProblem(dir, out) {
+  if (linkedAncestor(dir, out)) return 'has a linked folder in its path';
   if (isSymlink(out)) return 'is a symlink or junction';
   if (isTracked(dir, out)) return 'is tracked by git';
   if (git(['check-ignore', '-q', '--', out], { cwd: dir }).status !== 0) return 'is not git-ignored';
   return null;
+}
+
+/** The env output to leave out of the dirty check: only a plain, untracked generated file. */
+function envIgnore(dir, out) {
+  return linkedAncestor(dir, out) || isTracked(dir, out) ? [] : [out];
 }
 
 function removeFile(file) {
@@ -203,6 +223,7 @@ function runHook(fn, dir, data, commonDir) {
   const cwd = fs.existsSync(data.worktreePath || '') && !data.worktreeGone ? data.worktreePath : data.repoRoot;
   const r = run(process.execPath, [HOOK_RUNNER], {
     cwd, env: stripToken(process.env), input: JSON.stringify({ hookFile, fn, ctx: data, commonDir }), inherit: true,
+    stdoutToStderr: Boolean(jsonMode),
   });
   if (r.status === 3) return null;
   if (r.status !== 0) throw new Error(`hooks.${fn} failed (exit ${r.status})`);
@@ -266,7 +287,7 @@ async function cmdSetup(opts) {
   const badRefs = fs.existsSync(tpl) ? foreignRefs(fs.readFileSync(tpl, 'utf8'), prefix) : 0;
   const outputUsable = !problem;
   if (problem) {
-    if (isSymlink(out) || !isTracked(ctx.worktreePath, out)) removeFile(out);
+    if (!linkedAncestor(ctx.worktreePath, out) && (isSymlink(out) || !isTracked(ctx.worktreePath, out))) removeFile(out);
     loud([`${path.basename(out)} ${problem}: nothing written to it.`, 'Make it a plain, git-ignored, untracked file, then rerun setup.']);
     envNote = `env file refused (${problem})`;
   } else if (badRefs) {
@@ -400,6 +421,17 @@ export function unpushedReason(dir, tip, pr) {
   return `${plural(Number(ahead || 0), 'commit')} not on any remote and HEAD differs from PR #${pr.number} head`;
 }
 
+/** Changed or untracked files (ignored files and the paths in ignore excluded), or null. */
+function dirtyCount(worktreePath, ignore = []) {
+  const st = gitOut(['status', '--porcelain', '--untracked-files=all'], { cwd: worktreePath });
+  if (st === null) return null;
+  const skip = ignore.map((p) => normPath(p));
+  return st.split(/\r?\n/).filter(Boolean).filter((line) => {
+    const rel = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop();
+    return !skip.includes(normPath(path.resolve(worktreePath, rel)));
+  }).length;
+}
+
 /**
  * The teardown predicate. Returns {verdict, pr, detail} where verdict is one of
  * no-pr | queued | open | stacked | dirty | unpushed | eligible. Worktree checks run only
@@ -420,14 +452,9 @@ export function assess({ prs, worktreePath, ignore = [], tip, dir }) {
     return { verdict: 'stacked', pr, detail: `open PR ${prs.stacked.map((p) => `#${p.number}`).join(', ')} is based on this branch` };
   }
   if (worktreePath) {
-    const st = gitOut(['status', '--porcelain', '--untracked-files=all'], { cwd: worktreePath });
-    if (st === null) return { verdict: 'dirty', pr, detail: 'git status failed' };
-    const skip = ignore.map((p) => normPath(p));
-    const dirty = st.split(/\r?\n/).filter(Boolean).filter((line) => {
-      const rel = line.slice(3).replace(/^"|"$/g, '').split(' -> ').pop();
-      return !skip.includes(normPath(path.resolve(worktreePath, rel)));
-    });
-    if (dirty.length) return { verdict: 'dirty', pr, detail: `${plural(dirty.length, 'changed or untracked file')}` };
+    const n = dirtyCount(worktreePath, ignore);
+    if (n === null) return { verdict: 'dirty', pr, detail: 'git status failed' };
+    if (n) return { verdict: 'dirty', pr, detail: `${plural(n, 'changed or untracked file')}` };
   }
   const where = worktreePath || dir;
   if (where) {
@@ -487,11 +514,13 @@ export function deleteRefusal(p, ctx, live) {
   if (samePath(tgt, wt)) return 'is the worktree';
   const inWt = isUnder(tgt, wt);
   const home = canonical(homeDir());
-  const guards = [canonical(ctx.repoRoot), canonical(ctx.commonDir), home, wt, ...live.map((w) => canonical(w.path))];
+  const trees = live.map((w) => canonical(w.path));
+  const guards = [canonical(ctx.repoRoot), canonical(ctx.commonDir), home, wt, ...trees];
   if (guards.some((g) => isUnder(g, tgt))) return 'contains a protected folder';
+  if (!inWt && (isUnder(tgt, canonical(ctx.repoRoot)) || isUnder(tgt, canonical(ctx.commonDir)))) return 'inside the main checkout or git dir';
+  // Another worktree: anywhere outside this one, or nested inside it.
+  if (trees.some((t) => !samePath(t, wt) && isUnder(tgt, t) && (!inWt || isUnder(t, wt)))) return 'inside another worktree';
   if (!inWt) {
-    if (isUnder(tgt, canonical(ctx.repoRoot)) || isUnder(tgt, canonical(ctx.commonDir))) return 'inside the main checkout or git dir';
-    if (live.some((w) => isUnder(tgt, canonical(w.path)))) return 'inside another worktree';
     const tmp = canonical(os.tmpdir());
     const cache = canonical(path.join(homeDir(), '.cache'));
     const allowed = (isUnder(tgt, tmp) && !samePath(tgt, tmp)) || (isUnder(tgt, cache) && !samePath(tgt, cache));
@@ -556,7 +585,7 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
 
   if (!worktreeGone) {
     const { out } = envPaths(ctx);
-    if ((fs.existsSync(out) || isSymlink(out)) && !isTracked(wt, out)) s.envFile = dryRun ? 'would delete' : removeFile(out);
+    if ((fs.existsSync(out) || isSymlink(out)) && !linkedAncestor(wt, out) && !isTracked(wt, out)) s.envFile = dryRun ? 'would delete' : removeFile(out);
   }
 
   const pattern = ctx.cfg.remoteBranchDelete ? new RegExp(ctx.cfg.remoteBranchDelete) : null;
@@ -576,7 +605,8 @@ async function cleanup(ctx, ledger, pr, { dryRun, worktreeGone }) {
       } else if (dryRun) s.remoteBranch = 'would delete';
       else {
         const d = ghRun(ctx.cfg, ['api', '-X', 'DELETE', ref.replace('/git/ref/', '/git/refs/')], { cwd });
-        if (d.status === 0 || /HTTP 404|HTTP 422|reference does not exist/i.test(d.stderr + d.stdout)) s.remoteBranch = true;
+        // Success, or the ref is already gone (404, or 422 "Reference does not exist").
+        if (d.status === 0 || /HTTP 404|reference does not exist/i.test(d.stderr + d.stdout)) s.remoteBranch = true;
         else s.errors.push(`remote branch not deleted (gh exit ${d.status})`);
       }
     }
@@ -635,6 +665,13 @@ async function teardown(ctx, { dryRun }) {
       note('kept', why, null);
       return 1;
     }
+    const dirty = dirtyCount(ctx.worktreePath, envIgnore(ctx.worktreePath, envPaths(ctx).out));
+    if (dirty !== 0) {
+      const why = dirty === null ? 'detached HEAD; git status failed' : `detached HEAD with ${plural(dirty, 'changed or untracked file')}`;
+      warn(`keep: ${why}`);
+      note('kept', why, null);
+      return 1;
+    }
     log('detached HEAD: nothing removed');
     note('active', 'detached HEAD', null);
     return 0;
@@ -647,7 +684,7 @@ async function teardown(ctx, { dryRun }) {
     return 1;
   }
   const { out } = envPaths(ctx);
-  const a = assess({ prs, worktreePath: ctx.worktreePath, ignore: [out] });
+  const a = assess({ prs, worktreePath: ctx.worktreePath, ignore: envIgnore(ctx.worktreePath, out) });
   if (a.verdict === 'no-pr' || a.verdict === 'open') {
     log(`${a.detail}: nothing removed`);
     note('active', a.detail, a.pr);
@@ -709,8 +746,11 @@ function repoContext(repoRoot, cfg, repo, commonDir, wt) {
 async function sweepRepo(root, opts) {
   const id = gitIdentity(root);
   if (!id) return { repo: path.basename(root), errors: ['not a git checkout'] };
+  let repo;
+  try { repo = repoName(loadConfig(id.repoRoot), id.repoRoot); } catch (e) {
+    return { repo: path.basename(id.repoRoot), errors: [`.agents/repo.json: ${e.message}`] };
+  }
   const release = tryLock(path.join(ledgerDir(id.commonDir), 'sweep.lock'));
-  const repo = repoName(loadConfig(id.repoRoot), id.repoRoot);
   if (!release) return { repo, skipped: 'another sweep of this repo is running', errors: [] };
   try { return await sweepLocked(id, repo, opts); } finally { release(); }
 }
@@ -737,13 +777,16 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
   const live = worktrees.filter((w) => !w.prunable);
   const liveKeys = new Set(live.map((w) => canonKey(w.path)));
   const liveBranches = new Set(live.map((w) => w.branch).filter(Boolean));
+  const finished = new Set(); // ledgers this run finished (or, in a dry run, would finish)
+  const keepLedger = (wtId, why) => {
+    if (!dryRun) updateLedger(id.commonDir, wtId, (l) => Object.assign(l, { state: 'kept', keptReason: why }));
+  };
 
   // 1. Ledgers whose worktree is gone (not listed and not on disk).
   for (const { wtId, data } of listLedgers(id.commonDir)) {
     const p = data.worktreePath;
     if (p && (liveKeys.has(canonKey(p)) || fs.existsSync(p))) continue;
     if (data.branch && liveBranches.has(data.branch)) { r.kept.push(`${wtId}: branch checked out in another worktree`); continue; }
-    const ctx = repoContext(repoRoot, cfg, repo, id.commonDir, { worktreePath: p || repoRoot, branch: data.branch, wtId });
     if (data.state === 'torn-down') {
       const d = dockerCleanup(wtId, [], dryRun);
       r.containersRemoved += d.containers || 0;
@@ -752,6 +795,9 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
       r.ledgersRemoved++;
       continue;
     }
+    // Without a recorded worktree, path checks would measure against the main checkout.
+    if (!p) { r.kept.push(`${wtId}: no worktree path recorded`); continue; }
+    const ctx = repoContext(repoRoot, cfg, repo, id.commonDir, { worktreePath: p, branch: data.branch, wtId });
     if (!index) continue;
     if (!data.branch) { r.kept.push(`${wtId}: no branch recorded`); continue; }
     const tip = gitOut(['rev-parse', '--verify', '-q', `refs/heads/${data.branch}`], { cwd: repoRoot });
@@ -765,8 +811,13 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
     try {
       const s = await cleanup(ctx, data, a.pr, { dryRun, worktreeGone: true });
       r.containersRemoved += s.docker && s.docker.containers ? s.docker.containers : 0;
-      if (s.errors.length) { r.errors.push(`${wtId}: ${s.errors.join('; ')}`); continue; }
+      if (s.errors.length) {
+        r.errors.push(`${wtId}: ${s.errors.join('; ')}`);
+        if (!dryRun) keepLedger(wtId, s.errors.join('; '));
+        continue;
+      }
       r.ledgersFinished++;
+      finished.add(wtId);
       if (!dryRun) {
         updateLedger(id.commonDir, wtId, (l) => Object.assign(l, {
           state: 'torn-down', keptReason: null, tornDownAt: new Date().toISOString(),
@@ -788,12 +839,14 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
       if (canonKey(w.path) === lander || isUnder(canonical(w.path), t3)) continue;
       const name = path.basename(w.path);
       const wtId = makeWtId(repo, w.path);
-      const wcfg = loadConfig(w.path);
+      let wcfg;
+      try { wcfg = loadConfig(w.path); } catch (e) { r.errors.push(`${name}: .agents/repo.json: ${e.message}`); continue; }
       const ctx = repoContext(repoRoot, wcfg, repo, id.commonDir, { worktreePath: w.path, branch: w.branch, wtId });
       const prs = forBranch(w.branch);
       if (!prs) continue;
-      const { out } = envPaths(ctx);
-      const a = assess({ prs, worktreePath: w.path, ignore: [out] });
+      let out;
+      try { ({ out } = envPaths(ctx)); } catch (e) { r.errors.push(`${name}: ${e.message}`); continue; }
+      const a = assess({ prs, worktreePath: w.path, ignore: envIgnore(w.path, out) });
       if (a.verdict !== 'eligible') { r.kept.push(`${name}: ${a.detail}`); continue; }
       if (procs === undefined) procs = listProcesses();
       if (!procs) { r.kept.push(`${name}: process list failed`); continue; }
@@ -803,7 +856,12 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
       try {
         const ledger = readLedger(id.commonDir, wtId) || { resources: [], ports: {} };
         const s = await cleanup(ctx, ledger, a.pr, { dryRun, worktreeGone: false });
-        if (s.errors.length) { r.errors.push(`${name}: ${s.errors.join('; ')}`); continue; }
+        if (s.errors.length) {
+          r.errors.push(`${name}: ${s.errors.join('; ')}`);
+          if (!dryRun && readLedger(id.commonDir, wtId)) keepLedger(wtId, s.errors.join('; '));
+          continue;
+        }
+        finished.add(wtId);
         if (dryRun) { r.worktreesRemoved++; continue; }
         const rm = git(['worktree', 'remove', w.path], { cwd: repoRoot });
         if (rm.status !== 0) { r.kept.push(`${name}: git worktree remove refused (${firstLine(rm.stderr)})`); continue; }
@@ -817,10 +875,15 @@ async function sweepLocked(id, repo, { dryRun, quick }) {
   // 3. Local branches whose PR merged or closed, with nothing unpushed.
   if (index && worktrees) {
     const checkedOut = new Set(worktrees.map((w) => w.branch).filter(Boolean));
+    // A ledger that is not finished still needs its branch to prove, later, that it was pushed.
+    const pending = new Set(listLedgers(id.commonDir)
+      .filter(({ wtId, data: d }) => d.state !== 'torn-down' && d.branch && !finished.has(wtId))
+      .map(({ data: d }) => d.branch));
     const refs = (gitOut(['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads'], { cwd: repoRoot }) || '').split(/\r?\n/).filter(Boolean);
     for (const line of refs) {
       const [branch, tip] = line.split(' ');
       if (branch === base || branch === 'agent-landing-lock' || checkedOut.has(branch)) continue;
+      if (pending.has(branch)) { r.kept.push(`branch ${branch}: an unfinished ledger still needs it`); continue; }
       if (index.complete && !index.known(branch)) continue;
       const prs = forBranch(branch);
       if (!prs || !prs.head.length) continue;
@@ -967,6 +1030,7 @@ export async function main(argv) {
   }
 }
 
-if (process.argv[1] && samePath(process.argv[1], SELF)) {
+// Compare canonical paths: Node resolves links in import.meta.url but not in argv[1].
+if (process.argv[1] && canonKey(process.argv[1]) === canonKey(SELF)) {
   main(process.argv.slice(2)).then((code) => { process.exitCode = code; });
 }

@@ -10,6 +10,8 @@ import { normPath } from './repo.mjs';
 
 const LOCK_WAIT_MS = 15000;
 const LOCK_EMPTY_GRACE_MS = 5000;
+// Teardown and sweep finish well within this; older locks belong to a crashed holder.
+const LOCK_TTL_MS = 2 * 60 * 60 * 1000;
 
 export function ledgerDir(commonDir) { return path.join(commonDir, 'agent-resources'); }
 export function ledgerFile(commonDir, wtId) { return path.join(ledgerDir(commonDir), `${wtId}.json`); }
@@ -47,32 +49,67 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+/** The holder of a lock file is gone: its pid is dead, or the lock outlived LOCK_TTL_MS. */
+function stale(held, st) {
+  // A holder between create and write leaves an empty file for a moment.
+  if (!held) return Date.now() - st.mtimeMs >= LOCK_EMPTY_GRACE_MS;
+  // A reused pid would keep a crashed holder's lock "alive" forever: cap its age.
+  if (Date.now() - st.mtimeMs >= LOCK_TTL_MS) return true;
+  return !pidAlive(Number(held.split(' ')[0]));
+}
+
+function readHeld(file) {
+  try { return { held: fs.readFileSync(file, 'utf8'), st: fs.statSync(file) }; } catch { return null; }
+}
+
+/** Create file exclusively with token; true when it is ours. */
+function create(file, token) {
+  try { fs.writeFileSync(file, token, { flag: 'wx', mode: 0o600 }); return true; } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    return false;
+  }
+}
+
 /**
- * Take a lock file without waiting. The file holds "<pid> <random token>"; a lock whose pid
- * is dead is broken, a live holder means busy (null). Returns a release function that removes
- * the file only while it still holds our token.
+ * Take a lock file without waiting. The file holds "<pid> <random token>"; a live holder
+ * means busy (null). A stale lock is broken only under a second "<lock>.recover" lock, which
+ * makes "check that it is still the stale holder, then delete it" one step: two processes can
+ * never both break it, or delete a lock that a third one has just taken. Returns a release
+ * function that removes the file only while it still holds our token.
  */
 export function tryLock(lock) {
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   const token = `${process.pid} ${crypto.randomBytes(8).toString('hex')}`;
+  const release = () => {
+    try { if (fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock); } catch { /* gone */ }
+  };
   for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      fs.writeFileSync(lock, token, { flag: 'wx', mode: 0o600 });
-      return () => {
-        try { if (fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock); } catch { /* gone */ }
-      };
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let held;
-      let st;
-      try { held = fs.readFileSync(lock, 'utf8'); st = fs.statSync(lock); } catch { continue; }
-      // A holder between create and write leaves an empty file for a moment.
-      if (!held && Date.now() - st.mtimeMs < LOCK_EMPTY_GRACE_MS) return null;
-      if (pidAlive(Number(held.split(' ')[0]))) return null;
-      try { if (fs.readFileSync(lock, 'utf8') === held) fs.unlinkSync(lock); } catch { /* raced */ }
-    }
+    if (create(lock, token)) return release;
+    const cur = readHeld(lock);
+    if (!cur) continue;
+    if (!stale(cur.held, cur.st)) return null;
+    if (!breakStale(lock, cur.held, token)) return null;
   }
   return null;
+}
+
+/** Delete lock if it still holds held, under <lock>.recover. False when someone else is at it. */
+function breakStale(lock, held, token) {
+  const rec = `${lock}.recover`;
+  if (!create(rec, token)) {
+    const r = readHeld(rec);
+    if (r && !stale(r.held, r.st)) return false;
+    // A recoverer that died mid-way: clear its file once, then try again next attempt.
+    try { if (r && fs.readFileSync(rec, 'utf8') === r.held && stale(r.held, fs.statSync(rec))) fs.unlinkSync(rec); } catch { /* raced */ }
+    return true;
+  }
+  try {
+    const now = readHeld(lock);
+    if (now && now.held === held && stale(now.held, now.st)) fs.unlinkSync(lock);
+  } catch { /* gone */ } finally {
+    try { if (fs.readFileSync(rec, 'utf8') === token) fs.unlinkSync(rec); } catch { /* gone */ }
+  }
+  return true;
 }
 
 /** Run fn while holding <file>.lock, waiting up to 15 s for a live holder. */

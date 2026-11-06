@@ -112,10 +112,11 @@ export function prepare(cmd, args = [], opts = {}) {
 /**
  * Run a command synchronously. Returns {status, stdout, stderr, error}. stdin is 'ignore'
  * unless opts.input is given (then a pipe carrying it). opts.inherit streams output to the
- * caller's terminal instead of capturing it.
+ * caller's terminal instead of capturing it (opts.stdoutToStderr sends that stdout to stderr,
+ * so machine-readable output on our own stdout stays clean).
  */
 export function run(cmd, args = [], opts = {}) {
-  const { input, inherit, ...rest } = opts;
+  const { input, inherit, stdoutToStderr, ...rest } = opts;
   let prepared;
   try {
     prepared = prepare(cmd, args, rest);
@@ -129,7 +130,7 @@ export function run(cmd, args = [], opts = {}) {
     input,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
-    stdio: inherit ? [stdin, 'inherit', 'inherit'] : [stdin, 'pipe', 'pipe'],
+    stdio: inherit ? [stdin, stdoutToStderr ? 2 : 'inherit', 'inherit'] : [stdin, 'pipe', 'pipe'],
   });
   return {
     status: r.status === null ? (r.error ? 127 : 128) : r.status,
