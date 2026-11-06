@@ -94,7 +94,10 @@ git ls-files --eol | awk '$1 ~ /^i\/(crlf|mixed)$/ {print $NF ":-"}' > "$TMP"
 report "crlf" < "$TMP"
 
 # 7. 1Password functions only in the secrets partials; their users must be private_ or run_.
-git grep -nIE '(^|[^A-Za-z])onepassword[A-Za-z]*([^A-Za-z]|$)' -- home ':(exclude)home/.chezmoitemplates/secrets/*' ':(exclude)home/.chezmoi.toml.tmpl' > "$TMP" 2>/dev/null
+#    The exact string literal "onepassword" (T3's secret-provider id, a JSON key) is data, not
+#    a function call, so it is blanked before the match; any other use on that line still fails.
+git grep -nIE '(^|[^A-Za-z])onepassword[A-Za-z]*([^A-Za-z]|$)' -- home ':(exclude)home/.chezmoitemplates/secrets/*' ':(exclude)home/.chezmoi.toml.tmpl' 2>/dev/null |
+  awk '{ c = $0; sub(/^[^:]*:[0-9]+:/, "", c); gsub(/"onepassword"/, "", c); if (c ~ /(^|[^A-Za-z])onepassword[A-Za-z]*([^A-Za-z]|$)/) print }' > "$TMP"
 report "op-outside-secrets" < "$TMP"
 git grep -lIE '[tT]emplate "secrets/' -- home 2>/dev/null | while IFS= read -r f; do
   base=${f##*/}

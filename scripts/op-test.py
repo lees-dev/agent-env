@@ -32,14 +32,21 @@ elif data:
     sys.exit(94)
 elif a == ['--version']:
     print('2.41.1')
+elif a[:3] == ['vault', 'get', 'agent-repos']:
+    # The shared repo-credentials vault: reachable unless the scope says otherwise.
+    if os.environ.get('FAKE_SCOPE') in ('norepos', 'failure'):
+        sys.exit(1)
+    print(json.dumps({'id': 'repos-vault', 'name': 'agent-repos'}))
 elif a == ['whoami'] or a[:2] == ['vault', 'get']:
     pass
 elif a[:2] == ['vault', 'list']:
     if os.environ.get('FAKE_SCOPE') == 'failure':
         sys.exit(95)
-    vaults = [{'id': 'device-vault'}]
+    vaults = [{'id': 'device-vault', 'name': 'agent-env-device'}]
+    if os.environ.get('FAKE_SCOPE') != 'norepos':
+        vaults.append({'id': 'repos-vault', 'name': 'agent-repos'})
     if os.environ.get('FAKE_SCOPE') == 'broad':
-        vaults.append({'id': 'admin-vault'})
+        vaults.append({'id': 'admin-vault', 'name': 'admin'})
     print(json.dumps(vaults))
 elif a[:2] == ['item', 'list']:
     items = [{'title': 'cpa-client-device'}]
@@ -48,6 +55,9 @@ elif a[:2] == ['item', 'list']:
             items.append({'title': 'cpa-client-remote-device'})
     elif 'admin-vault' in a:
         items = [{'title': 'owner-only-test-item'}]
+    elif 'repos-vault' in a:
+        # Preflight must never scan the shared vault's items.
+        sys.exit(98)
     print(json.dumps(items))
 elif a[:2] == ['item', 'get']:
     sys.exit(0 if (root / 'item.json').exists() else 1)
@@ -351,7 +361,8 @@ def main():
             script = root / ('preflight-op' + (suffix or '.sh'))
             script.write_text(bootstrap + section + summary, encoding='ascii', newline='\n')
             for role, scope, expected in [('hub', 'broad', 0), ('client', 'narrow', 0),
-                                           ('client', 'broad', 2), ('client', 'failure', 1)]:
+                                           ('client', 'broad', 2), ('client', 'norepos', 2),
+                                           ('client', 'failure', 1)]:
                 env.update(TEST_ROLE=role, TEST_VAULT='agent-env' if role == 'hub' else 'agent-env-device',
                            FAKE_SCOPE=scope)
                 code, _ = run(cmd + [str(script)], env)

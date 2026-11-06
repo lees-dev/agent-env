@@ -154,14 +154,15 @@ if ($opReady) {
         Ae-Hint 'create it or grant this account/service account read access, then rerun'
     }
 }
-# BEAST's hub admin account may read all agent vaults. Device accounts see their key only.
+# BEAST's hub admin account may read all agent vaults. Device accounts see their own key,
+# plus the shared repo-credentials vault agent-repos (not item-scanned; docs/cpa.md).
 # Counts titles only; no field value is fetched and no title is printed.
 if ($opReady -and $OpMode -eq 'service') {
     if ($Role -eq 'hub') {
         Ae-Ok 'hub service mode: device scope check does not apply'
     } else {
         if ($Vault -ne "agent-env-$Machine") { Ae-Warn "service mode reads vault '$Vault': use a vault of its own, 'agent-env-$Machine' (docs/cpa.md '1Password vaults')" }
-        $opNv = 0; $opExtra = 0
+        $opNv = 0; $opExtra = 0; $opRepos = $false
         $opVaults = @()
         # Windows PowerShell 5.1 emits a JSON array as one object: assign it, then enumerate.
         try {
@@ -171,6 +172,7 @@ if ($opReady -and $OpMode -eq 'service') {
         } catch { Ae-Fail 'cannot list service-account vaults to check scope' }
         foreach ($v in $opVaults) {
             if (-not $v.id) { continue }
+            if ([string]$v.name -eq 'agent-repos') { $opRepos = $true; continue }
             $opNv++
             $its = @()
             try {
@@ -185,12 +187,14 @@ if ($opReady -and $OpMode -eq 'service') {
             }
             $its = $null
         }
-        if ($opNv -eq 1 -and $opExtra -eq 0) { Ae-Ok 'device service account sees one vault and only its own key' }
+        if ($opNv -eq 1 -and $opExtra -eq 0) { Ae-Ok 'device service account sees one key vault and only its own key' }
         else {
             if ($opNv -ne 1) { Ae-Warn "device service account sees $opNv vault(s), expected one" }
             if ($opExtra -gt 0) { Ae-Warn "device service account can read $opExtra unexpected item(s)" }
-            Ae-Hint "scope this machine's service account read-only to vault 'agent-env-$Machine' only (docs/cpa.md)"
+            Ae-Hint "scope this machine's service account read-only to vault 'agent-env-$Machine', plus read+write on 'agent-repos' (docs/cpa.md)"
         }
+        if ($opRepos) { Ae-Ok "device service account reaches vault 'agent-repos' (repo dev credentials)" }
+        else { Ae-Warn "device service account cannot reach vault 'agent-repos': repo dev credentials will not inject (docs/cpa.md '1Password vaults')" }
         $opVaults = $null; $j = $null
     }
 }
