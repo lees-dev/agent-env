@@ -242,7 +242,11 @@ async function landOne(ctx, pr) {
     // A failed gate gets one retry; a lost lock or a timeout does not.
     let g = await runCommands([...named('setup', cfg.setup), ...named('affectedGate', cfg.affectedGate)], dir, lock, cfg);
     let retried = false;
-    if (!g.ok && !g.lost && !g.timedOut) { retried = true; g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg); }
+    // Only a red affected gate is retried; a failed setup is a failure as it stands.
+    if (!g.ok && !g.lost && !g.timedOut && String(g.name || '').startsWith('affectedGate')) {
+      retried = true;
+      g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg);
+    }
     // A lost lock: the checkout may be another lander's now (and processes this gate started may
     // survive), so it is left as it is.
     if (g.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push', lock);
@@ -293,10 +297,11 @@ async function landOne(ctx, pr) {
   const m = await mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root, lock });
   // Lost: nothing more is changed. Stuck: the merge may still happen, so no bounce; the lock is
   // kept and `landing` stays for the next lander's recovery.
-  if (m.lost) return abort(gh, pr, { requeue: m.summary, lost: true }, 'the merge', lock);
-  if (m.stuck) return { aborted: { pr: pr.number, reason: m.summary }, stop: true };
+  if (!m.ok && m.lost) return abort(gh, pr, { requeue: m.summary, lost: true }, 'the merge', lock);
+  if (!m.ok && m.stuck) return { aborted: { pr: pr.number, reason: m.summary }, stop: true };
   if (!m.ok) return bounceOwned(ctx, pr, `merge failed (${m.summary})`);
-  return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased } };
+  // Merged, but the lock was lost or the merge command timed out: counted, and the run stops.
+  return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased }, stop: Boolean(m.lost || m.stuck), lost: Boolean(m.lost), stuck: Boolean(m.stuck) };
 }
 
 // ---------------------------------------------------------------- capacity
@@ -499,7 +504,11 @@ async function runRepoSteps(t, opts, report) {
       if (res?.merged) {
         report.merged.push(res.merged);
         try { bumpMergeCount(gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
-        if (await sweepAfter(ctx, report)) lost = true;
+        if (res.stop) {
+          // No sweep, reset or other PR after a lost lock or a merge command that may still run.
+          lost = true;
+          report.alerts.push(`#${res.merged.pr} merged, but ${res.lost ? 'the landing lock was lost' : 'the merge command timed out (the landing lock is kept)'}: stopped before any sweep or other landing`);
+        } else if (await sweepAfter(ctx, report)) lost = true;
       }
     } catch (e) {
       // Settle the PR from a fresh read. A merge that went through is counted and the run goes

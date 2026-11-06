@@ -53,7 +53,7 @@ import {
   Gh, LandError, LandingLock,
   addHold, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
   holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
-  parseLanding, pollMs, print, removeHold, repoTop, resolveRepo, retainedLockMessage, setLabels, unmetDeps,
+  parseLanding, pollMs, print, removeHold, repoTop, resolveRepo, retainedLockMessage, setLabels, sweepDue, unmetDeps,
   validateLandingCommands, writeLanding,
 } from './lib/land.mjs';
 import { sleepMs } from './lib/proc.mjs';
@@ -360,6 +360,18 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
   // base and the queue are checked again, then the last read before the merge, then fairness
   // once more and the lock itself.
   if (current && !['queued', 'queue-waiting', 'queue-blocked'].some((l) => labels.includes(l)) && line.count === 0) {
+    // A wide sweep that is overdue (one that failed to run or to pause) runs first, under this
+    // lock, as the lander does: nothing merges past it unless it finishes green.
+    if (sweepDue(repo, cfg)) {
+      let s;
+      try { s = await dueSweep({ gh, cfg, mainRoot: mainCheckout(root), lock }); } catch (e) {
+        s = { ok: false, stop: true, alert: `the wide sweep could not run: ${firstLine(e?.message || e)}; it stays due` };
+      }
+      if (s?.alert) process.stderr.write(`warning: ${s.alert}\n`);
+      if (s && (!s.ok || s.lost || s.stop || s.paused)) {
+        return refuse(`an overdue wide sweep on ${base} did not finish green (${s.lost ? 'the landing lock was lost' : s.paused ? 'the repo is paused' : 'see the warning'}); nothing was merged`);
+      }
+    }
     fetchBranch(root, base);
     const stillCurrent = isAncestor(`refs/remotes/origin/${base}`, sha, root);
     line = othersInLine(gh, n);
@@ -374,14 +386,19 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
         if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.summary}`);
         // The merge stands even if its count cannot be recorded (the next sweep may run late).
         try { bumpMergeCount(repo); } catch (e) { process.stderr.write(`warning: the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late\n`); }
-        // A wide sweep that is due runs now, still under the lock.
+        // A wide sweep that is due runs now, still under the lock: not after a lost lock or a
+        // merge command that may still run (the next lander runs it first).
         let sweep = null;
-        try {
-          sweep = await dueSweep({ gh, cfg, mainRoot: mainCheckout(root), lock });
-          if (sweep?.alert) process.stderr.write(`warning: ${sweep.alert}\n`);
-        } catch (e) {
-          sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
-          process.stderr.write(`warning: the wide sweep could not run: ${sweep.error}\n`);
+        if (m.lost || m.stuck) {
+          process.stderr.write(`warning: #${n} merged, but ${m.lost ? 'the landing lock was lost' : 'the merge command timed out (the landing lock is kept)'}: no wide sweep now\n`);
+        } else {
+          try {
+            sweep = await dueSweep({ gh, cfg, mainRoot: mainCheckout(root), lock });
+            if (sweep?.alert) process.stderr.write(`warning: ${sweep.alert}\n`);
+          } catch (e) {
+            sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
+            process.stderr.write(`warning: the wide sweep could not run: ${sweep.error}\n`);
+          }
         }
         const freed = lock.release();
         if (!freed) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);

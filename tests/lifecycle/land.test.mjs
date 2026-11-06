@@ -26,7 +26,9 @@ const BIN = path.resolve(HERE, '../../home/dot_agents/bin');
 const LAND_PR = path.join(BIN, 'land-pr.mjs');
 const LAND_QUEUE = path.join(BIN, 'land-queue.mjs');
 const temps = [];
-after(() => { for (const t of temps) fs.rmSync(t, { recursive: true, force: true }); });
+// A process a test proved unstoppable (a hook's sleep on Windows) may still hold a file for a
+// moment: cleanup is best effort, never a test failure.
+after(() => { for (const t of temps) { try { fs.rmSync(t, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }); } catch { /* left for the OS temp cleanup */ } } });
 
 // gh on PATH: the same shim shape as the lifecycle fakes (helpers.mjs installFake).
 function installGh(dir) {
@@ -1281,11 +1283,11 @@ describe('land-queue', () => {
     const t = setup();
     const head = queuePr(t, 1);
     advanceMain(t, 'other.txt', 'x\n');
-    pushHook(t, 'sleep 90');
+    pushHook(t, 'sleep 40');
     Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: '4000', AGENT_LAND_STUCK_MS: '3000' });
     const started = Date.now();
     const rep = runQueue(t);
-    assert.ok(Date.now() - started < 60000, 'the hung hook did not hold the lander');
+    assert.ok(Date.now() - started < 30000, 'the hung hook did not hold the lander');
     assert.match(rep.aborted[0].reason, /push of the rebased head timed out .* landing lock is kept/);
     assert.ok(rep.lockRetained?.sha, 'the lock is kept');
     assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
@@ -1296,7 +1298,7 @@ describe('land-queue', () => {
 
   test('run: a merge wrapper that hangs is stopped at the command timeout: no bounce, lock kept', { timeout: 180000 }, () => {
     const t = setup({ mergeCmd: 'node scripts/hang-merge.mjs {pr}' });
-    fs.writeFileSync(path.join(t.work, 'scripts', 'hang-merge.mjs'), 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 90000);\n');
+    fs.writeFileSync(path.join(t.work, 'scripts', 'hang-merge.mjs'), 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40000);\n');
     queuePr(t, 1);
     Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: '4000', AGENT_LAND_STUCK_MS: '3000' });
     const started = Date.now();
@@ -1362,6 +1364,109 @@ describe('land-queue', () => {
     assert.notEqual(q.status, 0);
     assert.equal(lockExists(t), false, 'no lock created');
     assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge' || (c.cmd === 'api' && c.method !== 'GET')), false);
+  });
+
+  // ---- a merge confirmed after a lost lock or a timed-out merge command still ends the run
+
+  // A mergeCmd that merges the PR (in the fake), writes a file into the lander checkout (the
+  // command's own output a reset or a sweep would wipe), then steals the lock or hangs.
+  const mergeThen = (t, then) => {
+    fs.writeFileSync(path.join(t.work, 'scripts', 'merge-then.mjs'), [
+      "import fs from 'node:fs';",
+      "import { spawnSync } from 'node:child_process';",
+      'const [pr, sha] = process.argv.slice(2);',
+      'const s = JSON.parse(fs.readFileSync(process.env.FAKE_GH_STATE, "utf8"));',
+      'const p = s.prs.find((x) => x.number === Number(pr));',
+      "p.state = 'MERGED'; p.mergeCommit = { oid: sha };",
+      'fs.writeFileSync(process.env.FAKE_GH_STATE, JSON.stringify(s, null, 2));',
+      "const lander = `${process.cwd()}-lander`;",
+      "if (fs.existsSync(lander)) fs.writeFileSync(`${lander}/command-file.txt`, 'kept\\n');",
+      then === 'steal' ? [
+        "const g = (...a) => spawnSync('git', ['--git-dir', process.env.FAKE_GH_BARE, ...a], { encoding: 'utf8' }).stdout.trim();",
+        "const lock = 'refs/heads/agent-landing-lock';",
+        "const c = g('commit-tree', g('rev-parse', lock + '^{tree}'), '-m', 'agent-landing-lock host=other pid=1 at=2099-01-01T00:00:00Z ttl=45');",
+        "g('update-ref', lock, c); fs.writeFileSync(process.env.STOLEN_FILE, c);",
+      ].join('\n') : 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 40000);',
+    ].join('\n'));
+    t.env.STOLEN_FILE = path.join(t.tmp, 'stolen');
+  };
+  const sweepCount = (t) => {
+    try { return JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r']?.sinceSweep ?? 0; } catch { return 0; }
+  };
+
+  for (const then of ['steal', 'hang']) {
+    test(`run: merged, then ${then === 'steal' ? 'the lock was lost' : 'the merge command timed out'}: counted once, then stop (no sweep, reset or next PR)`, { timeout: 180000 }, () => {
+      const t = setup({ mergeCmd: 'node scripts/merge-then.mjs {pr} {sha}', sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+      queuePr(t, 1);
+      queuePr(t, 2);
+      // Written after the PRs (an untracked file in the main checkout, where the merge runs).
+      mergeThen(t, then);
+      Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: then === 'hang' ? '4000' : '600000', AGENT_LAND_STUCK_MS: '3000' });
+      const rep = runQueue(t);
+      assert.deepEqual(rep.merged.map((m) => m.pr), [1], 'the confirmed merge is reported');
+      assert.equal(sweepCount(t), 1, 'counted once, and no sweep ran');
+      assert.equal(rep.sweep, null);
+      assert.match(rep.alerts.join('\n'), /#1 merged, but .*stopped before any sweep or other landing/);
+      assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the next PR was not started');
+      assert.ok(fs.existsSync(path.join(`${t.work}-lander`, 'command-file.txt')), 'the lander checkout was not reset or cleaned');
+      assert.ok(prOf(t, 1).labels.includes('landing'), 'no label cleanup after the loss or the timeout');
+      if (then === 'steal') assert.equal(lockSha(t), fs.readFileSync(t.env.STOLEN_FILE, 'utf8'), 'the other lander keeps its lock');
+      else assert.ok(rep.lockRetained?.sha, 'the lock is kept while the merge command may still run');
+    });
+  }
+
+  test('land-pr merge now: merged after a lost lock: MERGED, counted once, no wide sweep', { timeout: 180000 }, () => {
+    const t = setup({ mergeCmd: 'node scripts/merge-then.mjs {pr} {sha}', sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    const head = makePr(t, 1);
+    mergeThen(t, 'steal');
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const out = JSON.parse(r.out);
+    assert.equal(out.result, 'MERGED');
+    assert.equal(out.sweep, null);
+    assert.match(r.err, /#1 merged, but the landing lock was lost: no wide sweep now/);
+    assert.equal(sweepCount(t), 1);
+    assert.equal(lockSha(t), fs.readFileSync(t.env.STOLEN_FILE, 'utf8'));
+  });
+
+  // An overdue sweep (one that failed to run or to pause earlier) runs before land-pr merges.
+  test('land-pr merge now: an overdue wide sweep runs first; red refuses with nothing merged, green merges', { timeout: 180000 }, () => {
+    for (const color of ['red', 'green']) {
+      const t = setup({ sweepEveryMerges: 5, wideSweep: 'node scripts/sweep.mjs' });
+      const dir = path.join(t.home, '.agents', 'state');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'land-queue.json'), JSON.stringify({ 'o/r': { merges: 5, sinceSweep: 5 } }));
+      const head = makePr(t, 1);
+      t.env.LAND_TEST_SWEEP = color === 'red' ? 'fail' : 'pass';
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+      if (color === 'red') {
+        assert.equal(r.status, 2, r.err);
+        assert.match(r.out, /^REFUSED an overdue wide sweep on main did not finish green/);
+        assert.equal(prOf(t, 1).state, 'OPEN');
+        assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+        assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1', 'the red sweep paused the repo');
+      } else {
+        assert.equal(r.status, 0, r.err);
+        assert.match(r.out, /^MERGED/);
+        assert.equal(sweepCount(t), 1, 'swept first (reset to 0), then this merge counted');
+      }
+      assert.equal(lockExists(t), false);
+    }
+  });
+
+  test('run: a failed setup after the rebase is not retried and never lands, even if the gate would pass', { timeout: 180000 }, () => {
+    const t = setup({ setup: ['node scripts/fail-setup.mjs'] });
+    fs.writeFileSync(path.join(t.work, 'scripts', 'fail-setup.mjs'), 'process.exit(1);\n');
+    const head = queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0);
+    assert.match(rep.bounced[0].reason, /affected gate failed: setup\[0\] .* exit 1, after the rebase/);
+    assert.doesNotMatch(rep.bounced[0].reason, /retried/);
+    assert.equal(fs.existsSync(`${t.env.LAND_TEST_GATE}.runs`), false, 'the affected gate was not run on its own');
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
+    assert.doesNotMatch(prOf(t, 1).body, /Gate: pending/);
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
   });
 
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {

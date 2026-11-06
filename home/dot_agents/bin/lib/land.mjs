@@ -871,9 +871,12 @@ export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
     try { after = gh.prView(pr); } catch { after = null; }
   }
   if (after?.state === 'MERGED') {
-    // Labels are cleared only while the lock is still ours (the next lander clears a leftover).
-    if (!r.lost && (!lock || lock.stillHeld())) clearQueueLabels(gh, after);
-    return { ok: true, mergeSha: after.mergeCommit?.oid || null };
+    // A confirmed merge is counted, but a lost lock or a step that timed out still ends the run:
+    // both are reported with it, and the caller stops before any sweep, reset or other PR.
+    // Labels are cleared only while the lock is ours and nothing may still run (the next lander
+    // clears a leftover).
+    if (!r.lost && !r.stuck && (!lock || lock.stillHeld())) clearQueueLabels(gh, after);
+    return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost), stuck: Boolean(r.stuck) };
   }
   if (r.lost) return { ok: false, lost: true, summary: 'the landing lock was lost during the merge command' };
   if (r.stuck) return { ok: false, stuck: true, summary: `the merge command timed out (PR state ${after?.state || 'unknown'}); the landing lock is kept` };

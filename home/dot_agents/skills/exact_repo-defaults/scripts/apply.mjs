@@ -647,6 +647,12 @@ function main() {
   const flags = new Set(argv.filter((a) => a.startsWith('--')));
   const known = new Set(['--inspect', '--check', '--apply', '--repo', '--json', '--offline', '--help']);
   for (const f of flags) if (!known.has(f)) { process.stderr.write(`unknown option ${f}\n`); return 2; }
+  // Anything else (`check`, `-check`, a stray word) is a mistake, not a request to inspect: only
+  // the path after --repo may stand alone.
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--repo') { i++; continue; }
+    if (!argv[i].startsWith('--')) { process.stderr.write(`unexpected argument ${argv[i]} (options start with --)\n`); return 2; }
+  }
   if (flags.has('--help')) { process.stdout.write('usage: node apply.mjs [--inspect|--check|--apply] [--repo <path>] [--json] [--offline]\n'); return 0; }
   // One mode at most, and --repo needs a path: a wrong call stops here, before any write.
   const modes = ['--inspect', '--check', '--apply'].filter((m) => flags.has(m));

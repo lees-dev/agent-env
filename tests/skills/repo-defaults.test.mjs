@@ -918,6 +918,20 @@ describe('repo-defaults apply.mjs', () => {
     assert.doesNotMatch(p.stdout + txt, /plainvalue/);
   });
 
+  test('a stray argument (check, -check, a word) is refused with exit 2 before anything is read or written', () => {
+    const r = repo();
+    const before = snapshot(r);
+    for (const extra of [['check'], ['-check'], ['--check', 'extra']]) {
+      const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, ...extra], { env: r.e, encoding: 'utf8', shell: false });
+      assert.equal(p.status, 2, `${extra.join(' ')}: ${p.stdout}`);
+      assert.match(p.stderr, /unexpected argument/);
+      assert.equal(p.stdout, '');
+    }
+    assert.deepEqual(snapshot(r), before);
+    const help = spawnSync(process.execPath, [APPLY, '--help'], { encoding: 'utf8', shell: false });
+    assert.equal(help.status, 0);
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');
