@@ -29,8 +29,11 @@ const GIT = realGit();
 function env(tmp) {
   const gitcfg = path.join(tmp, 'gitconfig');
   if (!fs.existsSync(gitcfg)) fs.writeFileSync(gitcfg, '');
+  // No inherited GIT_* (GIT_DIR, GIT_INDEX_FILE, GIT_WORK_TREE from an outer git, such as a
+  // hook): the fixture's git must only ever touch the temp repo (the lifecycle helpers do the same).
+  const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_/i.test(k)));
   return {
-    ...process.env, GIT_CONFIG_GLOBAL: gitcfg, GIT_CONFIG_NOSYSTEM: '1',
+    ...base, GIT_CONFIG_GLOBAL: gitcfg, GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
   };
 }
@@ -403,6 +406,19 @@ describe('repo-defaults apply.mjs', () => {
     assert.deepEqual(fs.readdirSync(outDir), [], 'nothing created outside');
   });
 
+  test('reports never read through a link outside the repo (TODO markers in an outside docs folder)', () => {
+    const r = repo();
+    const outDir = path.join(path.dirname(r.work), 'outdocs');
+    fs.mkdirSync(path.join(outDir, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'agents', 'repo.md'), 'TODO(repo-defaults) one\nTODO(repo-defaults) two\n');
+    fs.symlinkSync(outDir, path.join(r.work, 'docs'), process.platform === 'win32' ? 'junction' : 'dir');
+    const i = run(r, '--inspect', '--json');
+    assert.equal(i.status, 0, i.err);
+    assert.equal(i.json.items.find((x) => x.name === 'docs/agents/repo.md').status, 'invalid');
+    assert.equal(i.json.todo, null, 'no TODO markers counted from outside the repo');
+    assert.doesNotMatch(run(r, '--inspect').out, /TODO markers/);
+  });
+
   test('a dangling docs/agents/repo.md link is invalid and left as it is', (t) => {
     const r = repo();
     fs.mkdirSync(path.join(r.work, 'docs', 'agents'), { recursive: true });
@@ -495,6 +511,54 @@ describe('repo-defaults apply.mjs', () => {
     git(r.work, r.e, 'add', '-f', '.env.op');
     git(r.work, r.e, 'commit', '--quiet', '-m', 'env.op');
     assert.equal(run(r, '--inspect', '--json').json.env.envOpIgnored, false);
+  });
+
+  test('a newer managed block (from a newer skill) is reported and never rewritten', () => {
+    const newer = BLOCK.replace(/agent-standard v1/g, 'agent-standard v2').replace('(v1)', '(v2)');
+    const text = `${newer}\n\nOwned.\n`;
+    const r = repo({ 'AGENTS.md': text });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1);
+    const item = a.json.items.find((i) => i.name === 'AGENTS.md block');
+    assert.equal(item.status, 'invalid');
+    assert.match(item.detail, /v2 is newer than this skill's v1/);
+    assert.equal(read(r, 'AGENTS.md'), text);
+  });
+
+  test('repo.json: a missing version is added with the other keys; an explicit other version is refused', () => {
+    const r = repo({ '.agents/repo.json': JSON.stringify({ repo: 'x', vault: 'agent-repos', gate: ['make gate'] }) });
+    assert.equal(run(r, '--apply').status, 0);
+    const rj = JSON.parse(read(r, '.agents/repo.json'));
+    assert.equal(rj.version, 1);
+    assert.deepEqual(rj.gate, ['make gate']);
+    const r2 = repo({ '.agents/repo.json': JSON.stringify({ version: 2, vault: 'agent-repos' }) });
+    const a = run(r2, '--apply');
+    assert.equal(a.status, 1);
+    assert.match(a.out, /version is not 1/);
+  });
+
+  test('a CRLF workflow with a blank line inside on: still lists its pull_request trigger', () => {
+    const r = repo({ '.github/workflows/ci.yml': 'name: ci\r\non:\r\n  push:\r\n\r\n  pull_request:\r\njobs: {}\r\n' });
+    assert.deepEqual(run(r, '--inspect', '--json').json.gatingWorkflows, [{ file: '.github/workflows/ci.yml', triggers: ['pull_request'] }]);
+  });
+
+  test('an inherited GIT_INDEX_FILE (outer repo) is never touched by the fixture', () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'outer repo '));
+    temps.push(outer);
+    const oe = env(outer);
+    git(outer, oe, 'init', '--quiet', outer);
+    fs.writeFileSync(path.join(outer, 'staged.txt'), 'staged\n');
+    git(outer, oe, 'add', 'staged.txt');
+    const index = path.join(outer, '.git', 'index');
+    const before = fs.readFileSync(index);
+    const saved = process.env.GIT_INDEX_FILE;
+    process.env.GIT_INDEX_FILE = index;
+    try {
+      repo({ 'a.txt': 'a\n' });
+    } finally {
+      if (saved === undefined) delete process.env.GIT_INDEX_FILE; else process.env.GIT_INDEX_FILE = saved;
+    }
+    assert.ok(fs.readFileSync(index).equals(before), 'the outer index is byte-identical');
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

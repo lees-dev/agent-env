@@ -34,7 +34,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 
 - **merged**: mark each PR's Linear ticket Done with the merge sha; clean up per `pr-workflow` section 7 (worktree teardown does most of it).
 - **bounced**, not parked: move the Linear ticket back to In Progress with the reason. Start an Opus fixer (`subagent-routing`): in this project `delegate_task` with `isolation: "worktree"`; for another repo `t3_thread_launch` with a worktree. Brief it with the PR, the bounce reason, and `pr-workflow` "Editing a queued PR":
-  1. `node "$HOME/.agents/bin/land-pr.mjs" hold <n> --holder <id>` with one fixed id for this fix (the fixer's `$T3CODE_THREAD_ID` is used when `--holder` is left out; with neither it refuses). It adds `queue-hold` and `Hold-By: <id> <ISO time>`, and refuses if `queue-hold` is already set or the PR is `landing`: then report and stop;
+  1. `node "$HOME/.agents/bin/land-pr.mjs" hold <n> --holder <id>` with one fixed id for this fix (the fixer's `$T3CODE_THREAD_ID` is used when `--holder` is left out; with neither it refuses). It adds `queue-hold` and `Hold-By: <id> <ISO time>` under the landing lock, and refuses if `queue-hold` is already set, the PR is `landing` or the lock is busy: then report, and retry only for a busy lock once the lander is done;
   2. fix on the PR branch, push, run the affected gate;
   3. one cross-family reviewer checks the fix (for a conflict, the resolution), started the same way;
   4. `node "$HOME/.agents/bin/land-pr.mjs" <n> --sha <new gated sha> --release-hold --holder <the same id>` (checks first, then records the new gated sha and removes only its own hold, in one edit; the PR goes back in line).
@@ -45,7 +45,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 - **stale**: the lock is older than its ttl. Confirm the holder (`host`, `pid`) is gone: same machine, no such process, no lander thread running. Only then rerun with `--reclaim-stale`. Otherwise report it. Only the lander reclaims a stale lock.
 - **busy**: another lander holds the lock. Stop; the next run picks up.
 - **lockRetained**: this run did not delete its own lock (the alert says why and gives the command). Report it; it blocks every lander until it is deleted, or reclaimed as stale once its ttl has passed. When the alert says a command could not be stopped, first make sure that command and everything it started (in the lander checkout) have stopped; then delete the lock with that command, and only while no lander run is active.
-- **paused** or a sweep alert: open a ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node "$HOME/.agents/bin/land-queue.mjs" unpause` takes the landing lock (it refuses while another lander holds it), reruns the sweep and clears the pause only when it is green; the owner may also clear it.
+- **paused** or a sweep alert: open a ticket for the red sweep on the base, with the failing command and the alert. Land nothing. When a fix is on the base, `node "$HOME/.agents/bin/land-queue.mjs" unpause` takes the landing lock (it refuses while another lander holds it), reruns the sweep and clears the pause only when it is green; a repo without a `wideSweep` keeps the pause for the owner to clear.
 - **error** on a repo: report the message; do not retry in a loop.
 
 ## 3. Labels

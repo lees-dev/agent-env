@@ -128,7 +128,9 @@ function setup(repoJson = {}) {
   const gitcfg = path.join(tmp, 'gitconfig');
   fs.writeFileSync(gitcfg, '');
   const env = { ...process.env };
-  for (const k of Object.keys(env)) if (k.toUpperCase().startsWith('OP_') || k.toUpperCase() === 'T3CODE_THREAD_ID') delete env[k];
+  // No inherited GIT_* (an outer git's GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE, such as in a
+  // hook) reaches the fixture's git; its own GIT_* settings are added below.
+  for (const k of Object.keys(env)) if (/^(OP_|GIT_)/i.test(k) || k.toUpperCase() === 'T3CODE_THREAD_ID') delete env[k];
   env.OP_SERVICE_ACCOUNT_TOKEN = 'dummy-test-value';
   const pk = pathKey(env);
   env[pk] = `${fakebin}${path.delimiter}${env[pk] || ''}`;
@@ -718,6 +720,44 @@ describe('land-pr', () => {
     const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
     assert.equal(r.status, 0, r.err);
     assert.deepEqual(prOf(t, 1).labels, []);
+  });
+
+  test('hold edits only under the landing lock: a busy lock refuses with no edit; a hold releases the lock', () => {
+    const t = setup();
+    queuePr(t, 1);
+    setLock(t, 1);
+    const lock = lockSha(t);
+    const before = state(t).calls.length;
+    const r = tool(t, LAND_PR, 'hold', '1', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED the landing lock is busy/);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.doesNotMatch(prOf(t, 1).body, /Hold-By:/);
+    assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit'), false);
+    assert.equal(lockSha(t), lock, 'the other lock is untouched');
+    sh(t.bare, t.env, 'update-ref', '-d', 'refs/heads/agent-landing-lock');
+    const ok = tool(t, LAND_PR, 'hold', '1', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(ok.status, 0, ok.err);
+    assert.equal(lockExists(t), false, 'released after the hold');
+  });
+
+  test('an inherited GIT_INDEX_FILE (outer repo) is never touched by the fixture', () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), 'outer repo '));
+    temps.push(outer);
+    const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_/i.test(k)));
+    sh(outer, clean, 'init', '--quiet', outer);
+    fs.writeFileSync(path.join(outer, 'staged.txt'), 'staged\n');
+    sh(outer, clean, 'add', 'staged.txt');
+    const index = path.join(outer, '.git', 'index');
+    const before = fs.readFileSync(index);
+    const saved = process.env.GIT_INDEX_FILE;
+    process.env.GIT_INDEX_FILE = index;
+    try {
+      setup();
+    } finally {
+      if (saved === undefined) delete process.env.GIT_INDEX_FILE; else process.env.GIT_INDEX_FILE = saved;
+    }
+    assert.ok(fs.readFileSync(index).equals(before), 'the outer index is byte-identical');
   });
 
   test('hold refuses a landing PR', () => {
@@ -1536,6 +1576,16 @@ describe('land-queue', () => {
       assert.equal(lockExists(t), false);
     });
   }
+
+  test('unpause keeps the pause when no wideSweep is configured (nothing shows the base is green)', () => {
+    const t = setup();
+    const s = state(t); s.variables = { AGENT_LANDING_PAUSED: '1' }; saveState(t, s);
+    const r = tool(t, LAND_QUEUE, 'unpause', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 1);
+    assert.equal(JSON.parse(r.out).paused, true);
+    assert.match(JSON.parse(r.out).note, /the owner clears the pause/);
+    assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
+  });
 
   test('unpause takes the landing lock for its sweep and refuses while it is busy', () => {
     const t = setup({ wideSweep: 'node scripts/sweep.mjs' });

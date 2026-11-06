@@ -421,8 +421,10 @@ async function unpauseRepo(t) {
   const ctx = context(t);
   const { gh, cfg } = ctx;
   if (!gh.isPaused()) return { repo: t.repo, paused: false, sweep: null, note: 'not paused' };
+  // Nothing can show the base is green without a sweep: the pause stays for the owner to clear.
+  if (!cfg.wideSweep) return { repo: t.repo, paused: true, sweep: null, note: 'no wideSweep is configured, so nothing can show the base is green; the owner clears the pause' };
   let sweep = null;
-  if (cfg.wideSweep) {
+  {
     // The sweep runs in the lander checkout: only while holding the landing lock.
     const probe = { stale: [], busy: false, alerts: [] };
     if (!takeLock(ctx, probe, {})) {

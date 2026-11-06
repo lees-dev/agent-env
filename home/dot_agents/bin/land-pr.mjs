@@ -22,8 +22,8 @@
 // Editing a queued PR (pr-workflow section 4): `hold` adds `queue-hold` and a PR-body line
 // `Hold-By: <holder> <ISO time>` in one edit. <holder> is --holder, else $T3CODE_THREAD_ID; with
 // neither it refuses (exit 2), because the same id must release the hold. `hold` refuses when the
-// PR is `landing` or `queue-hold` is already there, and backs its hold out again if `landing`
-// appears meanwhile. After the push, gate and review, `--release-hold` (same holder) first runs
+// PR is `landing` or `queue-hold` is already there, and makes its edit under the landing lock
+// (a busy lock refuses too, with no edit). After the push, gate and review, `--release-hold` (same holder) first runs
 // the read-only checks (only its own queue-hold excepted), then records the new gated sha and
 // removes `queue-hold` and this holder's line in one edit, then continues as above on a fresh
 // read. A hold whose line names another holder is refused. Only whoever set a hold clears it
@@ -94,22 +94,40 @@ function hold(args, n) {
   const gh = new Gh({ repo });
   const out = (o, code) => { if (args.json) print(o, true); else print(o.line, false); return code; };
   const refuse = (reason) => out({ result: 'REFUSED', pr: n, reason, line: `REFUSED ${reason}` }, 2);
-  // Read-only checks first, then the edit, then a re-check.
-  const pr = gh.prView(n);
-  if (pr.state !== 'OPEN') throw new LandError(`PR #${n} is ${pr.state}`);
-  const labels = labelNames(pr);
-  if (labels.includes('landing')) return refuse('landing (the lander has it; wait for its merge or bounce)');
-  if (labels.includes('queue-hold')) return refuse('queue-hold already set (leave it, push nothing that lands, report it)');
-  gh.ensureLabels();
-  const body = addHold(pr.body, holder);
-  gh.prEdit(n, { body, add: ['queue-hold'] });
-  // The lander may have taken it in the meantime: then back out and wait.
-  const after = gh.prView(n);
-  if (labelNames(after).includes('landing')) {
-    gh.prEdit(n, { body: removeHold(after.body, holder), remove: ['queue-hold'] });
-    return refuse('landing (the lander took it while holding; hold removed, wait for its merge or bounce)');
+  const check = (p) => {
+    if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
+    const labels = labelNames(p);
+    if (labels.includes('landing')) return 'landing (the lander has it; wait for its merge or bounce)';
+    if (labels.includes('queue-hold')) return 'queue-hold already set (leave it, push nothing that lands, report it)';
+    return '';
+  };
+  // Read-only checks first.
+  const first = check(gh.prView(n));
+  if (first) return refuse(first);
+  // The edit happens under the landing lock: the lander changes PR bodies and labels only while
+  // holding it, and GitHub keeps the last body written, so this is what stops a bounce from
+  // overwriting the Hold-By line. A busy lock refuses, with no edit, like `landing` does.
+  const cfg = loadRepoConfig(root, { needGate: false });
+  fetchBranch(root, cfg.base);
+  const lock = new LandingLock(gh, { ttlMin: cfg.lockTtlMin, cwd: root });
+  const got = lock.acquire(baseTreeOf(root, `refs/remotes/origin/${cfg.base}`));
+  if (!got.held) {
+    return refuse(`the landing lock is ${got.stale ? 'stale (only the lander reclaims it)' : 'busy (a landing is in progress)'}; try again after it`);
   }
-  return out({ result: 'HELD', pr: n, holder, line: `HELD ${holder}` }, 0);
+  try {
+    const pr = gh.prView(n);
+    const again = check(pr);
+    if (again) return refuse(again);
+    gh.ensureLabels();
+    gh.prEdit(n, { body: addHold(pr.body, holder), add: ['queue-hold'] });
+    const after = gh.prView(n);
+    if (!parseHolds(after.body).some((h) => h.holder === holder) || !labelNames(after).includes('queue-hold')) {
+      throw new LandError(`PR #${n}: the hold was not recorded (Hold-By line or queue-hold missing after the edit); check the PR by hand`);
+    }
+    return out({ result: 'HELD', pr: n, holder, line: `HELD ${holder}` }, 0);
+  } finally {
+    if (!lock.release()) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);
+  }
 }
 
 async function main() {

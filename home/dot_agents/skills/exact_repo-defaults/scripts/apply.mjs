@@ -35,7 +35,7 @@ function git(args, cwd) {
   return { ok: r.status === 0, out: (r.stdout || '').trim(), status: r.status };
 }
 
-function readText(p) { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } }
+function readText(p, root) { try { inside(root, p); return fs.readFileSync(p, 'utf8'); } catch { return null; } }
 // A file this script may write: its text, or null only when it does not exist. One that exists
 // but cannot be read (a directory, no read permission) throws Unreadable: the item is then
 // invalid and nothing is written, so an existing file is never replaced unseen.
@@ -161,6 +161,10 @@ function agentsBlock(root) {
     // Which copy is the real one is the repo's call: report it, change nothing.
     return { name: 'AGENTS.md block', status: 'invalid', detail: `${blocks.length} managed blocks (${found}): keep one by hand` };
   }
+  // A newer standard (from a newer skill) is never rewritten by this older one.
+  if (Number(blocks[0][1]) > BLOCK_VERSION) {
+    return { name: 'AGENTS.md block', status: 'invalid', detail: `${found} is newer than this skill's v${BLOCK_VERSION}: update repo-defaults (chezmoi apply) first` };
+  }
   if (blocks[0][0].replace(/\r\n/g, '\n') === BLOCK) return { name: 'AGENTS.md block', status: 'ok', detail: `agent-standard v${BLOCK_VERSION}` };
   return {
     name: 'AGENTS.md block', status: 'outdated', detail: `${found}, want v${BLOCK_VERSION} text`,
@@ -261,7 +265,7 @@ function isCanonical(s) {
 
 export function detect(root) {
   const has = (f) => fs.existsSync(path.join(root, f));
-  const pkg = json(readText(path.join(root, 'package.json')) ?? 'null').value || null;
+  const pkg = json(readText(path.join(root, 'package.json'), root) ?? 'null').value || null;
   let pm = null;
   let install = null;
   if (has('pnpm-lock.yaml')) { pm = 'pnpm'; install = 'pnpm install --frozen-lockfile'; }
@@ -314,7 +318,8 @@ function repoJson(root) {
   const tmpl = repoJsonFromDetection(d);
   const missing = Object.keys(tmpl).filter((k) => !(k in cur));
   const bad = [];
-  if (cur.version !== 1) bad.push('version is not 1');
+  // A missing version is added like any other missing key; an explicit other one is refused.
+  if (Object.hasOwn(cur, 'version') && cur.version !== 1) bad.push('version is not 1');
   if (cur.vault !== undefined && cur.vault !== 'agent-repos') bad.push('vault is not agent-repos');
   for (const k of ['setup', 'gate', 'affectedGate']) if (k in cur && !Array.isArray(cur[k])) bad.push(`${k} is not an array`);
   if (bad.length) return { name: '.agents/repo.json', status: 'invalid', detail: `${bad.join('; ')}: fix by hand` };
@@ -371,7 +376,7 @@ function todos(root) {
   let n = 0;
   const where = [];
   for (const f of files) {
-    const c = (readText(path.join(root, f)) || '').split(TODO).length - 1;
+    const c = (readText(path.join(root, f), root) || '').split(TODO).length - 1;
     if (c) { n += c; where.push(`${f} (${c})`); }
   }
   return n ? { name: 'TODO markers', status: 'warn', detail: `${n} to fill in: ${where.join(', ')}` } : null;
@@ -400,10 +405,10 @@ function envFiles(root) {
       try { st = fs.statSync(p); } catch { out.push({ file: f, keys: 0, tracked: tracked(f), role: envRole(f), dangling: true }); continue; }
     }
     if (!st.isFile()) continue;
-    const keys = (readText(p) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
+    const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
     out.push({ file: f, keys, tracked: tracked(f), role: envRole(f) });
   }
-  const op = readText(path.join(root, '.env.op'));
+  const op = readText(path.join(root, '.env.op'), root);
   const refs = op ? op.split(/\r?\n/).filter((l) => /=\s*["']?op:\/\//.test(l)) : [];
   const foreign = refs.filter((l) => !/op:\/\/agent-repos\//.test(l)).length;
   // `.env.op` must be committed. A broad rule (for example `.env*`) would make a new one
@@ -418,9 +423,9 @@ function gatingWorkflows(root) {
   if (!fs.existsSync(dir)) return [];
   const out = [];
   for (const f of fs.readdirSync(dir).filter((x) => /\.ya?ml$/.test(x)).sort()) {
-    const text = readText(path.join(dir, f)) || '';
+    const text = readText(path.join(dir, f), root) || '';
     // The `on:` block runs to the next top-level key (or the end of the file).
-    const on = text.match(/^(on|"on"|'on'):[^\n]*\n?(?:[ \t#][^\n]*\n?|\n)*/m);
+    const on = text.match(/^(on|"on"|'on'):[^\n]*\n?(?:[ \t#][^\n]*\n?|\r?\n)*/m);
     const section = on ? on[0] : text;
     const triggers = ['pull_request_target', 'pull_request', 'merge_group'].filter((t) => new RegExp(`\\b${t}\\b`).test(section));
     if (triggers.length) out.push({ file: `.github/workflows/${f}`, triggers });
