@@ -12,7 +12,7 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  appendLanding, isStale, lockMessage, orderQueue, parseLanding, parseLockMessage, rangeDiffChanges,
+  appendLanding, isStale, lockMessage, orderQueue, parseHolds, parseLanding, parseLockMessage, rangeDiffChanges,
   registeredRepos, scrub, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
 
@@ -610,9 +610,17 @@ describe('land-pr', () => {
     assert.equal(edits.length, 1);
     assert.deepEqual(edits[0].add, ['queue-hold']);
     assert.equal(edits[0].body, true);
+    // A second holder joins (its line shares the first one's events>N); the same holder again
+    // is refused.
     const again = tool(t, LAND_PR, 'hold', '1', '--holder', 'x', '--repo', 'o/r');
-    assert.equal(again.status, 2);
-    assert.match(again.out, /^REFUSED queue-hold already set/);
+    assert.equal(again.status, 0, again.err);
+    assert.equal(again.out, 'HELD x (joined)');
+    const n = prOf(t, 1).body.match(/Hold-By: thread-from-env \S+ events>(\d+)/)[1];
+    assert.match(prOf(t, 1).body, new RegExp(`^- Hold-By: x \\S+ events>${n}$`, 'm'));
+    assert.equal(state(t).calls.filter((c) => c.cmd === 'pr edit').at(-1).add.length, 0, 'a join adds no label');
+    const twice = tool(t, LAND_PR, 'hold', '1', '--holder', 'x', '--repo', 'o/r');
+    assert.equal(twice.status, 2);
+    assert.match(twice.out, /^REFUSED x already holds it/);
   });
 
   test('--release-hold leaves a queue-hold that was removed and set again after the caller\'s hold', () => {
@@ -654,8 +662,117 @@ describe('land-pr', () => {
     const head = queuePr(t, 1, { body: 'Hold-By: old-holder 2026-11-06T09:00:00Z\n', labels: ['queue-hold'] });
     const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', 'old-holder', '--repo', 'o/r');
     assert.equal(r.status, 2, r.err);
-    assert.match(r.out, /no baseline for your hold, so the label is left in place/);
+    assert.match(r.out, /your hold has no proven label origin, so queue-hold is left for the owner to remove by hand/);
     assert.ok(prOf(t, 1).labels.includes('queue-hold'));
+  });
+
+  // ---- holds through the command only (owner `--holder owner`), joining with shared provenance
+
+  // A PR queued, held by `first`, then changed (a new head to release with).
+  function heldBy(t, first) {
+    queuePr(t, 1);
+    const h = tool(t, LAND_PR, 'hold', '1', '--holder', first, '--repo', 'o/r');
+    assert.equal(h.status, 0, h.err);
+    sh(t.work, t.env, 'checkout', '--quiet', 'agent/LEE-1-change');
+    fs.writeFileSync(path.join(t.work, 'edit.txt'), 'edit\n');
+    sh(t.work, t.env, 'add', '-A');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'edit');
+    sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+    return sh(t.work, t.env, 'rev-parse', 'HEAD');
+  }
+  const joinHold = (t, holder) => tool(t, LAND_PR, 'hold', '1', '--holder', holder, '--repo', 'o/r');
+  const releaseBy = (t, holder, head) => tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', holder, '--repo', 'o/r');
+  const holders = (t) => parseHolds(prOf(t, 1).body).map((h) => h.holder).sort();
+
+  for (const [name, order] of [['agent first, owner last', [HOLDER, 'owner']], ['owner first, agent last', ['owner', HOLDER]]]) {
+    test(`owner joins an agent's hold (shared events>N): ${name}; only the last release removes the label`, () => {
+      const t = setup();
+      const head = heldBy(t, HOLDER);
+      const j = joinHold(t, 'owner');
+      assert.equal(j.status, 0, j.err);
+      assert.equal(j.out, 'HELD owner (joined)');
+      const lines = parseHolds(prOf(t, 1).body);
+      assert.equal(lines.find((h) => h.holder === 'owner').after, lines.find((h) => h.holder === HOLDER).after, 'shared N');
+      const first = releaseBy(t, order[0], head);
+      assert.equal(first.status, 2, first.err);
+      assert.match(first.out, /^REFUSED queue-hold is still set by 1 other holder/);
+      assert.ok(prOf(t, 1).labels.includes('queue-hold'));
+      assert.deepEqual(holders(t), [order[1]], 'only the releaser\'s line went');
+      const last = releaseBy(t, order[1], head);
+      assert.equal(last.status, 0, last.err || last.out);
+      assert.doesNotMatch(last.out, /REFUSED/);
+      assert.equal(prOf(t, 1).labels.includes('queue-hold'), false);
+      assert.deepEqual(holders(t), []);
+    });
+  }
+
+  test('owner joins a hand-set queue-hold: no proven origin, so the last release keeps the label for the owner', () => {
+    const t = setup();
+    const head = queuePr(t, 1, { labels: ['queue-hold'] });
+    const j = joinHold(t, 'owner');
+    assert.equal(j.status, 0, j.err);
+    assert.match(j.out, /^HELD owner \(joined\): the label's origin is not proven/);
+    assert.equal(parseHolds(prOf(t, 1).body)[0].after, null);
+    const r = releaseBy(t, 'owner', head);
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /your hold has no proven label origin, so queue-hold is left for the owner to remove by hand/);
+    assert.ok(prOf(t, 1).labels.includes('queue-hold'));
+    assert.deepEqual(holders(t), []);
+  });
+
+  test('owner joins after the label was removed and set again: not proven; no release removes it', () => {
+    const t = setup();
+    const head = heldBy(t, HOLDER);
+    const s = state(t);
+    s.events.push({ pr: 1, event: 'unlabeled', label: { name: 'queue-hold' }, created_at: new Date().toISOString() });
+    s.events.push({ pr: 1, event: 'labeled', label: { name: 'queue-hold' }, created_at: new Date().toISOString() });
+    saveState(t, s);
+    const j = joinHold(t, 'owner');
+    assert.equal(j.status, 0, j.err);
+    assert.match(j.out, /origin is not proven/);
+    const a = releaseBy(t, HOLDER, head);
+    assert.equal(a.status, 2);
+    assert.match(a.out, /still set by 1 other holder/);
+    const o = releaseBy(t, 'owner', head);
+    assert.equal(o.status, 2);
+    assert.match(o.out, /no proven label origin/);
+    assert.ok(prOf(t, 1).labels.includes('queue-hold'));
+  });
+
+  test('owner hold, agents A and B join: every release order removes only its own line; the last removes the label', { timeout: 600000 }, () => {
+    const perms = [['owner', 'a', 'b'], ['owner', 'b', 'a'], ['a', 'owner', 'b'], ['a', 'b', 'owner'], ['b', 'owner', 'a'], ['b', 'a', 'owner']];
+    for (const order of perms) {
+      const t = setup();
+      const head = heldBy(t, 'owner');
+      for (const h of ['a', 'b']) assert.equal(joinHold(t, h).out, `HELD ${h} (joined)`);
+      const left = ['a', 'b', 'owner'];
+      order.forEach((who, i) => {
+        const r = releaseBy(t, who, head);
+        left.splice(left.indexOf(who), 1);
+        if (i < 2) {
+          assert.equal(r.status, 2, `${order}: ${who}`);
+          assert.match(r.out, new RegExp(`still set by ${left.length} other holder`));
+          assert.ok(prOf(t, 1).labels.includes('queue-hold'), `${order}: label kept after ${who}`);
+        } else {
+          assert.equal(r.status, 0, `${order}: last ${who}: ${r.out} ${r.err}`);
+          assert.equal(prOf(t, 1).labels.includes('queue-hold'), false, `${order}: label removed by the last`);
+        }
+        assert.deepEqual(holders(t), [...left].sort(), `${order}: the other lines survive ${who}`);
+      });
+    }
+  });
+
+  test('a join while the landing lock is busy is refused with nothing written', () => {
+    const t = setup();
+    heldBy(t, HOLDER);
+    const before = prOf(t, 1).body;
+    setLock(t, 0);
+    const j = joinHold(t, 'owner');
+    assert.equal(j.status, 2);
+    assert.match(j.out, /^REFUSED the landing lock is busy/);
+    assert.equal(prOf(t, 1).body, before);
+    sh(t.bare, t.env, 'update-ref', '-d', 'refs/heads/agent-landing-lock');
+    assert.equal(joinHold(t, 'owner').status, 0);
   });
 
   test('--release-hold leaves queue-hold when its history cannot be read', () => {

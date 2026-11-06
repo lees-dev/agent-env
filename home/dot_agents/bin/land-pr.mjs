@@ -21,17 +21,24 @@
 // waiting unless it is the oldest waiting PR and a slot is free. A `queue-blocked` PR (bounced,
 // then fixed, re-gated and re-reviewed) goes back in line: queue-blocked -> queued (or
 // queue-waiting). None of these is ever merged now.
-// Editing a queued PR (pr-workflow section 4): `hold` adds `queue-hold` and a PR-body line
-// `Hold-By: <holder> <ISO time> events>N` in one edit (N: the PR's newest event id then). <holder> is --holder, else $T3CODE_THREAD_ID; with
-// neither it refuses (exit 2), because the same id must release the hold. `hold` refuses when the
-// PR is `landing` or `queue-hold` is already there, and makes its edit under the landing lock
-// (a busy lock refuses too, with no edit). After the push, gate and review, `--release-hold` (same holder) first runs
-// the read-only checks (only its own queue-hold excepted), then records the new gated sha and
-// removes `queue-hold` and this holder's line in one edit, then continues as above on a fresh
-// read. A hold whose line names another holder is refused. Only whoever set a hold clears it
-// (the owner may clear any by hand).
+// Holding a PR (pr-workflow section 4): every hold goes through `hold`: the owner with
+// `--holder owner`, full-stop with `--holder full-stop`, an agent with its thread id. Do not add
+// queue-hold by hand: agents and the owner share one gh identity, so a hand-set label cannot be
+// told from a hold's and a release may remove it (the owner may still remove any by hand).
+// `hold` adds queue-hold and a PR-body line `Hold-By: <holder> <ISO time> events>N` in one edit
+// (N: the PR's newest event id, so a release can find the label event this hold made). On a PR
+// already held it joins: only its line is added, sharing an existing holder's N while that
+// holder's label event is provably still the current one; otherwise its line has no N, and when
+// it is the last holder its release keeps the label for the owner to remove by hand. <holder>
+// is --holder, else $T3CODE_THREAD_ID; with neither it refuses (exit 2), because the same id
+// must release the hold. `hold` refuses when the PR is `landing` or the holder already holds it,
+// and makes its edit under the landing lock, on a fresh read (a busy lock refuses, with no
+// edit). After the push, gate and review, `--release-hold` (same holder) first runs the
+// read-only checks (only queue-hold excepted), then records the new gated sha and removes this
+// holder's line; queue-hold goes too only when no other holder is left and the label is
+// provably this hold's; then it continues as above on a fresh read.
 //
-//   HELD <holder>           hold: queue-hold and the Hold-By line added                exit 0
+//   HELD <holder>           hold: the Hold-By line added (and queue-hold, or joined)    exit 0
 //
 // Prints one line (or JSON with --json):
 //   MERGED <merge-sha>      merged now (or already merged)                         exit 0
@@ -122,7 +129,7 @@ function hold(args, n) {
     if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
     const labels = labelNames(p);
     if (labels.includes('landing')) return 'landing (the lander has it; wait for its merge or bounce)';
-    if (labels.includes('queue-hold')) return 'queue-hold already set (leave it, push nothing that lands, report it)';
+    if (parseHolds(p.body).some((h) => h.holder === holder)) return `${holder} already holds it (one Hold-By line per holder)`;
     return '';
   };
   // Read-only checks first.
@@ -148,15 +155,27 @@ function hold(args, n) {
       return refuse(`the PR now targets ${pr.baseRefName} from ${pr.headRefName} (it changed while taking the lock); run hold again`);
     }
     gh.ensureLabels();
-    // The baseline for telling this hold's label from earlier ones at release (no baseline when
-    // the events cannot be read: the release then leaves the label for the owner).
-    const baseline = eventBaseline(gh, n);
-    gh.prEdit(n, { body: addHold(pr.body, holder, undefined, baseline), add: ['queue-hold'] });
+    const joined = labelNames(pr).includes('queue-hold');
+    let baseline;
+    if (joined) {
+      // Join: the label stays as it is. This line shares an existing holder's N only while that
+      // holder's label event is provably the current label (no removal since); otherwise it gets
+      // no N, so its release never removes a label whose origin is unknown.
+      const proven = parseHolds(pr.body).find((h) => Number.isSafeInteger(h.after) && holdRelabelled(gh, n, h) === false);
+      baseline = proven ? proven.after : null;
+      gh.prEdit(n, { body: addHold(pr.body, holder, undefined, baseline) });
+    } else {
+      // The baseline for finding this hold's label event at release (none when the events
+      // cannot be read: the release then leaves the label for the owner).
+      baseline = eventBaseline(gh, n);
+      gh.prEdit(n, { body: addHold(pr.body, holder, undefined, baseline), add: ['queue-hold'] });
+    }
     const after = gh.prView(n);
     if (!parseHolds(after.body).some((h) => h.holder === holder) || !labelNames(after).includes('queue-hold')) {
       throw new LandError(`PR #${n}: the hold was not recorded (Hold-By line or queue-hold missing after the edit); check the PR by hand`);
     }
-    return out({ result: 'HELD', pr: n, holder, line: `HELD ${holder}` }, 0);
+    const note = baseline === null ? ': the label\'s origin is not proven, so when you are the last holder your release keeps queue-hold for the owner to remove by hand' : '';
+    return out({ result: 'HELD', pr: n, holder, joined, proven: baseline !== null, line: `HELD ${holder}${joined ? ' (joined)' : ''}${note}` }, 0);
   } finally {
     if (!lock.release()) process.stderr.write(`WARNING: ${retainedLockMessage(lock)}\n`);
   }
@@ -298,7 +317,10 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
       // recorded); queue-hold stays, so REFUSED: nothing lands or queues.
       gh.prEdit(n, { body });
       const reason = others.length ? `queue-hold is still set by ${others.length} other holder(s)`
-        : relabelled === null ? 'the queue-hold label history could not be read or has no baseline for your hold, so the label is left in place'
+        : relabelled === null
+          ? (Number.isSafeInteger(mine.after)
+            ? 'the queue-hold label history could not be read, so the label is left in place'
+            : 'your hold has no proven label origin, so queue-hold is left for the owner to remove by hand')
           : 'queue-hold was removed and set again after your hold, so it is not yours';
       return refuse(`${reason}; your hold line was removed and the gated sha recorded`);
     }

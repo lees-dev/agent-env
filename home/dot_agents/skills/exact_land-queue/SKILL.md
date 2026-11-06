@@ -34,7 +34,7 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 
 - **merged**: mark each PR's Linear ticket Done with the merge sha; clean up per `pr-workflow` section 7 (worktree teardown does most of it).
 - **bounced**, not parked: move the Linear ticket back to In Progress with the reason. Start an Opus fixer (`subagent-routing`): in this project `delegate_task` with `isolation: "worktree"`; for another repo `t3_thread_launch` with a worktree. Brief it with the PR, the bounce reason, and `pr-workflow` "Editing a queued PR":
-  1. `node "$HOME/.agents/bin/land-pr.mjs" hold <n> --holder <id>` with one fixed id for this fix (the fixer's `$T3CODE_THREAD_ID` is used when `--holder` is left out; with neither it refuses). It adds `queue-hold` and `Hold-By: <id> <ISO time> events>N` (N: the PR's newest event id, so the release can tell this hold's label from an earlier one) under the landing lock, and refuses if `queue-hold` is already set, the PR is `landing` or the lock is busy: then report, and retry only for a busy lock once the lander is done;
+  1. `node "$HOME/.agents/bin/land-pr.mjs" hold <n> --holder <id>` with one fixed id for this fix (the fixer's `$T3CODE_THREAD_ID` is used when `--holder` is left out; with neither it refuses). It adds `queue-hold` and `Hold-By: <id> <ISO time> events>N` (N: the PR's newest event id, so the release can find this hold's label event) under the landing lock. On a PR already held it joins (`HELD <id> (joined)`): only its line is added and the label stays until the last holder releases. It refuses if the PR is `landing`, this id already holds it, or the lock is busy: then report, and retry only for a busy lock once the lander is done;
   2. fix on the PR branch, push, run the affected gate;
   3. one cross-family reviewer checks the fix (for a conflict, the resolution), started the same way;
   4. `node "$HOME/.agents/bin/land-pr.mjs" <n> --sha <new gated sha> --release-hold --holder <the same id>` (checks first, then records the new gated sha and removes only its own hold, in one edit; the PR goes back in line).
@@ -55,11 +55,11 @@ Each repo report has `merged`, `bounced` (with `attempt` and `parked`), `aborted
 | `queued` | `land-pr`; the lander (admitting a `queue-waiting` PR, or after an abort) | the lander, `full-stop` |
 | `landing` | the lander | the lander |
 | `queue-blocked` | the lander | the lander, or `land-pr` re-landing it |
-| `queue-hold` | the owner, `full-stop`, or an agent editing a queued PR (`land-pr hold`) | only whoever set it (`--release-hold`); the owner may clear any |
+| `queue-hold` | only `land-pr hold <n> --holder <id>`: the owner `--holder owner`, `full-stop` `--holder full-stop`, an agent its thread id | the last holder's `--release-hold` (each release removes only its own line); the owner may remove it by hand |
 | `queue-next` | the owner | the owner (`full-stop` may remove it only while setting `queue-hold`) |
 | `queue-waiting` | `land-pr` | the lander (admission), `land-pr`, `full-stop` |
 
-Never remove a `queue-hold` you did not set, never add `queue-next`, never `gh pr merge` a PR with a queue label.
+Never add `queue-hold` by hand: agents and the owner share one gh identity, so a hand-set label cannot be told from a hold's, and a holder's release may remove it. Hold with `land-pr hold` instead. A release whose hold has no proven label origin keeps the label and says so: the owner removes it by hand. Never remove a `queue-hold` you did not set (the owner may remove any deliberately), never add `queue-next`, never `gh pr merge` a PR with a queue label.
 
 ## 4. Report
 
