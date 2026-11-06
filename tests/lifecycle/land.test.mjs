@@ -84,6 +84,7 @@ if (act) {
   if (act === 'pause') s.variables = { ...(s.variables || {}), AGENT_LANDING_PAUSED: '1' };
   if (act === 'dep') pr.body += '\\nDepends-on: #99\\n';
   if (act === 'retarget') pr.baseRefName = 'other';
+  if (act === 'draft') pr.isDraft = true;
   if (act === 'move') {
     const ref = 'refs/heads/' + pr.headRefName;
     const c = g('commit-tree', g('rev-parse', ref + '^{tree}'), '-p', g('rev-parse', ref), '-m', 'moved');
@@ -1192,16 +1193,21 @@ describe('land-queue', () => {
     assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 2);
   });
 
-  test('run: a replaced landing lock is never deleted, and losing it aborts the landing', () => {
+  test('run: a lost lock stops the gate at once; the replacement lock, the PR labels and the checkout are left alone', () => {
     const t = setup();
     const head = queuePr(t, 1);
     advanceMain(t, 'other.txt', 'x\n');
-    Object.assign(t.env, { LAND_TEST_GATE_ACTION: 'steal:1', LAND_TEST_GATE_SLEEP_MS: '1500', AGENT_LAND_TICK_MS: '200' });
+    // The gate would run 40 s; another lander takes the lock at its start; refresh every 200 ms.
+    Object.assign(t.env, { LAND_TEST_GATE_ACTION: 'steal:1', LAND_TEST_GATE_SLEEP_MS: '40000', AGENT_LAND_TICK_MS: '200' });
+    const started = Date.now();
     const rep = runQueue(t);
+    assert.ok(Date.now() - started < 30000, 'the gate was stopped, not waited for');
     assert.equal(rep.merged.length, 0);
     assert.match(rep.aborted[0].reason, /landing lock was lost/);
     assert.match(rep.alerts.join('\n'), /lock was lost while landing #1; stopped/);
-    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    // Not ours to relabel any more: the next lander's leftover recovery handles `landing`.
+    assert.deepEqual(prOf(t, 1).labels, ['landing']);
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
     assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
     assert.equal(lockSha(t), fs.readFileSync(`${t.env.LAND_TEST_GATE}.stolen`, 'utf8'), 'the other lander keeps its lock');
     assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
@@ -1438,6 +1444,31 @@ describe('land-queue', () => {
     assert.equal(JSON.parse(q.out).busy, undefined);
   });
 
+  test('run: an overdue sweep that cannot run stops the run before any merge, stays due, and is retried first', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs | tee x' });
+    const dir = path.join(t.home, '.agents', 'state');
+    fs.mkdirSync(dir, { recursive: true });
+    const counts = path.join(dir, 'land-queue.json');
+    fs.writeFileSync(counts, JSON.stringify({ 'o/r': { merges: 5, sinceSweep: 5 } }));
+    queuePr(t, 1);
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0, 'nothing lands while the overdue sweep cannot run');
+    assert.match(rep.alerts.join('\n'), /wide sweep could not run: .*it stays due, nothing more lands/);
+    assert.equal(rep.paused, false, 'no pause invented');
+    assert.equal(state(t).variables?.AGENT_LANDING_PAUSED, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].sinceSweep, 5, 'still due');
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.equal(lockExists(t), false);
+    // Still broken: still nothing lands. Fixed: the sweep runs first, then the PR lands.
+    assert.equal(runQueue(t).merged.length, 0);
+    const cfgFile = path.join(t.work, '.agents', 'repo.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(cfgFile, 'utf8')), wideSweep: 'node scripts/sweep.mjs' }));
+    const fixed = runQueue(t);
+    assert.equal(fixed.sweep.ran, true);
+    assert.equal(fixed.sweep.ok, true);
+    assert.deepEqual(fixed.merged.map((m) => m.pr), [1]);
+  });
+
   test('run: a red sweep whose pause cannot be set stays due, lands nothing more, and runs first next time', () => {
     const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
     queuePr(t, 1, { priority: 1 });
@@ -1462,6 +1493,49 @@ describe('land-queue', () => {
     assert.equal(next.merged.length, 0);
     assert.equal(prOf(t, 2).state, 'OPEN');
     assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
+  });
+
+  test('a bounce reason is scrubbed once, for the PR body, the comment and the report alike', () => {
+    const token = `ghp_${'a'.repeat(36)}`;
+    const t = setup({ affectedGate: [`node scripts/gate.mjs --token=${token}`] });
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    fs.writeFileSync(t.env.LAND_TEST_GATE, 'fail');
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    assert.match(prOf(t, 1).body, /Bounced: .*\[redacted\]/);
+    for (const [where, text] of [['body', prOf(t, 1).body], ['comment', state(t).comments.map((c) => c.body).join('\n')], ['report', r.out]]) {
+      assert.doesNotMatch(text, new RegExp(token), `${where} has no token`);
+    }
+  });
+
+  test('a draft PR stays queued but is not landed; one made a draft mid-gate is aborted, not bounced', () => {
+    const t = setup();
+    queuePr(t, 1);
+    let s = state(t); s.prs.find((p) => p.number === 1).isDraft = true; saveState(t, s);
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0);
+    assert.deepEqual(rep.drafts, [1]);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    s = state(t); s.prs.find((p) => p.number === 1).isDraft = false; saveState(t, s);
+    advanceMain(t, 'other.txt', 'x\n');
+    t.env.LAND_TEST_GATE_ACTION = 'draft:1';
+    const mid = runQueue(t);
+    assert.match(mid.aborted[0].reason, /made a draft before the push/);
+    assert.deepEqual(mid.bounced, []);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+    assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0);
+  });
+
+  test('merge-now: a merge count that cannot be recorded still reports MERGED, with a warning', () => {
+    const t = setup();
+    const head = makePr(t, 1);
+    fs.mkdirSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), { recursive: true });
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 0, r.err);
+    assert.match(r.out, /^MERGED /);
+    assert.match(r.err, /warning: the merge count was not updated .* the next wide sweep may run late/);
+    assert.equal(prOf(t, 1).state, 'MERGED');
   });
 
   test('run: waiting PRs are admitted only under the landing lock', () => {

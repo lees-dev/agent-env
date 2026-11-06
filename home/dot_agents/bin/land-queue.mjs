@@ -67,7 +67,9 @@ function changedPaths(dir, from, to) {
 
 // The reason is a summary built here (commands, exit codes, paths, SHAs); the output of a
 // command never goes into a PR comment, where a secret it printed would be public.
-function bounce(gh, pr, reason) {
+function bounce(gh, pr, rawReason) {
+  // One scrubbed reason for every destination: the PR body, the comment and the report.
+  const reason = scrub(rawReason);
   const at = new Date().toISOString();
   const attempt = parseLanding(pr.body).bounces.length + 1;
   const body = appendLanding(pr.body, `Bounced: ${at} ${reason}`);
@@ -107,6 +109,7 @@ function recheck(gh, pr, want, expectHead, lock) {
   if (p.headRefName !== want.headRef) return { requeue: `head branch changed to ${p.headRefName}` };
   if (p.headRefOid !== expectHead) return { requeue: `head changed to ${p.headRefOid.slice(0, 12)}` };
   if (labelNames(p).includes('queue-hold')) return { requeue: 'queue-hold appeared' };
+  if (p.isDraft) return { requeue: 'the PR was made a draft' };
   const deps = unmetDeps(gh, p);
   if (deps.length) return { requeue: `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged` };
   if (gh.isPaused()) return { requeue: 'repo paused', paused: true };
@@ -121,7 +124,9 @@ function abort(gh, pr, r, stage) {
     setLabels(gh, pr, { remove: ['landing'] });
     return { aborted: { pr: pr.number, reason: `${r.stop} before ${stage}` } };
   }
-  setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
+  // After a lost lock the PR is not ours to relabel (the new holder may be landing it): the
+  // next lander recovers a leftover `landing` under its own lock.
+  if (!r.lost) setLabels(gh, pr, { add: ['queued'], remove: ['landing'] });
   return { aborted: { pr: pr.number, reason: `${r.requeue} before ${stage}` }, paused: Boolean(r.paused), lost: Boolean(r.lost) };
 }
 
@@ -205,7 +210,9 @@ async function landOne(ctx, pr) {
     let g = await runCommands([...named('setup', cfg.setup), ...named('affectedGate', cfg.affectedGate)], dir, lock, cfg);
     let retried = false;
     if (!g.ok && !g.lost && !g.timedOut) { retried = true; g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg); }
-    if (g.lost) { resetTo(dir, baseRef); return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push'); }
+    // A lost lock: the checkout may be another lander's now (and processes this gate started may
+    // survive), so it is left as it is.
+    if (g.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push');
     // A gate that could not be stopped may still use the checkout: no reset; the lock is kept
     // (runCommands) and the run stops when it is not released.
     if (g.stuck) return { bounced: bounce(gh, pr, `affected gate failed: ${g.summary}, after the rebase`) };
@@ -215,7 +222,7 @@ async function landOne(ctx, pr) {
     }
     landSha = rebasedSha;
     const pre = recheck(gh, pr, want, head, lock);
-    if (pre) { resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
+    if (pre) { if (!pre.lost) resetTo(dir, baseRef); return abort(gh, pr, pre, 'the push'); }
     // Record the gated rebased head before pushing it, as pending: if recording `pass` after the
     // push fails, the next run recognises the pushed head as this lander's gated one.
     const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started)`);
@@ -287,6 +294,7 @@ function fillQueueState(gh, report) {
   report.queued = q.eligible.length + q.waiting.length;
   report.held = q.held;
   report.waiting = q.waiting;
+  report.drafts = q.drafts;
   report.queueWaiting = listWaiting(gh).map((p) => p.number);
   return q;
 }
@@ -344,7 +352,10 @@ function settleAfterError(gh, pr, res, report) {
   return null;
 }
 
-// A due sweep, caught on its own: a sweep that throws never touches a merged PR.
+// A due sweep, caught on its own: a sweep that throws never touches a merged PR. Returns true
+// when the run must stop before anything else lands: the lock was lost, the sweep could not
+// finish or record its pause, or it could not run at all (a checkout, config or API error). In
+// every one of those the sweep stays due and the next run tries it first.
 async function sweepAfter(ctx, report) {
   try {
     const s = await dueSweep(ctx);
@@ -355,8 +366,8 @@ async function sweepAfter(ctx, report) {
     return Boolean(s.lost || s.stop);
   } catch (e) {
     report.sweep = { ran: false, ok: false, error: firstLine(e?.message || e) };
-    report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}; it stays due and runs again next time`);
-    return false;
+    report.alerts.push(`wide sweep could not run: ${firstLine(e?.message || e)}; it stays due, nothing more lands in this run, and it runs again first next time`);
+    return true;
   }
 }
 
@@ -415,7 +426,7 @@ async function runRepo(t, opts) {
       }
       if (res?.merged) {
         report.merged.push(res.merged);
-        bumpMergeCount(gh.repo);
+        try { bumpMergeCount(gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
         if (await sweepAfter(ctx, report)) lost = true;
       }
     } catch (e) {

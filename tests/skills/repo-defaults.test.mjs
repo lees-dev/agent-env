@@ -675,6 +675,16 @@ describe('repo-defaults apply.mjs', () => {
     assert.equal(run(r, '--inspect', '--json').json.todo, null);
   });
 
+  test('an @AGENTS.md import inside a fenced code block is not an import (``` and ~~~)', () => {
+    for (const fence of ['```', '~~~~']) {
+      const text = `Example:\n\n${fence}md\n@AGENTS.md\n${fence}\n`;
+      const r = repo({ 'CLAUDE.md': text });
+      assert.equal(run(r, '--inspect', '--json').json.items.find((i) => i.name === 'CLAUDE.md').status, 'missing', fence);
+      assert.equal(run(r, '--apply').status, 0);
+      assert.equal(read(r, 'CLAUDE.md'), `@AGENTS.md\n\n${text}`, `${fence}: the real import is added, the example kept`);
+    }
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

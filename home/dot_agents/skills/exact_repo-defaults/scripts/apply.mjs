@@ -225,12 +225,29 @@ function claudeMd(root) {
       : { name: 'CLAUDE.md', status: 'invalid', detail: `link to ${raw}, not this repo's AGENTS.md: fix by hand` };
   }
   const text = readOwned(p, root) ?? '';
-  if (/^@AGENTS\.md\s*$/m.test(text)) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
+  if (/^@AGENTS\.md\s*$/m.test(outsideFences(text))) return { name: 'CLAUDE.md', status: 'ok', detail: 'imports @AGENTS.md' };
   const eol = eolOf(text);
   return {
     name: 'CLAUDE.md', status: 'missing', detail: 'does not import @AGENTS.md',
     fix: () => { writeIn(root, p, `@AGENTS.md${eol}${eol}${text}`); return 'prepended @AGENTS.md to CLAUDE.md'; },
   };
+}
+
+// The text outside fenced code blocks (``` or ~~~, closed by the same character, at least as
+// long): Claude Code does not expand an @import written inside one.
+function outsideFences(text) {
+  const out = [];
+  let fence = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    const m = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (fence) {
+      if (m && m[1][0] === fence[0] && m[1].length >= fence.length && !line.slice(m.index + m[0].length).trim()) fence = null;
+      continue;
+    }
+    if (m) { fence = m[1]; continue; }
+    out.push(line);
+  }
+  return out.join('\n');
 }
 
 const isSetup = (s) => /agent-worktree\.mjs"?\s+setup\b/.test(s?.command || '');

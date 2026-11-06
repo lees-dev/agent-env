@@ -299,6 +299,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
   const validate = (p) => {
     if (p.state === 'MERGED') return { done: mergedOut(p) };
     if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
+    if (p.isDraft) throw new LandError(`PR #${n} is a draft: mark it ready first`);
     if (p.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${p.headRefOid} while landing; re-run the gate`);
     if ((p.baseRefName || base) !== base || p.headRefName !== headRef) {
       throw new LandError(`PR #${n} now targets ${p.baseRefName} from ${p.headRefName}; re-run the gate and land-pr`);
@@ -323,7 +324,8 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
         if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
         const m = mergePinned(gh, cfg, { pr: n, sha, cwd: root });
         if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.message}`);
-        bumpMergeCount(repo);
+        // The merge stands even if its count cannot be recorded (the next sweep may run late).
+        try { bumpMergeCount(repo); } catch (e) { process.stderr.write(`warning: the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late\n`); }
         // A wide sweep that is due runs now, still under the lock.
         let sweep = null;
         try {

@@ -88,7 +88,9 @@ export function run(argv, { cwd, env = childEnv(), input } = {}) {
 // (see ownedTree) and its process group or tree is signalled, and this waits (bounded) for the
 // command to exit. A timeout always reports `stuck`: a process the command started and
 // orphaned earlier (detached, its parent gone) cannot be found, so nothing proves the checkout
-// is free, and the caller keeps the landing lock. { status, timedOut, stuck }.
+// is free, and the caller keeps the landing lock. onTick returning false (the lock refresh
+// failed) stops the command the same way, at once: { stopped: true }, also stuck.
+// { status, timedOut, stopped, stuck }.
 export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
     let prepared;
@@ -96,35 +98,44 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
     const [file, args, options] = prepared;
     const child = spawn(file, args, { ...options, stdio: 'ignore', detached: !isWindows });
     let timedOut = false;
+    let stopped = false;
     let stuck = false;
+    let ending = false;
     const timers = [];
-    if (tickMs > 0 && onTick) timers.push(setInterval(() => { try { onTick(); } catch { /* the caller's onTick records failures */ } }, tickMs));
-    if (timeoutMs > 0) {
-      timers.push(setTimeout(() => {
-        timedOut = true;
-        // Snapshot what the command provably owns while its tree is intact, then stop it.
-        const procs = listProcesses(env);
-        stopOwned(procs ? ownedTree(procs, child.pid, process.pid) : [], env);
-        killTree(child, 'SIGTERM');
-        timers.push(setTimeout(() => killTree(child, 'SIGKILL'), 3000));
-        // A command that does not exit is not waited on forever.
-        timers.push(setTimeout(() => done(124), stuckMs()));
-      }, timeoutMs));
+    // Stop the command: what it provably owns (one snapshot while its tree is intact), then the
+    // command itself; then wait (bounded) for it to exit.
+    const terminate = () => {
+      if (ending) return;
+      ending = true;
+      const procs = listProcesses(env);
+      stopOwned(procs ? ownedTree(procs, child.pid, process.pid) : [], env);
+      killTree(child, 'SIGTERM');
+      timers.push(setTimeout(() => killTree(child, 'SIGKILL'), 3000));
+      // A command that does not exit is not waited on forever.
+      timers.push(setTimeout(() => done(124), stuckMs()));
+    };
+    if (tickMs > 0 && onTick) {
+      timers.push(setInterval(() => {
+        let ok = true;
+        try { ok = onTick() !== false; } catch { ok = false; }
+        if (!ok && !ending) { stopped = true; terminate(); }
+      }, tickMs));
     }
+    if (timeoutMs > 0) timers.push(setTimeout(() => { if (!ending) { timedOut = true; terminate(); } }, timeoutMs));
     let finished = false;
     const done = (status) => {
       if (finished) return;
       finished = true;
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
-      if (timedOut) {
-        // On Unix, anything left in its group goes with it. Whatever was stopped, a timeout
-        // cannot prove that nothing the command started survives: it is stuck.
+      if (timedOut || stopped) {
+        // On Unix, anything left in its group goes with it. Whatever was stopped, nothing proves
+        // that every process the command started is gone: it is stuck.
         if (!isWindows) killTree(child, 'SIGKILL');
         stuck = true;
         // A command still running must not keep this process from exiting.
         child.unref();
       }
-      resolve({ status, timedOut, stuck });
+      resolve({ status, timedOut, stopped, stuck });
     };
     child.on('error', () => done(127));
     child.on('exit', (code, signal) => done(code ?? (signal ? 128 : 1)));
@@ -732,6 +743,8 @@ export function classifyQueue(gh, prs) {
   const held = [];
   const waiting = [];
   const eligible = [];
+  // A PR made a draft after it was queued stays queued but is not landed until it is ready.
+  const drafts = [];
   const depState = new Map();
   const depOpen = (n) => {
     if (!depState.has(n)) {
@@ -743,11 +756,12 @@ export function classifyQueue(gh, prs) {
   };
   for (const pr of orderQueue(prs)) {
     if (labelNames(pr).includes('queue-hold')) { held.push(pr.number); continue; }
+    if (pr.isDraft) { drafts.push(pr.number); continue; }
     const deps = parseLanding(pr.body).dependsOn.filter((d) => d !== pr.number && depOpen(d));
     if (deps.length) { waiting.push({ pr: pr.number, dependsOn: deps }); continue; }
     eligible.push(pr);
   }
-  return { eligible, held, waiting };
+  return { eligible, held, waiting, drafts };
 }
 
 // ---------------------------------------------------------------- merging
@@ -871,18 +885,21 @@ export const commandEnv = () => childEnv({ AGENT_LANDER: '1' });
 // failure that leaves here (name, command, exit status or timeout), never the command's output.
 export async function runCommands(entries, dir, lock, cfg) {
   let lost = false;
-  const onTick = () => { if (lock && !lock.refresh()) lost = true; };
+  // A failed refresh means another lander may own the lock: the command is stopped at once.
+  const onTick = () => { if (lock && !lock.refresh()) { lost = true; return false; } return true; };
   const limit = commandTimeoutMs(cfg);
   for (const { name, cmd } of entries) {
     const r = await runAsync(splitArgv(cmd), { cwd: dir, env: commandEnv(), tickMs: lock ? tickMs(cfg.lockTtlMin) : 0, onTick, timeoutMs: limit });
     const what = `${name} \`${cmd}\``;
+    // The lock is someone else's now: nothing is kept or released for it, and since processes
+    // this command started may survive, the checkout must not be reused (stuck).
+    if (lost) return { ok: false, lost: true, stuck: Boolean(r.stuck), name, cmd, status: r.status, summary: `${what}: the landing lock was lost, so it was stopped` };
     if (r.stuck) {
       // Something it started may still run in the checkout: the lock must outlive it.
       const summary = `${what} timed out after ${Math.round(limit / 60000) || '<1'} min; its known processes were stopped, but one it started may still run, so the landing lock is kept`;
       if (lock) lock.keep(summary);
       return { ok: false, timedOut: true, stuck: true, name, cmd, status: r.status, summary };
     }
-    if (lost) return { ok: false, lost: true, name, cmd, status: r.status, summary: `${what}: the landing lock was lost` };
     if (r.status !== 0) return { ok: false, name, cmd, status: r.status, summary: `${what} exit ${r.status}` };
   }
   return { ok: true };
@@ -929,11 +946,13 @@ export async function runSweep({ cfg, mainRoot, lock }) {
   fetchBranch(dir, cfg.base);
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
   const r = await runCommands([...named('setup', cfg.setup), ...sweepCommands(cfg)], dir, lock, cfg);
-  // A command that could not be stopped may still use the checkout: leave it as it is.
-  if (r.stuck) return r;
+  // A command that could not be stopped may still use the checkout, and after a lost lock the
+  // checkout may be another lander's: leave it as it is.
+  if (r.stuck || r.lost) return r;
+  // A sweep can finish before any refresh noticed another lander: ownership is checked before
+  // the checkout is touched again.
+  if (lock && !lock.stillHeld()) return { ...r, ok: false, lost: true, summary: 'the landing lock was lost' };
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
-  // A sweep can finish before any refresh noticed another lander: ownership is checked last.
-  if (!r.lost && lock && !lock.stillHeld()) return { ...r, ok: false, lost: true, summary: 'the landing lock was lost' };
   return r;
 }
 
