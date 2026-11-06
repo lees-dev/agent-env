@@ -864,6 +864,47 @@ describe('repo-defaults apply.mjs', () => {
     assert.doesNotMatch(p.stdout + txt, /plainvalue/, 'no values');
   });
 
+  test('workflows: one that cannot be read is reported (JSON and text); readable ones still are', () => {
+    const r = repo({ '.github/workflows/pr.yml': 'on:\n  pull_request:\njobs: {}\n' });
+    fs.mkdirSync(path.join(r.work, '.github', 'workflows', 'gate.yml'));
+    const ev = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+    assert.deepEqual(JSON.parse(ev.stdout).gatingWorkflows, [
+      { file: '.github/workflows/gate.yml', triggers: [], unreadable: true },
+      { file: '.github/workflows/pr.yml', triggers: ['pull_request'] },
+    ]);
+    const txt = run(r, '--inspect').out;
+    assert.match(txt, /WARN {2}workflow \.github\/workflows\/gate\.yml could not be read/);
+    assert.match(txt, /INFO {2}PR-gating workflow \.github\/workflows\/pr\.yml \(pull_request\)/);
+  });
+
+  test('env report: nested .env.op files do not use the cap; a cut list says so (JSON and text)', () => {
+    const files = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`pkgs/p${String(i).padStart(3, '0')}/.env`, 'K=v\n']));
+    const ops = Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`a${i}/.env.op`, 'K=op://agent-repos/x/K\n']));
+    const env = (r) => JSON.parse(spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false }).stdout).env;
+    const full = env(repo({ ...ops, ...files(200) }));
+    assert.equal(full.files.filter((f) => f.file.startsWith('pkgs/')).length, 200, 'all 200 env files listed');
+    assert.equal(full.nestedIncomplete, null);
+    const r = repo({ ...ops, ...files(201) });
+    const cut = env(r);
+    assert.equal(cut.files.filter((f) => f.file.startsWith('pkgs/')).length, 200);
+    assert.deepEqual(cut.nestedIncomplete, { listed: 200, total: 201 });
+    assert.match(run(r, '--inspect').out, /WARN {2}tracked env files below the root: only 200 of 201 listed/);
+  });
+
+  test('.gitignore that is a symbolic link: invalid, never written through', (t) => {
+    const r = repo({ 'rules/ignore.txt': 'node_modules\n' });
+    try { fs.symlinkSync(path.join('rules', 'ignore.txt'), path.join(r.work, '.gitignore'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const item = run(r, '--inspect', '--json').json.items.find((i) => i.name === '.gitignore');
+    assert.equal(item.status, 'invalid');
+    assert.match(item.detail, /symbolic link, which Git does not read/);
+    for (let i = 0; i < 2; i++) assert.equal(run(r, '--apply').status, 1);
+    assert.equal(read(r, 'rules/ignore.txt'), 'node_modules\n', 'the link target is unchanged');
+    assert.ok(fs.lstatSync(path.join(r.work, '.gitignore')).isSymbolicLink());
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

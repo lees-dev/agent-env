@@ -163,10 +163,16 @@ export function ownedTree(procs, rootPid, selfPid) {
   return [...owned.values()];
 }
 
+// Test hook: simulate a kill that fails (nothing is signalled). Only in the test mode
+// (AGENT_ENV_NO_SECRETS=1 too): the switch alone in a real lander still stops what it owns.
+function testNoKill() {
+  return process.env.AGENT_ENV_NO_SECRETS === '1' && process.env.AGENT_LAND_TEST_NO_KILL === '1';
+}
+
 // Stop the given processes; each pid is re-checked (start time, command) before each signal,
 // so a reused pid is never touched.
 function stopOwned(list, env) {
-  if (!list || !list.length || process.env.AGENT_LAND_TEST_NO_KILL === '1') return;
+  if (!list || !list.length || testNoKill()) return;
   stopProcesses(list, env);
 }
 
@@ -177,7 +183,7 @@ function stopOwned(list, env) {
 function killTree(child, signal) {
   if (!child?.pid) return;
   // Test hook: simulate a process tree that cannot be stopped (nothing is signalled).
-  if (process.env.AGENT_LAND_TEST_NO_KILL === '1') return;
+  if (testNoKill()) return;
   if (isWindows) { try { child.kill(); } catch { /* already gone */ } return; }
   try { process.kill(-child.pid, signal); } catch { /* already gone */ }
 }

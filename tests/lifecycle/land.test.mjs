@@ -1073,6 +1073,22 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), true);
   });
 
+  // The no-kill test hook works only in the test mode: the switch alone (leaked into a real
+  // lander's environment) still stops the gate and its children at the timeout.
+  test('run: the no-kill switch without the test mode still stops a hung gate', { timeout: 180000 }, () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '3000', AGENT_LAND_TEST_NO_KILL: '1' });
+    delete t.env.AGENT_ENV_NO_SECRETS;
+    const rep = runQueue(t);
+    assert.match(rep.bounced[0].reason, /timed out after/);
+    const child = Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}.child`, 'utf8'));
+    let alive = true;
+    try { process.kill(child, 0); } catch { alive = false; }
+    assert.equal(alive, false, 'the gate\'s child process was stopped');
+  });
+
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {
     const t = setup();
     queuePr(t, 1);
@@ -1733,7 +1749,7 @@ describe('land-queue', () => {
     queuePr(t, 2, { priority: 2 });
     advanceMain(t, 'other.txt', 'x\n');
     // The kill is simulated as failing (nothing is signalled); the test stops its own gate after.
-    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '2000', AGENT_LAND_STUCK_MS: '1500', AGENT_LAND_TEST_NO_KILL: '1' });
+    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '2000', AGENT_LAND_STUCK_MS: '1500', AGENT_ENV_NO_SECRETS: '1', AGENT_LAND_TEST_NO_KILL: '1' });
     try {
       const rep = runQueue(t);
       assert.match(rep.bounced[0].reason, /timed out after .* the landing lock is kept/);

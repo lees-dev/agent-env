@@ -441,6 +441,11 @@ function ignoredByRepo(root, file) {
 
 function gitignore(root) {
   const p = path.join(root, '.gitignore');
+  // Git does not read a .gitignore that is a symbolic link: lines written through it would
+  // never take effect (and would be added again on every run). Fixed by hand.
+  let st = null;
+  try { st = fs.lstatSync(p); } catch { st = null; }
+  if (st?.isSymbolicLink()) return { name: '.gitignore', status: 'invalid', detail: 'a symbolic link, which Git does not read: replace it with a file by hand' };
   const missing = GITIGNORE_LINES.filter((l) => !ignoredByRepo(root, l));
   if (!missing.length) return { name: '.gitignore', status: 'ok', detail: GITIGNORE_LINES.join(', ') };
   const current = readOwned(p, root) ?? '';
@@ -485,6 +490,8 @@ function envRole(f) {
   return 'source';
 }
 
+const NESTED_ENV_CAP = 200;
+
 function envFiles(root) {
   const out = [];
   const tracked = (f) => git(['ls-files', '--error-unmatch', '--', f], root).ok;
@@ -505,10 +512,15 @@ function envFiles(root) {
   // Only what git tracks (no walk of the tree, untracked files or caches), read through the same
   // containment checks; key counts only, never values.
   const nested = git(['ls-files', '-z', '--', '*/.env', '*/.env.*'], root);
+  let nestedIncomplete = null;
   if (nested.ok) {
-    for (const f of nested.out.split('\0').filter(Boolean).slice(0, 200)) {
+    const names = nested.out.split('\0').filter(Boolean).filter((f) => {
       const base = f.split('/').pop();
-      if (!/^\.env(\..+)?$/.test(base) || base === '.env.op') continue;
+      return /^\.env(\..+)?$/.test(base) && base !== '.env.op';
+    });
+    if (names.length > NESTED_ENV_CAP) nestedIncomplete = { listed: NESTED_ENV_CAP, total: names.length };
+    for (const f of names.slice(0, NESTED_ENV_CAP)) {
+      const base = f.split('/').pop();
       const p = path.join(root, ...f.split('/'));
       let st;
       try { st = fs.lstatSync(p); } catch { out.push({ file: f, keys: 0, tracked: true, role: envRole(base), missing: true }); continue; }
@@ -526,7 +538,7 @@ function envFiles(root) {
   // `.env.op` must be committed. A broad rule (for example `.env*`) would make a new one
   // silently left out of `git add`; a tracked one is committed whatever the rules say.
   const envOpIgnored = !tracked('.env.op') && git(['check-ignore', '-q', '--no-index', '--', '.env.op'], root).ok;
-  return { envOp: op === null ? null : { refs: refs.length, foreignVaultRefs: foreign }, envOpIgnored, files: out };
+  return { envOp: op === null ? null : { refs: refs.length, foreignVaultRefs: foreign }, envOpIgnored, files: out, nestedIncomplete };
 }
 
 // Workflows that run on pull requests or the merge queue gate PRs; release/deploy ones do not.
@@ -539,7 +551,9 @@ function gatingWorkflows(root) {
   try { names = fs.readdirSync(dir); } catch (e) { return { error: `.github/workflows could not be listed (${e.code || e.message})` }; }
   const out = [];
   for (const f of names.filter((x) => /\.ya?ml$/.test(x)).sort()) {
-    const text = readText(path.join(dir, f), root) || '';
+    const text = readText(path.join(dir, f), root);
+    // One that cannot be read (a folder, no permission, a link out of the repo) might gate PRs.
+    if (text === null) { out.push({ file: `.github/workflows/${f}`, triggers: [], unreadable: true }); continue; }
     // The `on:` block runs to the next top-level key (or the end of the file).
     const on = text.match(/^(on|"on"|'on'):[^\n]*\n?(?:[ \t#][^\n]*\n?|\r?\n)*/m);
     const section = on ? on[0] : text;
@@ -672,8 +686,12 @@ function main() {
         else if (e.role === 'source') L.push(`INFO  ${e.file}: ${e.keys} keys${tracked}; migrate with agent-secret import`);
         else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);
       }
+      if (ev.env.nestedIncomplete) L.push(`WARN  tracked env files below the root: only ${ev.env.nestedIncomplete.listed} of ${ev.env.nestedIncomplete.total} listed; list the rest with git ls-files and check them for rotation`);
       if (ev.env.envOp?.foreignVaultRefs) L.push(`WARN  .env.op: ${ev.env.envOp.foreignVaultRefs} reference(s) outside op://agent-repos/`);
-      for (const w of result.gatingWorkflows) L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
+      for (const w of result.gatingWorkflows) {
+        if (w.unreadable) L.push(`WARN  workflow ${w.file} could not be read: check by hand whether it runs on pull_request or merge_group`);
+        else L.push(`INFO  PR-gating workflow ${w.file} (${w.triggers.join(', ')}): remove in a separate PR`);
+      }
       if (result.gatingWorkflowsError) L.push(`WARN  ${result.gatingWorkflowsError}: PR-gating workflows not checked`);
       for (const r of ev.rulesets.list || []) L.push(`INFO  ruleset ${r.name} (${r.enforcement}) has ${r.rules.join(', ')}: drop only those rules in the separate PR, keep its other rules`);
       for (const r of ev.rulesets.unreadable || []) L.push(`WARN  ruleset ${r.name}: its rules could not be read; check by hand for required status checks or a merge queue`);
