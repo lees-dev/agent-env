@@ -12,11 +12,14 @@ export const LABELS = {
   queued: { color: '1d76db', description: 'Gated; waiting for the lander (land-queue)' },
   landing: { color: '5319e7', description: 'The lander is landing this PR now' },
   'queue-blocked': { color: 'd93f0b', description: 'Bounced by the lander; see the latest comment' },
-  'queue-hold': { color: 'b60205', description: 'Never landed automatically (full stop or red sweep)' },
-  'queue-next': { color: 'fbca04', description: 'Land before the rest of the queue' },
+  'queue-hold': { color: 'b60205', description: 'Held by the owner or a full stop: never landed automatically' },
+  'queue-next': { color: 'fbca04', description: 'Owner only: land before the rest of the queue' },
+  'queue-waiting': { color: 'c5def5', description: 'Gated and ready, but the queue was full' },
 };
+// Repo-wide pause: a GitHub Actions repo variable, never a PR label.
+export const PAUSE_VAR = 'AGENT_LANDING_PAUSED';
 export const DEFAULT_PRIORITY = 3;
-export const MAX_QUEUED_HINT = 5;
+export const MAX_QUEUED = 5; // queued + landing PRs per repo
 export const BOUNCE_MARKER = '<!-- land-queue:bounce -->';
 
 export const DEFAULT_CONFIG = {
@@ -30,6 +33,7 @@ export const DEFAULT_CONFIG = {
   sweepEveryMerges: 5,
   wideSweep: null,
   lockTtlMin: 45,
+  maxQueued: MAX_QUEUED,
 };
 
 // ---------------------------------------------------------------- errors and output
@@ -297,6 +301,7 @@ export function loadRepoConfig(root) {
   if (!Array.isArray(cfg.affectedGate) || cfg.affectedGate.length === 0) cfg.affectedGate = cfg.gate;
   if (!['squash', 'merge', 'rebase'].includes(cfg.mergeMethod)) throw new LandError(`mergeMethod must be squash, merge or rebase`, 2);
   cfg.lockTtlMin = Number(cfg.lockTtlMin) > 0 ? Number(cfg.lockTtlMin) : DEFAULT_CONFIG.lockTtlMin;
+  cfg.maxQueued = Number(cfg.maxQueued) > 0 ? Number(cfg.maxQueued) : MAX_QUEUED;
   cfg.sweepEveryMerges = Number(cfg.sweepEveryMerges) > 0 ? Number(cfg.sweepEveryMerges) : DEFAULT_CONFIG.sweepEveryMerges;
   for (const k of ['setup', 'gate', 'affectedGate']) {
     if (cfg[k].some((c) => typeof c !== 'string' || /TODO\(repo-defaults\)/.test(c))) {
@@ -377,6 +382,26 @@ export class Gh {
       created++;
     }
     return created;
+  }
+
+  // AGENT_LANDING_PAUSED=1 on the repo pauses every merge (land-pr and the lander).
+  isPaused() {
+    const r = this.api('GET', `repos/${this.repo}/actions/variables/${PAUSE_VAR}`);
+    if (r.ok) return String(r.data?.value ?? '').trim() === '1';
+    if (r.status === 404) return false;
+    throw new LandError(`could not read the ${PAUSE_VAR} repo variable (HTTP ${r.status})`);
+  }
+
+  setPaused(on) {
+    const route = `repos/${this.repo}/actions/variables`;
+    if (!on) {
+      const r = this.api('DELETE', `${route}/${PAUSE_VAR}`);
+      if (!r.ok && r.status !== 404) throw new LandError(`could not clear ${PAUSE_VAR} (HTTP ${r.status})`);
+      return;
+    }
+    let r = this.api('POST', route, { fields: { name: PAUSE_VAR, value: '1' } });
+    if (!r.ok && (r.status === 409 || r.status === 422)) r = this.api('PATCH', `${route}/${PAUSE_VAR}`, { fields: { name: PAUSE_VAR, value: '1' } });
+    if (!r.ok) throw new LandError(`could not set ${PAUSE_VAR} (HTTP ${r.status})`);
   }
 }
 
@@ -589,10 +614,28 @@ export function orderQueue(prs) {
 }
 
 // Open PRs labelled queued or landing (landing = a lander run stopped mid-PR), each once.
+// These count toward the repo's capacity (maxQueued); queue-blocked, queue-hold and
+// queue-waiting do not.
 export function listQueue(gh) {
   const seen = new Map();
   for (const label of ['landing', 'queued']) for (const pr of gh.prList(label)) seen.set(pr.number, pr);
   return [...seen.values()];
+}
+
+// PRs waiting for capacity, oldest first (time queued, then number).
+export function listWaiting(gh) {
+  const t = (pr) => Date.parse(parseLanding(pr.body).queuedAt || pr.createdAt || '') || 0;
+  return gh.prList('queue-waiting')
+    .filter((pr) => !labelNames(pr).some((l) => l === 'queued' || l === 'landing'))
+    .sort((a, b) => t(a) - t(b) || a.number - b.number);
+}
+
+// Unmerged Depends-on PRs of `pr` (numbers).
+export function unmetDeps(gh, pr) {
+  return parseLanding(pr.body).dependsOn.filter((d) => {
+    if (d === pr.number) return false;
+    try { return gh.prView(d, 'number,state').state !== 'MERGED'; } catch { return true; }
+  });
 }
 
 // Split the queue into eligible PRs (in order), held PRs, and PRs waiting on a dependency.

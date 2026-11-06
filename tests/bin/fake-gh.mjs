@@ -68,6 +68,8 @@ function pr(sub, rest) {
     for (const l of remove) if (!(p.labels || []).includes(l)) die(`label ${l} is not on the PR`);
     p.labels = [...new Set([...(p.labels || []).filter((l) => !remove.includes(l)), ...add])];
     if (o['body-file'] === '-') p.body = readStdin();
+    // Test hook: queue-hold appears right after the lander records its rebase gate line.
+    if (s.holdAfterLanderGate === p.number && /\(lander rebase\)/.test(p.body || '')) p.labels.push('queue-hold');
     log(s, { cmd: 'pr edit', pr: p.number, add, remove, body: o['body-file'] === '-' });
     save(s);
     return;
@@ -120,6 +122,30 @@ function api(rest) {
   const o = opts(rest);
   const method = o.method || 'GET';
   const route = o._[0];
+  const v = route.match(/^repos\/[^/]+\/[^/]+\/actions\/variables(?:\/([A-Z0-9_]+))?$/);
+  if (v) {
+    const s = load();
+    s.variables = s.variables || {};
+    log(s, { cmd: 'api', method, route: `variables/${v[1] || ''}` });
+    if (method === 'GET') {
+      save(s);
+      if (!(v[1] in s.variables)) die('Not Found', 404);
+      process.stdout.write(JSON.stringify({ name: v[1], value: s.variables[v[1]] }));
+      return;
+    }
+    if (method === 'POST') {
+      if (o.f.name in s.variables) { save(s); die('Already exists', 409); }
+      s.variables[o.f.name] = o.f.value;
+    } else if (method === 'PATCH') {
+      if (!(v[1] in s.variables)) { save(s); die('Not Found', 404); }
+      s.variables[v[1]] = o.f.value;
+    } else if (method === 'DELETE') {
+      if (!(v[1] in s.variables)) { save(s); die('Not Found', 404); }
+      delete s.variables[v[1]];
+    }
+    save(s);
+    return;
+  }
   const m = route.match(/^repos\/[^/]+\/[^/]+\/git\/(.*)$/) || die(`fake gh: unsupported api ${route}`);
   const p = m[1];
   const s = load();

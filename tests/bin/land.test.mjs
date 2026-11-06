@@ -1,5 +1,5 @@
 // Tests for home/dot_agents/bin/land-pr.mjs, land-queue.mjs and lib/land.mjs.
-// Run: node --test tests/bin/
+// Run: node --test "tests/**/*.test.mjs"
 // Git is real (local bare "origin" plus a clone); gh is tests/bin/fake-gh.mjs on PATH, backed by
 // the same bare repo. Every temp path contains spaces, to cover Windows paths with spaces.
 import assert from 'node:assert/strict';
@@ -30,9 +30,28 @@ function sh(cwd, env, ...args) {
   return r.stdout.trim();
 }
 
+// The gate: counts its runs, fails when the control file says so or when it can see the
+// 1Password token, and can change the fake GitHub mid-landing (LAND_TEST_GATE_ACTION).
 const GATE = `import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 const f = process.env.LAND_TEST_GATE;
 if (f) fs.appendFileSync(f + '.runs', 'x');
+if (process.env.OP_SERVICE_ACCOUNT_TOKEN) { console.log('token leaked into the gate'); process.exit(1); }
+const [act, n] = (process.env.LAND_TEST_GATE_ACTION || '').split(':');
+if (act) {
+  const sf = process.env.FAKE_GH_STATE;
+  const s = JSON.parse(fs.readFileSync(sf, 'utf8'));
+  const pr = s.prs.find((p) => p.number === Number(n));
+  if (act === 'hold') pr.labels.push('queue-hold');
+  if (act === 'pause') s.variables = { ...(s.variables || {}), AGENT_LANDING_PAUSED: '1' };
+  if (act === 'move') {
+    const g = (...a) => spawnSync('git', ['-C', process.env.FAKE_GH_BARE, ...a], { encoding: 'utf8' }).stdout.trim();
+    const ref = 'refs/heads/' + pr.headRefName;
+    const c = g('commit-tree', g('rev-parse', ref + '^{tree}'), '-p', g('rev-parse', ref), '-m', 'moved');
+    g('update-ref', ref, c);
+  }
+  fs.writeFileSync(sf, JSON.stringify(s, null, 2));
+}
 process.exit(f && fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes('fail') ? 1 : 0);
 `;
 const SWEEP = `process.exit(process.env.LAND_TEST_SWEEP === 'fail' ? 1 : 0);\n`;
@@ -50,6 +69,8 @@ function setup(repoJson = {}) {
   const gitcfg = path.join(tmp, 'gitconfig');
   fs.writeFileSync(gitcfg, '');
   const env = { ...process.env };
+  for (const k of Object.keys(env)) if (k.toUpperCase().startsWith('OP_')) delete env[k];
+  env.OP_SERVICE_ACCOUNT_TOKEN = 'dummy-test-value';
   const pk = pathKey(env);
   env[pk] = `${fakebin}${path.delimiter}${env[pk] || ''}`;
   Object.assign(env, {
@@ -162,6 +183,7 @@ describe('lib/land.mjs', () => {
     assert.equal(parseLanding(c).bounces.length, 1, 're-queue keeps the bounce history');
     assert.equal(parseLanding('Linear-Priority: 0').priority, 3, 'no priority means the default');
     assert.equal(parseLanding('').priority, 3);
+    assert.equal(parseLanding('- Linear-Priority: 4').priority, 4);
   });
 
   test('orderQueue: landing, queue-next, priority, time, number', () => {
@@ -173,8 +195,9 @@ describe('lib/land.mjs', () => {
       pr(4, ['queued'], 2, '2026-11-06T02:00:00Z'),
       pr(5, ['landing'], 4, '2026-11-06T09:00:00Z'),
       pr(6, ['queued'], 2, '2026-11-06T02:00:00Z'),
+      pr(7, ['queued'], 0, '2026-11-06T00:30:00Z'),
     ]).map((p) => p.number);
-    assert.deepEqual(out, [5, 3, 4, 6, 2, 1]);
+    assert.deepEqual(out, [5, 3, 4, 6, 2, 7, 1], '0 counts as 3 (Medium), after High and before Low');
   });
 
   test('lock message round trip and staleness', () => {
@@ -240,7 +263,7 @@ describe('land-pr', () => {
     assert.equal(p.state, 'OPEN');
     assert.deepEqual(p.labels, ['queued']);
     assert.match(p.body, new RegExp(`## Landing\\n\\n- Gate: pass @ ${head}\\n- Queued: `));
-    assert.deepEqual(state(t).labels.sort(), ['landing', 'queue-blocked', 'queue-hold', 'queue-next', 'queued']);
+    assert.deepEqual(state(t).labels.sort(), ['landing', 'queue-blocked', 'queue-hold', 'queue-next', 'queue-waiting', 'queued']);
     assert.equal(lockExists(t), true, 'someone else\'s lock is left alone');
   });
 
@@ -268,14 +291,111 @@ describe('land-pr', () => {
     assert.deepEqual(prOf(t, 1).labels, []);
   });
 
-  test('queue-hold (full stop): HELD, never merged or queued', () => {
+  for (const [name, prep, re] of [
+    ['queue-hold', (t) => makePr(t, 1, { labels: ['queue-hold'] }), /^REFUSED queue-hold/],
+    ['landing', (t) => makePr(t, 1, { labels: ['landing'] }), /^REFUSED landing/],
+    ['unmerged Depends-on', (t) => { makePr(t, 2); return makePr(t, 1, { body: 'Depends-on: #2' }); }, /^REFUSED Depends-on #2 not merged/],
+    ['paused repo', (t) => { const s = state(t); s.variables = { AGENT_LANDING_PAUSED: '1' }; saveState(t, s); return makePr(t, 1); }, /^REFUSED repo paused/],
+  ]) {
+    test(`refuses (exit 2, no merge, no label change): ${name}`, () => {
+      const t = setup();
+      const head = prep(t);
+      const labels = [...prOf(t, 1).labels];
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+      assert.equal(r.status, 2, r.err);
+      assert.match(r.out, re);
+      assert.equal(prOf(t, 1).state, 'OPEN');
+      assert.deepEqual(prOf(t, 1).labels, labels);
+      assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge' || c.cmd === 'pr edit'), false);
+      assert.equal(lockExists(t), false);
+    });
+  }
+
+  test('Depends-on a merged PR is fine', () => {
     const t = setup();
-    const head = makePr(t, 1, { labels: ['queue-hold'] });
-    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    const h2 = makePr(t, 2);
+    assert.equal(tool(t, LAND_PR, '2', '--sha', h2, '--repo', 'o/r').status, 0);
+    const h1 = makePr(t, 1, { body: 'Depends-on: #2' });
+    const r = tool(t, LAND_PR, '1', '--sha', h1, '--repo', 'o/r');
     assert.equal(r.status, 0, r.err);
-    assert.equal(r.out, 'HELD');
-    assert.equal(prOf(t, 1).state, 'OPEN');
-    assert.deepEqual(prOf(t, 1).labels, ['queue-hold']);
+    assert.match(r.out, /^MERGED /);
+  });
+
+  test('a PR already queued only gets its gated sha refreshed, never merged now', () => {
+    const t = setup();
+    queuePr(t, 1);
+    fs.writeFileSync(path.join(t.work, 'more.txt'), 'more\n');
+    sh(t.work, t.env, 'add', '-A');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'more');
+    sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+    const head = sh(t.work, t.env, 'rev-parse', 'HEAD');
+    const queuedAt = parseLanding(prOf(t, 1).body).queuedAt;
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const j = JSON.parse(r.out);
+    assert.equal(j.result, 'QUEUED');
+    assert.equal(j.refreshed, true);
+    const l = parseLanding(prOf(t, 1).body);
+    assert.equal(l.gatedSha, head);
+    assert.equal(l.gates.length, 1);
+    assert.equal(l.queuedAt, queuedAt, 'keeps its place in the queue');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+    assert.equal(lockExists(t), false, 'no lock taken');
+  });
+
+  for (const full of [false, true]) {
+    test(`a fixed queue-blocked PR goes back in line, never merged now (${full ? 'queue full' : 'room'})`, () => {
+      const t = setup({ maxQueued: full ? 1 : 5 });
+      if (full) queuePr(t, 2);
+      queuePr(t, 1, { queuedAt: '2026-11-06T00:00:00Z' });
+      let s = state(t);
+      const p1 = s.prs.find((p) => p.number === 1);
+      p1.labels = ['queue-blocked'];
+      p1.body = appendLanding(p1.body, 'Bounced: 2026-11-06T01:00:00Z conflict');
+      saveState(t, s);
+      sh(t.work, t.env, 'checkout', '--quiet', 'agent/LEE-1-change');
+      fs.writeFileSync(path.join(t.work, 'fix.txt'), 'fix\n');
+      sh(t.work, t.env, 'add', '-A');
+      sh(t.work, t.env, 'commit', '--quiet', '-m', 'fix');
+      sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
+      const head = sh(t.work, t.env, 'rev-parse', 'HEAD');
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+      assert.equal(r.status, full ? 3 : 0, r.err);
+      const j = JSON.parse(r.out);
+      assert.equal(j.result, full ? 'QUEUE-FULL' : 'QUEUED');
+      assert.equal(j.requeue, true);
+      assert.deepEqual(prOf(t, 1).labels, [full ? 'queue-waiting' : 'queued']);
+      const l = parseLanding(prOf(t, 1).body);
+      assert.equal(l.gatedSha, head);
+      assert.equal(l.bounces.length, 1, 'bounce history kept');
+      s = state(t);
+      assert.equal(s.calls.some((c) => c.cmd === 'pr merge'), false);
+      assert.equal(lockExists(t), false);
+    });
+  }
+
+  test('a queue-blocked PR that also has queue-hold is refused', () => {
+    const t = setup();
+    const head = makePr(t, 1, { labels: ['queue-blocked', 'queue-hold'] });
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.out, /^REFUSED queue-hold/);
+    assert.deepEqual(prOf(t, 1).labels, ['queue-blocked', 'queue-hold']);
+  });
+
+  test('capacity: queued + landing at maxQueued -> queue-waiting, QUEUE-FULL, exit 3', () => {
+    const t = setup({ maxQueued: 2 });
+    queuePr(t, 1);
+    queuePr(t, 2, { labels: ['landing'] });
+    queuePr(t, 3);
+    const s = state(t); s.prs.find((p) => p.number === 3).labels = ['queue-blocked']; saveState(t, s);
+    const head = makePr(t, 4);
+    advanceMain(t, 'other.txt', 'x\n');
+    const r = tool(t, LAND_PR, '4', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 3, r.err);
+    assert.equal(r.out, 'QUEUE-FULL 3');
+    assert.deepEqual(prOf(t, 4).labels, ['queue-waiting']);
+    assert.equal(parseLanding(prOf(t, 4).body).gatedSha, head);
   });
 
   test('dry run makes no changes', () => {
@@ -283,7 +403,7 @@ describe('land-pr', () => {
     const head = makePr(t, 1);
     const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--dry-run');
     assert.equal(r.out, 'WOULD-MERGE');
-    assert.equal(state(t).calls.length, 0);
+    assert.deepEqual(state(t).calls.filter((c) => c.cmd !== 'api' || c.method !== 'GET'), [], 'reads only');
   });
 });
 
@@ -417,7 +537,7 @@ describe('land-queue', () => {
     assert.equal(prOf(t, 1).state, 'OPEN');
   });
 
-  test('run: a red wide sweep holds the rest of the queue', () => {
+  test('run: a red wide sweep pauses the repo (a repo variable, not a label); unpause needs green', () => {
     const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
     queuePr(t, 1, { priority: 1 });
     queuePr(t, 2, { priority: 2 });
@@ -425,9 +545,115 @@ describe('land-queue', () => {
     const rep = runQueue(t);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
     assert.equal(rep.sweep.ok, false);
-    assert.match(rep.alerts[0], /wide sweep on main failed/);
-    assert.deepEqual(rep.held, [2]);
-    assert.ok(prOf(t, 2).labels.includes('queue-hold'));
+    assert.equal(rep.paused, true);
+    assert.match(rep.alerts[0], /wide sweep on main failed.*AGENT_LANDING_PAUSED/);
+    assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
+    assert.deepEqual(prOf(t, 2).labels, ['queued'], 'no queue-hold label');
+    const again = runQueue(t);
+    assert.equal(again.paused, true);
+    assert.equal(again.merged.length, 0);
+    const still = tool(t, LAND_QUEUE, 'unpause', '--repo', 'o/r', '--json');
+    assert.equal(still.status, 1);
+    assert.equal(JSON.parse(still.out).paused, true);
+    t.env.LAND_TEST_SWEEP = 'pass';
+    const ok = tool(t, LAND_QUEUE, 'unpause', '--repo', 'o/r', '--json');
+    assert.equal(ok.status, 0, ok.err);
+    assert.equal(JSON.parse(ok.out).paused, false);
+    assert.equal('AGENT_LANDING_PAUSED' in state(t).variables, false);
+    assert.deepEqual(runQueue(t).merged.map((m) => m.pr), [2]);
+  });
+
+  test('run: admits queue-waiting PRs, oldest first, as capacity frees', () => {
+    const t = setup({ maxQueued: 1 });
+    queuePr(t, 1);
+    for (const n of [2, 3]) {
+      queuePr(t, n, { queuedAt: `2026-11-06T0${5 - n}:00:00Z` });
+      const s = state(t); s.prs.find((p) => p.number === n).labels = ['queue-waiting']; saveState(t, s);
+    }
+    const rep = runQueue(t);
+    assert.deepEqual(rep.admitted, [3, 2]);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1, 3, 2]);
+    assert.deepEqual(rep.queueWaiting, []);
+  });
+
+  test('run: a waiting PR whose head changed is bounced at admission', () => {
+    const t = setup({ maxQueued: 1 });
+    queuePr(t, 2);
+    const s = state(t); s.prs.find((p) => p.number === 2).labels = ['queue-waiting']; saveState(t, s);
+    fs.writeFileSync(path.join(t.work, 'late.txt'), 'late\n');
+    sh(t.work, t.env, 'add', '-A');
+    sh(t.work, t.env, 'commit', '--quiet', '-m', 'late');
+    sh(t.work, t.env, 'push', '--quiet', 'origin', 'HEAD:refs/heads/agent/LEE-2-change');
+    const rep = runQueue(t);
+    assert.deepEqual(rep.admitted, []);
+    assert.match(rep.bounced[0].reason, /head changed while waiting/);
+    assert.deepEqual(prOf(t, 2).labels, ['queue-blocked']);
+  });
+
+  test('run: paused repo merges nothing', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t); s.variables = { AGENT_LANDING_PAUSED: '1' }; saveState(t, s);
+    const rep = runQueue(t);
+    assert.equal(rep.paused, true);
+    assert.equal(rep.merged.length, 0);
+    assert.deepEqual(prOf(t, 1).labels, ['queued']);
+  });
+
+  for (const [act, check] of [
+    ['hold', (t, rep, head) => {
+      assert.match(rep.aborted[0].reason, /queue-hold appeared before the push/);
+      assert.deepEqual(prOf(t, 1).labels.sort(), ['queue-hold', 'queued']);
+      assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
+    }],
+    ['pause', (t, rep, head) => {
+      assert.equal(rep.paused, true);
+      assert.match(rep.aborted[0].reason, /repo paused before the push/);
+      assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head, 'not pushed');
+    }],
+    ['move', (t, rep) => {
+      assert.match(rep.bounced[0].reason, /head changed while landing.*before the push/);
+      assert.deepEqual(prOf(t, 1).labels, ['queue-blocked']);
+    }],
+  ]) {
+    test(`run: re-check before the push aborts the landing (${act})`, () => {
+      const t = setup();
+      const head = queuePr(t, 1);
+      advanceMain(t, 'other.txt', 'x\n');
+      t.env.LAND_TEST_GATE_ACTION = `${act}:1`;
+      const rep = runQueue(t);
+      assert.equal(rep.merged.length, 0);
+      assert.equal(prOf(t, 1).state, 'OPEN');
+      assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+      assert.equal(lockExists(t), false);
+      check(t, rep, head);
+    });
+  }
+
+  test('run: re-check before the merge aborts when queue-hold appears after the push', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const s = state(t); s.holdAfterLanderGate = 1; saveState(t, s);
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0);
+    assert.match(rep.aborted[0].reason, /queue-hold appeared before the merge/);
+    assert.equal(prOf(t, 1).state, 'OPEN');
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+  });
+
+  test('run: a rebase that changes a patch (range-diff not all =) bounces for re-gate', () => {
+    const t = setup();
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`);
+    advanceMain(t, 'ten.txt', `${lines.join('\n')}\n`);
+    const pl = [...lines]; pl[5] = 'PR EDIT';
+    const head = queuePr(t, 1, { file: 'ten.txt', content: `${pl.join('\n')}\n` });
+    const ml = [...lines]; ml[2] = 'MAIN EDIT';
+    advanceMain(t, 'ten.txt', `${ml.join('\n')}\n`);
+    const rep = runQueue(t);
+    assert.equal(rep.merged.length, 0);
+    assert.match(rep.bounced[0].reason, /the rebase changed 1 of 1 commit/);
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/agent/LEE-1-change'), head);
   });
 
   test('run --dry-run reports the plan and changes nothing', () => {

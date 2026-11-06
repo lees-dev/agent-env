@@ -1,0 +1,17 @@
+{
+  "defaultThreadEnvMode": "worktree",
+  "scripts": [
+    {
+      "name": "Agent setup",
+      "command": "node \"$HOME/.agents/bin/agent-worktree.mjs\" setup",
+      "runOnWorktreeCreate": true,
+      "async": false
+    },
+    {
+      "name": "Agent teardown",
+      "command": "node \"$HOME/.agents/bin/agent-worktree.mjs\" teardown",
+      "runOnWorktreeCreate": false,
+      "runOnSettle": true
+    }
+  ]
+}
