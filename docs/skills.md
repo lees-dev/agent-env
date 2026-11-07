@@ -123,7 +123,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `principle-subtract-before-you-add` | identical in both | 1 | `91cf90d82d8aeca82c237753b2022b0ca836cdb20d1b200a5b80d5ce4aef185a` |
 | `principle-type-system-discipline` | identical in both | 1 | `6a3a9db88195d3863d0a4ead13b68d5f6d996d142cdd1d04c20f9ee0c6922c1d` |
 | `react-best-practices` | identical in both | 49 | `81afad38880a4b945e92056485b04a3a75082818bb62094bbdc5329c8d82b7c1` |
-| `repo-defaults` | written here (2026-11-06) | 7 | `b2e19ce3280c009961d3c1dd7a338f85505e42d483a05e25507f09ecd8f888b8` |
+| `repo-defaults` | written here (2026-11-06) | 7 | `5b929c816ef54829de0e26b3164b2c369d9e1026929c8cc05c7a886e7a60dea3` |
 | `sol-loop` | identical in both | 1 | `65db87ad81f27476d487a3c31d7e117f473e383edf8bdfb7360ae7119331631c` |
 | `subagent-routing` | `~/.claude/skills` (2026-11-05) | 2 | `5d300353b82bb5698bd3a0c647b562bdeaa03fd3abb218780e3faf64a0b1b382` |
 | `takeover` | identical in both | 1 | `87987a701b4669b52401bd0940a99a9c2dbcd250ccb3b0da434c391dd50de216` |

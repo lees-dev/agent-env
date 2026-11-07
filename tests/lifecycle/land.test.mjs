@@ -1176,6 +1176,23 @@ describe('land-pr', () => {
     assert.equal(lockExists(t), false);
   });
 
+  // The merge went through and reading it back failed once: a fresh read confirms it. MERGED,
+  // counted once, labels cleared, like any merge.
+  test('merge-now: a merge whose read-back fails is confirmed by a fresh read: MERGED, counted once', () => {
+    const t = setup();
+    const head = makePr(t, 1, { labels: ['queue-next'] });
+    const s = state(t); s.failViewAfterMerge = 1; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const j = JSON.parse(r.out);
+    assert.equal(j.result, 'MERGED');
+    assert.match(String(j.mergeSha), /^[0-9a-f]{40}$/);
+    assert.match(r.err, /#1 merged, but reading it back failed .*confirmed merged from a fresh read/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].merges, 1);
+    assert.deepEqual(prOf(t, 1).labels, [], 'queue labels cleared');
+    assert.equal(lockExists(t), false);
+  });
+
   test('merge-now clears queue labels after the merge', () => {
     const t = setup();
     const head = makePr(t, 1, { labels: ['queue-next'] });
@@ -2173,6 +2190,47 @@ describe('land-queue', () => {
     assert.deepEqual(prOf(t, 1).labels, []);
     const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
     assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].merges, 1);
+  });
+
+  // A merge recovered after an error (the merge went through; reading it back failed twice, so
+  // the run's own recovery read confirms it) gets the same decision as any merge: a sweep it
+  // made due runs before anything else lands; red pauses the repo and PR 2 waits.
+  test('run: a merge recovered after an error runs the due sweep first: red pauses, the next PR does not land', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1);
+    queuePr(t, 2);
+    t.env.LAND_TEST_SWEEP = 'fail';
+    const s = state(t); s.failViewAfterMerge = 1; s.failViewTimes = 2; saveState(t, s);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /#1 merged, but reading it back failed/);
+    assert.equal(rep.sweep?.ran, true);
+    assert.equal(rep.sweep?.ok, false);
+    assert.equal(rep.paused, true);
+    assert.equal(state(t).variables.AGENT_LANDING_PAUSED, '1');
+    assert.equal(prOf(t, 2).state, 'OPEN', 'PR 2 did not land on an unswept base');
+    assert.deepEqual(prOf(t, 2).labels, ['queued']);
+  });
+
+  // The same recovered merge with the lock taken during the recovery read: counted, then the run
+  // stops with no sweep, no label change and no other PR; the sweep stays due.
+  test('run: a merge recovered after an error with the lock lost: counted, then stop (no sweep, labels kept)', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1);
+    queuePr(t, 2);
+    // Reads of PR 1 that answer: the third is the run's recovery read; the lock moves after it.
+    const s = state(t); s.failViewAfterMerge = 1; s.failViewTimes = 2; s.mutateAfter = { kind: 'prView', n: 3, pr: 1, steal: true }; saveState(t, s);
+    const rep = runQueue(t);
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /#1 merged, but the landing lock was lost: stopped before any sweep or other landing/);
+    assert.equal(rep.sweep, null, 'no sweep');
+    assert.equal(prOf(t, 1).state, 'MERGED');
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched after the loss');
+    assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the next PR was not started');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'counted once; the sweep stays due');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
   });
 
   // SHAs in the Landing section count whatever their case: GitHub and git print lower case.

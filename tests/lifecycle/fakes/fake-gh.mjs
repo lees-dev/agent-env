@@ -56,8 +56,14 @@ function pr(sub, rest) {
   const find = (n) => s.prs.find((p) => p.number === Number(n)) || die(`no pull requests found for ${n}`);
   if (sub === 'view') {
     const p = find(o._[0]);
-    // Test hook: the first read of PR n after it merged fails (the merge itself went through).
-    if (s.failViewAfterMerge === p.number && p.state === 'MERGED') { delete s.failViewAfterMerge; save(s); die('HTTP 502: Bad Gateway'); }
+    // Test hook: the first read (or the first failViewTimes reads) of PR n after it merged fails
+    // (the merge itself went through).
+    if (s.failViewAfterMerge === p.number && p.state === 'MERGED') {
+      s.failViewTimes = (s.failViewTimes || 1) - 1;
+      if (s.failViewTimes <= 0) { delete s.failViewAfterMerge; delete s.failViewTimes; }
+      save(s);
+      die('HTTP 502: Bad Gateway');
+    }
     // Test hook: GitHub lags behind a push. Once the PR body records a lander rebase, the next
     // staleHead.n reads of PR staleHead.pr still show staleHead.sha (the branch itself moved).
     const lag = s.staleHead;

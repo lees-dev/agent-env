@@ -313,7 +313,7 @@ async function landOne(ctx, pr, wantIn = null) {
   if (!m.ok && m.stuck) return { aborted: { pr: pr.number, reason: m.summary }, stop: true };
   if (!m.ok) return bounceOwned(ctx, pr, `merge failed (${m.summary})`);
   // Merged, but the lock was lost or the merge command timed out: counted, and the run stops.
-  return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased }, stop: Boolean(m.lost || m.stuck), lost: Boolean(m.lost), stuck: Boolean(m.stuck) };
+  return { merged: { pr: pr.number, sha: landSha, mergeSha: m.mergeSha, rebased }, stop: Boolean(m.lost || m.stuck), lost: Boolean(m.lost), stuck: Boolean(m.stuck), readBack: m.readBack };
 }
 
 // ---------------------------------------------------------------- capacity
@@ -411,11 +411,10 @@ function settleAfterError(gh, pr, res, report, lock) {
   let fresh;
   try { fresh = gh.prView(pr.number); } catch { return null; }
   if (fresh.state === 'MERGED') {
-    // A confirmed merge is counted either way; its labels are cleared only while the lock is ours.
+    // A confirmed merge; the caller counts it (countMerge). Its labels are cleared only while
+    // the lock is ours and no landing step may still run.
     const merged = { pr: pr.number, sha: fresh.headRefOid, mergeSha: fresh.mergeCommit?.oid || null, rebased: null };
-    if (owned()) clearQueueLabels(gh, fresh);
-    report.merged.push(merged);
-    try { bumpMergeCount(gh.repo); } catch { /* the merge stands; only the sweep count is off */ }
+    if (!lock?.keepReason && owned()) clearQueueLabels(gh, fresh);
     return { merged };
   }
   if (!owned()) return null;
@@ -424,6 +423,26 @@ function settleAfterError(gh, pr, res, report, lock) {
     else setLabels(gh, fresh, { add: ['queued'], remove: ['landing'] });
   } catch { /* the error itself is reported */ }
   return null;
+}
+
+// One decision for every confirmed merge, whether the merge path saw it or a fresh read after
+// an error did: it is counted; after a lost lock or a landing step that may still run, the run
+// stops (no sweep, reset or other PR); otherwise a sweep it made due runs before anything else
+// lands. A merge recovered after an error proves nothing about the lock, so ownership is checked
+// first. Returns true when the run must stop.
+async function countMerge(ctx, report, merged, { lost = false, stuck = false, recovered = false } = {}) {
+  report.merged.push(merged);
+  try { bumpMergeCount(ctx.gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
+  let why = lost ? 'the landing lock was lost' : stuck ? 'the merge command timed out (the landing lock is kept)' : '';
+  if (!why && recovered) {
+    if (ctx.lock?.keepReason) why = 'a landing step timed out (the landing lock is kept)';
+    else if (ctx.lock && !ctx.lock.stillHeld()) why = 'the landing lock was lost';
+  }
+  if (why) {
+    report.alerts.push(`#${merged.pr} merged, but ${why}: stopped before any sweep or other landing`);
+    return true;
+  }
+  return sweepAfter(ctx, report);
 }
 
 // A due sweep, caught on its own: a sweep that throws never touches a merged PR. Returns true
@@ -521,21 +540,18 @@ async function runRepoSteps(t, opts, report) {
         }
       }
       if (res?.merged) {
-        report.merged.push(res.merged);
-        try { bumpMergeCount(gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
-        if (res.stop) {
-          // No sweep, reset or other PR after a lost lock or a merge command that may still run.
-          lost = true;
-          report.alerts.push(`#${res.merged.pr} merged, but ${res.lost ? 'the landing lock was lost' : 'the merge command timed out (the landing lock is kept)'}: stopped before any sweep or other landing`);
-        } else if (await sweepAfter(ctx, report)) lost = true;
+        if (res.readBack) report.alerts.push(`#${res.merged.pr} merged, but reading it back failed (${res.readBack}); confirmed merged from a fresh read`);
+        // No sweep, reset or other PR after a lost lock or a merge command that may still run.
+        if (await countMerge(ctx, report, res.merged, { lost: res.lost, stuck: res.stuck })) lost = true;
       }
     } catch (e) {
-      // Settle the PR from a fresh read. A merge that went through is counted and the run goes
-      // on; anything else is reported as the error.
+      // Settle the PR from a fresh read. A merge that went through gets the same decision as
+      // any other (countMerge); anything else is reported as the error.
       const settled = settleAfterError(gh, pr, res, report, ctx.lock);
       if (!settled) throw e;
       res = settled;
       report.alerts.push(`#${pr.number} merged, but reading it back failed (${firstLine(e?.message || e)}); confirmed merged from a fresh read`);
+      if (await countMerge(ctx, report, settled.merged, { recovered: true })) lost = true;
     } finally {
       if (!releaseLock(ctx, report)) lost = true;
     }

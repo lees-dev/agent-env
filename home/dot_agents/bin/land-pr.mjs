@@ -397,6 +397,9 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
         if (!lock.stillHeld()) throw new LandError('the landing lock was lost before the merge; run land-pr again');
         const m = await mergePinned(gh, cfg, { pr: n, sha, cwd: root, lock });
         if (!m.ok) throw new LandError(`merge of #${n} failed: ${m.summary}`);
+        // A read-back that failed after the merge was settled by a fresh read (mergePinned): it is
+        // a merge like any other, counted once, with the same sweep and lock handling below.
+        if (m.readBack) process.stderr.write(`warning: #${n} merged, but reading it back failed (${m.readBack}); confirmed merged from a fresh read\n`);
         // The merge stands even if its count cannot be recorded (the next sweep may run late).
         try { bumpMergeCount(repo); } catch (e) { process.stderr.write(`warning: the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late\n`); }
         // A wide sweep that is due runs now, still under the lock: not after a lost lock or a

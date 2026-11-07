@@ -5,7 +5,7 @@ description: Bring a repo to the agent standard (managed AGENTS.md block, CLAUDE
 
 # Repo defaults
 
-The global rule `repo-defaults` (`~/.agents/docs/agents/repo-defaults.md`) says when to run this: after cloning or registering a project, or when a repo lacks the current block, before other work. Land the result as its own small PR.
+Run this after cloning or registering a project, and whenever a repo lacks the current managed block or `--check` fails, before other work. Land the result as its own small PR. Where the global repo-defaults rules are installed, they apply too.
 
 ## Steps
 

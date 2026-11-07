@@ -1016,8 +1016,21 @@ export function mergeArgv(cfg, { pr, sha, repo }) {
 export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
   const r = await runStep(mergeArgv(cfg, { pr, sha, repo: gh.repo }), { cwd, env: gh.env, lock, cfg, label: `the merge command for #${pr}` });
   let after;
-  if (r.status === 0 && !r.lost && !r.stuck) after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
-  else {
+  let readBack = null;
+  if (r.status === 0 && !r.lost && !r.stuck) {
+    try {
+      after = waitForPr(gh, pr, (p) => p.state === 'MERGED');
+    } catch (e) {
+      // The merge command succeeded and reading the PR back failed: one fresh read decides. A
+      // PR shown MERGED is a merge, handled exactly as below (readBack names the failure);
+      // anything else, or a failed read, is the error as it was, never a merge.
+      let p = null;
+      try { p = gh.prView(pr); } catch { p = null; }
+      if (p?.state !== 'MERGED') throw e;
+      after = p;
+      readBack = firstLine(e?.message || e);
+    }
+  } else {
     // A wrapper can merge and still fail, time out or lose the lock: a fresh read that shows
     // MERGED is a merge, counted. Anything else (or a failed read) is not; an unconfirmed or
     // pending merge is never treated as merged.
@@ -1029,7 +1042,7 @@ export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
     // Labels are cleared only while the lock is ours and nothing may still run (the next lander
     // clears a leftover).
     if (!r.lost && !r.stuck && (!lock || lock.stillHeld())) clearQueueLabels(gh, after);
-    return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost), stuck: Boolean(r.stuck) };
+    return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost), stuck: Boolean(r.stuck), readBack };
   }
   if (r.lost) return { ok: false, lost: true, summary: 'the landing lock was lost during the merge command' };
   if (r.stuck) return { ok: false, stuck: true, summary: `the merge command timed out (PR state ${after?.state || 'unknown'}); the landing lock is kept` };
