@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "repo": "<github repo name, lowercase>",
+  "base": "main",
+  "vault": "agent-repos",
+  "itemPrefix": "<repo>",
+  "env": { "template": ".env.op", "output": ".env.local" },
+  "ports": { "PORT": 3000 },
+  "setup": ["npm ci --no-audit --no-fund"],
+  "gate": ["npm run gate"],
+  "affectedGate": ["npm run gate"],
+  "mergeMethod": "squash",
+  "mergeCmd": null,
+  "ghWrapper": null,
+  "branchPattern": "^agent/([A-Z]+-\\d+)",
+  "remoteBranchDelete": "^(agent|revert)/",
+  "sweepEveryMerges": 5,
+  "wideSweep": null,
+  "lockTtlMin": 45
+}

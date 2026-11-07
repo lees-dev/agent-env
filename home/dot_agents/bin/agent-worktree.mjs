@@ -486,7 +486,9 @@ function dirtyCount(worktreePath, ignore = []) {
 export function assess({ prs, worktreePath, ignore = [], tip, dir }) {
   const pr = newest(prs.head);
   if (!pr) return { verdict: 'no-pr', pr: null, detail: 'no PR for this branch' };
-  const inQueue = prs.head.find((p) => labelNames(p).some((n) => QUEUE_LABELS.includes(n)));
+  // Queue labels count only on an open PR: one left on a merged or closed PR (a lander that
+  // crashed after the merge) is stale and does not keep the worktree.
+  const inQueue = prs.head.find((p) => p.state === 'OPEN' && labelNames(p).some((n) => QUEUE_LABELS.includes(n)));
   if (inQueue) {
     return { verdict: 'queued', pr: inQueue, detail: `PR #${inQueue.number} is in the land queue (${labelNames(inQueue).filter((n) => QUEUE_LABELS.includes(n)).join(', ')})` };
   }

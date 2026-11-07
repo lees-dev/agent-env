@@ -16,6 +16,7 @@
 .agents/skills/herdr
 .agents/skills/how
 .agents/skills/kun
+.agents/skills/land-queue
 .agents/skills/leaving-pr-comments
 .agents/skills/maintain-verification-skill
 .agents/skills/modernize
@@ -30,6 +31,7 @@
 .agents/skills/principle-subtract-before-you-add
 .agents/skills/principle-type-system-discipline
 .agents/skills/react-best-practices
+.agents/skills/repo-defaults
 .agents/skills/sol-loop
 .agents/skills/subagent-routing
 .agents/skills/takeover
@@ -47,6 +49,7 @@
 .claude/skills/herdr
 .claude/skills/how
 .claude/skills/kun
+.claude/skills/land-queue
 .claude/skills/leaving-pr-comments
 .claude/skills/maintain-verification-skill
 .claude/skills/modernize
@@ -61,6 +64,7 @@
 .claude/skills/principle-subtract-before-you-add
 .claude/skills/principle-type-system-discipline
 .claude/skills/react-best-practices
+.claude/skills/repo-defaults
 .claude/skills/sol-loop
 .claude/skills/subagent-routing
 .claude/skills/takeover

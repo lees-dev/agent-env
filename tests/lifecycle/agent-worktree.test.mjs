@@ -530,14 +530,25 @@ describe('teardown', () => {
     assert.match(r.stderr, /open PR #8 is based on this branch/);
   });
 
-  for (const [state, label] of [['CLOSED', 'queued'], ['CLOSED', 'landing'], ['CLOSED', 'queue-blocked'], ['CLOSED', 'queue-waiting'], ['OPEN', 'queued'], ['MERGED', 'queue-hold']]) {
-    test(`${state} PR labelled ${label}: keep, exit 1`, () => {
+  for (const label of ['queued', 'landing', 'queue-blocked', 'queue-waiting', 'queue-hold']) {
+    test(`OPEN PR labelled ${label}: keep, exit 1`, () => {
       const { s, repo } = fixture();
-      merged(s, repo, { state, labels: [{ name: label }] });
+      merged(s, repo, { state: 'OPEN', labels: [{ name: label }] });
       const r = engine(s, ['teardown'], repo.wt);
       assert.equal(r.status, 1, r.out);
       assert.match(r.stderr, new RegExp(`land queue \\(${label}\\)`));
       assert.equal(s.readState().docker.containers.length, 2);
+    });
+  }
+
+  // A queue label left on a merged or closed PR (a lander crash after the merge) is stale.
+  for (const [state, label] of [['MERGED', 'landing'], ['MERGED', 'queue-hold'], ['CLOSED', 'queued']]) {
+    test(`${state} PR with a stale ${label} label: teardown proceeds`, () => {
+      const { s, repo } = fixture();
+      merged(s, repo, { state, labels: [{ name: label }] });
+      const r = engine(s, ['teardown'], repo.wt);
+      assert.equal(r.status, 0, r.out);
+      assert.deepEqual(s.readState().docker.containers.map((c) => c.id), ['c2']);
     });
   }
 
@@ -828,7 +839,7 @@ describe('sweep, status, track, gate', () => {
   test('worktree gone but PR queued: kept', () => {
     const { s, repo } = fixture();
     assert.equal(engine(s, ['setup'], repo.wt).status, 0);
-    merged(s, repo, { state: 'CLOSED', labels: [{ name: 'queue-blocked' }] });
+    merged(s, repo, { state: 'OPEN', labels: [{ name: 'queue-blocked' }] });
     gitIn(s, repo.main, 'worktree', 'remove', '--force', repo.wt);
     const r = engine(s, ['sweep'], repo.main);
     assert.equal(r.status, 0, r.out);
@@ -935,7 +946,7 @@ describe('sweep, status, track, gate', () => {
       st.gh.prs = [
         pr({ headRefOid: repo.head }),
         pr({ number: 10, state: 'OPEN', headRefName: 'agent/LEE-4-open' }),
-        pr({ number: 11, state: 'CLOSED', headRefName: 'agent/LEE-5-queued', labels: [{ name: 'queued' }] }),
+        pr({ number: 11, state: 'OPEN', headRefName: 'agent/LEE-5-queued', labels: [{ name: 'queued' }] }),
       ];
     });
     const r = engine(s, ['sweep'], repo.main);

@@ -5,14 +5,14 @@ Two Node scripts deploy to `~/.agents/bin/` (source: `home/dot_agents/bin/`). Th
 - `agent-worktree.mjs` prepares each agent worktree and cleans it up after its PR merges or closes.
 - `agent-secret.mjs` stores credentials in 1Password and writes the references a repo's `.env.op` needs.
 
-T3 Code runs the engine through two project scripts (global `defaultProjectScripts`, or a repo's `t3.json`):
+T3 Code runs the engine through two project scripts (global `defaultProjectScripts`, or a repo's `t3.json`). T3 may run project scripts in sh, pwsh, powershell or cmd, and cmd does not expand `$HOME`, so the commands find the engine through Node's `os.homedir()` and work in all of them (the `repo-defaults` skill's `assets/t3.json`):
 
 ```sh
-node "$HOME/.agents/bin/agent-worktree.mjs" setup      # runOnWorktreeCreate, async false
-node "$HOME/.agents/bin/agent-worktree.mjs" teardown   # runOnSettle
+node -e "process.argv.splice(1,0,require('path').join(require('os').homedir(),'.agents','bin','agent-worktree.mjs'));import(require('url').pathToFileURL(process.argv[1]).href)" setup      # runOnWorktreeCreate, async false
+node -e "process.argv.splice(1,0,require('path').join(require('os').homedir(),'.agents','bin','agent-worktree.mjs'));import(require('url').pathToFileURL(process.argv[1]).href)" teardown   # runOnSettle
 ```
 
-On Windows, write the absolute path to the script instead of `$HOME`: T3 runs project scripts in pwsh, powershell or cmd.
+The engine still starts as its own entry point (`process.argv[1]` is its path). In a shell of your own, `node "$HOME/.agents/bin/agent-worktree.mjs" <command>` is the same.
 
 ## Repo config
 
@@ -25,12 +25,12 @@ A repo describes itself in `.agents/repo.json` (version 1). Every key is optiona
 | `base` | `origin/HEAD`, else `main` | Base branch |
 | `env.template`, `env.output` | `.env.op`, `.env.local` | 1Password references in, injected file out (must be git-ignored and untracked) |
 | `ports` | `{}` | `{"PORT": 3000}`: each name gets `base + hash % 900`, probed free, stable per worktree |
-| `setup`, `gate`, `affectedGate` | `[]` | Commands, split into argv without a shell. Use a script for pipes or `&&` |
+| `setup`, `gate`, `affectedGate` | `[]` | Commands, split into argv without a shell. Use a script for pipes or `&&`. A gate (and a sweep) must stop every process it starts before it exits; setup may start services the gate uses, and the gate stops them. The lander stops what a command started only when it times out or loses the lock. The lander's checkout (`<main checkout>-lander`) keeps git-ignored files (dependencies, caches, build output) from one PR to the next, as a worktree does: `setup` and the gate must rebuild every output the gate reads and never trust a stale ignored artifact |
 | `ghWrapper` | none | Command that replaces `gh` (for example an identity wrapper), split like `setup` |
 | `branchPattern` | `^agent/([A-Z]+-\d+)` | Group 1 is the ticket id |
 | `remoteBranchDelete` | `^(agent\|revert)/` | Merged branches matching this lose their remote head at teardown |
 
-Other keys (`vault`, `mergeMethod`, `mergeCmd`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`) belong to the landing tools.
+Other keys (`vault`, `mergeMethod`, `mergeCmd`, `sweepEveryMerges`, `wideSweep`, `lockTtlMin`, `commandTimeoutMin`) belong to the landing tools.
 
 ## Hooks
 
@@ -71,7 +71,7 @@ Teardown is idempotent. Exit 0 means T3 may remove the worktree; exit 1 means ke
 
 | State | Result |
 |---|---|
-| Any PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` | Keep, exit 1 |
+| An open PR of the branch labelled `queued`, `landing`, `queue-blocked`, `queue-waiting` or `queue-hold` (a label left on a merged or closed PR is stale and ignored) | Keep, exit 1 |
 | Uncommitted or untracked files (ignored files and an untracked env output are fine), whatever the PR state | Keep, exit 1 |
 | No PR, or an open PR | Nothing removed, exit 0 |
 | An open PR uses this branch as its base | Keep, exit 1 |
