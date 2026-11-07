@@ -1049,6 +1049,16 @@ describe('repo-defaults apply.mjs', () => {
       '.github/workflows/u.yml': 'on: {push: {},\npull_request: {}}\njobs: {}\n',
       // Never closed, then a top-level key: jobs and what is under it are not events.
       '.github/workflows/v.yml': 'on: [push,\njobs:\n  pull_request: {}\n',
+      // Quoted scalars as YAML reads them: \" does not end a "..." string (here before a brace),
+      // \\ is one backslash (so the next " ends it), and '' is a quote inside '...'.
+      '.github/workflows/w.yml': 'on: {push: {branches: ["feature/\\"}"]}, pull_request: {}}\njobs: {}\n',
+      '.github/workflows/x.yml': 'on: {push: {branches: ["a\\\\"]}, pull_request_target: {}}\njobs: {}\n',
+      '.github/workflows/y.yml': "on: {push: {branches: ['it''s}']}, merge_group: {}}\njobs: {}\n",
+      // An escaped quote in a nested value does not expose the value's text as an event.
+      '.github/workflows/z.yml': 'on: {push: {branches: ["x\\", pull_request: y"]}}\njobs: {}\n',
+      // `on:` with its scalar on the next line names one event; a bare word nested deeper does not.
+      '.github/workflows/za.yml': 'on:\n  pull_request\njobs: {}\n',
+      '.github/workflows/zb.yml': 'on:\n  push:\n    tags:\n      pull_request\njobs: {}\n',
     });
     const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
     assert.deepEqual(JSON.parse(p.stdout).gatingWorkflows, [
@@ -1064,6 +1074,10 @@ describe('repo-defaults apply.mjs', () => {
       { file: '.github/workflows/s.yml', triggers: ['pull_request'] },
       { file: '.github/workflows/t.yml', triggers: ['pull_request_target'] },
       { file: '.github/workflows/u.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/w.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/x.yml', triggers: ['pull_request_target'] },
+      { file: '.github/workflows/y.yml', triggers: ['merge_group'] },
+      { file: '.github/workflows/za.yml', triggers: ['pull_request'] },
     ]);
   });
 
@@ -1140,6 +1154,25 @@ describe('repo-defaults apply.mjs', () => {
     const rs = JSON.parse(p.stdout).rulesets;
     assert.match(rs.incomplete, /ran out of time; \d+ of 50 rulesets were read in full/);
     assert.ok(rs.list.length >= 1 && rs.list.length < 50, 'what it read is kept');
+  });
+
+  test('t3.json: an engine script that differs from the canonical one in any field (a manual re-run) is kept, renamed only on a name clash', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const rerun = { name: 'Re-run setup', command: want.scripts[0].command, runOnWorktreeCreate: false, async: false };
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'local', scripts: [rerun] }) });
+    assert.equal(run(r, '--apply').status, 0);
+    assert.deepEqual(JSON.parse(read(r, 't3.json')).scripts, [...want.scripts, rerun], 'kept as it is');
+    const manualCopy = { ...want.scripts[0], runOnWorktreeCreate: false };
+    const r2 = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'local', scripts: [manualCopy] }) });
+    assert.equal(run(r2, '--apply').status, 0);
+    assert.deepEqual(JSON.parse(read(r2, 't3.json')).scripts, [...want.scripts, { ...manualCopy, name: 'Agent setup (kept)' }]);
+  });
+
+  test('.env.op example: a credential is piped from what produces it, never typed into a command or a VALUE= assignment', () => {
+    const text = fs.readFileSync(path.join(SKILL, 'assets', 'env.op.example'), 'utf8');
+    assert.doesNotMatch(text, /VALUE=|"\$VALUE"/);
+    assert.match(text, /read -rs V; .*; unset V/);
+    assert.match(text, /request_secret/);
   });
 
   test('t3.json: a name used twice is drift by itself; apply renames the kept one, keeps everything else, then is idempotent', () => {

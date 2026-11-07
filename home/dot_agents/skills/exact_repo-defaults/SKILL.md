@@ -27,7 +27,7 @@ The global rule `repo-defaults` (`~/.agents/docs/agents/repo-defaults.md`) says 
    - creates `docs/agents/repo.md` from `assets/repo.md`.
 4. Fill in every `TODO(repo-defaults)` in `.agents/repo.json` and `docs/agents/repo.md` from the repo itself: the gate and affected-tests commands, sensitive paths, size limit, merge method and identity (`mergeCmd` / `ghWrapper`), release step, per-worktree resources, wide sweep. A repo without a single gate command gets one (for example a `gate` script that runs lint, typecheck, build and the affected tests) in this PR. Commands are argv strings without shell features; point at a script when you need them.
 5. Move repo text that contradicts the global rules on process (CI waits, merge queues, agent tooling, worktrees, cleanup, credentials, landing) out of `AGENTS.md`/`CLAUDE.md`, or reword it as a fact. Keep facts and stricter checks.
-6. Verify: `node "$HOME/.agents/skills/repo-defaults/scripts/apply.mjs" --check` exits 0. Run the repo's gate, then open and land the PR per `pr-workflow`.
+6. Verify: `node "$HOME/.agents/skills/repo-defaults/scripts/apply.mjs" --check` exits 0, and no `TODO(repo-defaults)` is left in `.agents/repo.json` or `docs/agents/repo.md` (`--check` only warns about them, so exit 0 alone does not prove step 4 is done). Run the repo's gate, then open and land the PR per `pr-workflow`.
 
 ## Left for separate PRs (from `--inspect`)
 

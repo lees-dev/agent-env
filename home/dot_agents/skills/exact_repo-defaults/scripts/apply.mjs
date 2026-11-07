@@ -358,9 +358,14 @@ function uniqueKeptNames(canonical, kept) {
 // field the canonical script lacks. One with extra repo fields is kept (and reported).
 const norm = (c) => String(c || '').trim().replace(/\s+/g, ' ');
 function isCanonical(s) {
-  // An exact copy of a current or an earlier (legacy $HOME) engine script.
+  // An exact copy of a current or an earlier (legacy $HOME) engine script: the same command
+  // (whitespace aside), every other field the canonical one has with the same value, and none it
+  // lacks; the name does not matter. A copy that differs (a manual re-run with
+  // runOnWorktreeCreate false, another async) is the repo's own script and is kept.
+  const fields = (x) => Object.keys(x).filter((k) => k !== 'name' && k !== 'command');
   return JSON.parse(asset('t3.json')).scripts.some((w, i) => [norm(w.command), LEGACY_COMMANDS[i]].includes(norm(s?.command))
-    && Object.keys(s).every((k) => Object.hasOwn(w, k)));
+    && Object.keys(s).every((k) => Object.hasOwn(w, k))
+    && fields(w).every((k) => JSON.stringify(s[k]) === JSON.stringify(w[k])));
 }
 
 // ------------------------------------------------------------------ detection
@@ -594,26 +599,41 @@ function envFiles(root) {
 const GATING_TRIGGERS = ['pull_request_target', 'pull_request', 'merge_group'];
 
 // A YAML line without its comment: a `#` at the start or after a space, outside quotes.
-function stripYamlComment(line) {
+// Which characters of s are inside a quoted YAML scalar (its quotes included). The one place
+// quotes are read, for every scanner here: in "...", a backslash escapes the next character (so
+// \" does not end it and \\ is one backslash); in '...', a doubled '' is a quote, not the end.
+function quoteMask(s) {
+  const mask = new Array(s.length).fill(false);
   let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === '"') {
+      mask[i] = true;
+      if (c === '\\') { if (i + 1 < s.length) mask[++i] = true; } else if (c === '"') q = null;
+    } else if (q === "'") {
+      mask[i] = true;
+      if (c === "'") { if (s[i + 1] === "'") mask[++i] = true; else q = null; }
+    } else if (c === '"' || c === "'") { q = c; mask[i] = true; }
+  }
+  return mask;
+}
+
+function stripYamlComment(line) {
+  const mask = quoteMask(line);
   for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (q) { if (c === q) q = null; continue; }
-    if (c === '"' || c === "'") q = c;
-    else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+    if (!mask[i] && line[i] === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
   }
   return line;
 }
 
-// How deep the brackets of a flow value still are at its end (quotes respected).
+// How deep the brackets of a flow value still are at its end (outside quotes).
 function flowDepth(s) {
+  const mask = quoteMask(s);
   let depth = 0;
-  let q = null;
-  for (const c of s) {
-    if (q) { if (c === q) q = null; continue; }
-    if (c === '"' || c === "'") q = c;
-    else if (c === '[' || c === '{') depth++;
-    else if (c === ']' || c === '}') depth--;
+  for (let i = 0; i < s.length; i++) {
+    if (mask[i]) continue;
+    if (s[i] === '[' || s[i] === '{') depth++;
+    else if (s[i] === ']' || s[i] === '}') depth--;
   }
   return depth;
 }
@@ -624,14 +644,14 @@ function flowItems(s) {
   const unquote = (x) => x.trim().replace(/^['"]|['"]$/g, '').trim();
   if (!/^[[{]/.test(s)) return [unquote(s.split(':')[0])];
   const isMap = s[0] === '{';
+  const mask = quoteMask(s);
   const items = [];
   let depth = 0;
-  let q = null;
   let cur = '';
   let inKey = true;
-  for (const c of s) {
-    if (q) { if (depth === 1 && inKey) cur += c; if (c === q) q = null; continue; }
-    if (c === '"' || c === "'") { q = c; if (depth === 1 && inKey) cur += c; continue; }
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (mask[i]) { if (depth === 1 && inKey) cur += c; continue; }
     if (c === '[' || c === '{') { depth++; continue; }
     if (c === ']' || c === '}') { depth--; if (depth === 0) { items.push(cur); cur = ''; } continue; }
     if (depth !== 1) continue;
@@ -687,6 +707,8 @@ function workflowTriggers(text) {
     let m;
     if ((m = l.match(/^\s*-\s+(['"]?[A-Za-z_]+['"]?)\s*$/))) names.add(word(m[1]));
     else if ((m = l.match(/^\s*(['"]?[A-Za-z_]+['"]?)\s*:/))) names.add(word(m[1]));
+    // `on:` with its scalar on the next line (`on:\n  pull_request`) names one event.
+    else if ((m = l.match(/^\s*(['"]?[A-Za-z_]+['"]?)\s*$/))) names.add(word(m[1]));
   }
   return [...names];
 }
