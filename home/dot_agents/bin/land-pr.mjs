@@ -58,7 +58,7 @@
 import {
   Gh, LandError, LandingLock,
   addHold, baseTreeOf, depName, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
-  holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
+  holderId, interruptExitCode, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
   parseLanding, pollMs, print, removeHold, repoTop, resolveRepo, retainedLockMessage, setLabels, sweepDue, unmetDeps,
   validateLandingCommands, writeLanding,
 } from './lib/land.mjs';
@@ -454,7 +454,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
   return out({ result: 'QUEUED', ...common, position, line: `QUEUED ${position}` }, 0);
 }
 
-main().then((code) => { process.exitCode = code; }, (e) => {
+main().then((code) => { process.exitCode = interruptExitCode() ?? code; }, (e) => {
   process.stderr.write(`land-pr: ${e instanceof LandError ? e.message : e?.stack || e}\n`);
-  process.exitCode = e instanceof LandError ? e.code : 1;
+  process.exitCode = interruptExitCode() ?? (e instanceof LandError ? e.code : 1);
 });

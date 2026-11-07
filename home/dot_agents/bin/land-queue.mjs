@@ -41,7 +41,7 @@ import {
   depName,
   BOUNCE_MARKER, Gh, LandError, LandingLock,
   appendLanding, baseTreeOf, clearQueueLabels, confirmPending, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
-  firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
+  firstLine, git, gitOk, interruptExitCode, interruption, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
   mainCheckout, mergePinned, parseArgs, parseLanding, print, rangeDiffChanges, registeredRepos, repoTop, resetTo,
   named, resolveRepo, retainedLockMessage, runCommands, runStep, runSweep, scrub, setLabels, sweepCommands, sweepDue, unmetDeps,
   validateLandingCommands, waitForPr,
@@ -224,7 +224,7 @@ async function landOne(ctx, pr, wantIn = null) {
     // Lost: the checkout may be another lander's. Stuck: a hook may still run in it (the lock is
     // kept). Either way nothing is aborted, reset or relabelled here.
     if (rb.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the rebase', lost: true }, 'the push', lock);
-    if (rb.stuck) return { aborted: { pr: pr.number, reason: `the rebase onto ${base} timed out; the landing lock is kept and the checkout left as it is` }, stop: true };
+    if (rb.stuck) return { aborted: { pr: pr.number, reason: `the rebase onto ${base} ${rb.interrupted ? `was interrupted (${interruption()})` : 'timed out'}; the landing lock is kept and the checkout left as it is` }, stop: true };
     if (rb.status !== 0) {
       const files = git(['diff', '--name-only', '--diff-filter=U'], { cwd: dir }).stdout.split(/\r?\n/).filter(Boolean);
       git(['rebase', '--abort'], { cwd: dir });
@@ -256,7 +256,7 @@ async function landOne(ctx, pr, wantIn = null) {
     let g = await runCommands([...named('setup', cfg.setup), ...named('affectedGate', cfg.affectedGate)], dir, lock, cfg);
     let retried = false;
     // Only a red affected gate is retried; a failed setup is a failure as it stands.
-    if (!g.ok && !g.lost && !g.timedOut && String(g.name || '').startsWith('affectedGate')) {
+    if (!g.ok && !g.lost && !g.stuck && !g.timedOut && String(g.name || '').startsWith('affectedGate')) {
       retried = true;
       g = await runCommands(named('affectedGate', cfg.affectedGate), dir, lock, cfg);
     }
@@ -265,6 +265,9 @@ async function landOne(ctx, pr, wantIn = null) {
     if (g.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the gate', lost: true }, 'the push', lock);
     // A gate that could not be stopped may still use the checkout: no reset; the lock is kept
     // (runCommands) and the run stops when it is not released.
+    // Interrupted: the lander stopped, the PR did not fail: no bounce, `landing` stays for the
+    // next lander's recovery, the lock is kept and the run stops.
+    if (g.interrupted) return { aborted: { pr: pr.number, reason: g.summary }, stop: true };
     if (g.stuck) return bounceOwned(ctx, pr, `affected gate failed: ${g.summary}, after the rebase`);
     if (!g.ok) {
       resetOwned();
@@ -285,7 +288,7 @@ async function landOne(ctx, pr, wantIn = null) {
     // Lost or stuck: the push may still complete, and the pending line already names its head
     // for the next lander. Nothing is reset or relabelled; a stuck push keeps the lock.
     if (push.lost) return abort(gh, pr, { requeue: 'the landing lock was lost during the push', lost: true }, 'the merge', lock);
-    if (push.stuck) return { aborted: { pr: pr.number, reason: 'the push of the rebased head timed out (it may still complete); the landing lock is kept and the checkout left as it is' }, stop: true };
+    if (push.stuck) return { aborted: { pr: pr.number, reason: `the push of the rebased head ${push.interrupted ? `was interrupted (${interruption()})` : 'timed out'} (it may still complete); the landing lock is kept and the checkout left as it is` }, stop: true };
     resetOwned();
     if (push.status !== 0) return bounceOwned(ctx, pr, `push of the rebased head was rejected (git push exit ${push.status}: a repo hook or the remote refused it)`);
     // The pending line already names the pushed head: after a loss it is left for the next lander.
@@ -434,7 +437,7 @@ function settleAfterError(gh, pr, res, report, lock) {
 async function countMerge(ctx, report, merged, { lost = false, stuck = false } = {}) {
   report.merged.push(merged);
   try { bumpMergeCount(ctx.gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
-  let why = lost ? 'the landing lock was lost' : stuck ? 'the merge command timed out (the landing lock is kept)' : '';
+  let why = lost ? 'the landing lock was lost' : stuck ? `the merge command ${interruption() ? `was interrupted (${interruption()})` : 'timed out'} (the landing lock is kept)` : '';
   if (!why) {
     if (ctx.lock?.keepReason) why = 'a landing step timed out (the landing lock is kept)';
     else if (ctx.lock && !ctx.lock.stillHeld()) why = 'the landing lock was lost';
@@ -473,11 +476,16 @@ async function runRepo(t, opts) {
     stale: [], busy: false, paused: false, alerts: [], sweep: null,
   };
   try {
-    return await runRepoSteps(t, opts, report);
+    await runRepoSteps(t, opts, report);
   } catch (e) {
     report.error = scrub(firstLine(e instanceof LandError ? e.message : e?.message || e));
-    return report;
   }
+  // An interrupted run is never a clean one: it is named, and the tool exits 128 + the signal.
+  if (interruption()) {
+    report.interrupted = interruption();
+    report.alerts.push(`interrupted by ${interruption()}: the running command was stopped and nothing more lands in this run; the landing lock is kept (see lockRetained)`);
+  }
+  return report;
 }
 
 async function runRepoSteps(t, opts, report) {
@@ -507,6 +515,7 @@ async function runRepoSteps(t, opts, report) {
   }
   let lost = false;
   for (let i = 0; i < MAX_PRS_PER_RUN; i++) {
+    if (interruption()) break;
     if (gh.isPaused()) { report.paused = true; break; }
     let q = fillQueueState(gh, report);
     if (opts.dryRun) { if (q.eligible.length) report.plan = q.eligible.map((p) => p.number); break; }
@@ -569,7 +578,7 @@ async function runRepoSteps(t, opts, report) {
   }
   // A sweep that is overdue (merges by land-pr, or a run that stopped before its sweep) runs when
   // nothing else is in the way.
-  if (!opts.dryRun && !report.paused && !report.busy && !report.stale.length && !lost && sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
+  if (!opts.dryRun && !report.paused && !report.busy && !report.stale.length && !lost && !interruption() && sweepDue(gh.repo, ctx.cfg) && !gh.isPaused()) {
     if (takeLock(ctx, report, opts)) {
       try { if (await sweepAfter(ctx, report)) lost = true; } finally { releaseLock(ctx, report); }
     }
@@ -683,6 +692,7 @@ async function main() {
   const reports = [];
   let failed = 0;
   for (const t of targets) {
+    if (interruption()) break;
     if (t.error) { failed++; reports.push({ repo: t.repo, error: t.error }); continue; }
     try {
       if (cmd === 'run') {
@@ -709,7 +719,7 @@ async function main() {
   return failed ? 1 : 0;
 }
 
-main().then((code) => { process.exitCode = code; }, (e) => {
+main().then((code) => { process.exitCode = interruptExitCode() ?? code; }, (e) => {
   process.stderr.write(`land-queue: ${e instanceof LandError ? e.message : e?.stack || e}\n`);
-  process.exitCode = e instanceof LandError ? e.code : 1;
+  process.exitCode = interruptExitCode() ?? (e instanceof LandError ? e.code : 1);
 });

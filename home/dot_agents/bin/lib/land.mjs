@@ -128,6 +128,12 @@ export function run(argv, { cwd, env = childEnv(), input, timeoutMs = ioTimeoutM
   return { status, stdout, stderr: stderr || (r.error ? String(r.error.message || r.error) : ''), timedOut: false };
 }
 
+// The signal that interrupted a command in this process (SIGINT or SIGTERM), or null. The tools
+// stop, keep the lock, and exit with 128 + its number.
+let interruptedBy = null;
+export const interruption = () => interruptedBy;
+export const interruptExitCode = () => (interruptedBy === 'SIGINT' ? 130 : interruptedBy === 'SIGTERM' ? 143 : null);
+
 // Run a repo command asynchronously. Its output is discarded, never kept: gate output can hold
 // secret values, and only an exit status leaves this function. onTick runs every tickMs while it
 // runs (the lock refresh). After timeoutMs the processes the command provably owns are stopped
@@ -137,8 +143,13 @@ export function run(argv, { cwd, env = childEnv(), input, timeoutMs = ioTimeoutM
 // is free, and the caller keeps the landing lock. onTick returning false (the lock refresh
 // failed) stops the command the same way, at once: { stopped: true }, also stuck.
 // { status, timedOut, stopped, stuck }.
+// Interruption (SIGINT, SIGTERM) while a command runs stops it the same way, at once, and marks
+// it interrupted (also stuck: the lock is kept and nothing more lands). The handlers exist only
+// while a command runs, and go when it ends. After an interruption no new command starts.
+// SIGKILL cannot be caught: a command running then may survive, and the lock stays until stale.
 export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, timeoutMs = 0 } = {}) {
   return new Promise((resolve) => {
+    if (interruptedBy) { resolve({ status: 128, timedOut: false, interrupted: true, stuck: true }); return; }
     let prepared;
     try { prepared = prepare(argv[0], argv.slice(1), { cwd, env }); } catch { resolve({ status: 127, timedOut: false }); return; }
     const [file, args, options] = prepared;
@@ -147,7 +158,15 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
     let stopped = false;
     let stuck = false;
     let ending = false;
+    let interrupted = false;
     const timers = [];
+    const onSignal = (sig) => {
+      interruptedBy = interruptedBy || sig;
+      interrupted = true;
+      if (!ending) terminate();
+    };
+    process.on('SIGINT', onSignal);
+    process.on('SIGTERM', onSignal);
     // Stop the command: what it provably owns (one snapshot while its tree is intact), then the
     // command itself; then wait (bounded) for it to exit.
     const terminate = () => {
@@ -173,7 +192,9 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
       if (finished) return;
       finished = true;
       for (const t of timers) { clearInterval(t); clearTimeout(t); }
-      if (timedOut || stopped) {
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      if (timedOut || stopped || interrupted) {
         // On Unix, anything left in its group goes with it. Whatever was stopped, nothing proves
         // that every process the command started is gone: it is stuck.
         if (!isWindows) killTree(child, 'SIGKILL');
@@ -181,7 +202,7 @@ export function runAsync(argv, { cwd, env = childEnv(), tickMs = 0, onTick, time
         // A command still running must not keep this process from exiting.
         child.unref();
       }
-      resolve({ status, timedOut, stopped, stuck });
+      resolve({ status, timedOut, stopped, stuck, interrupted });
     };
     child.on('error', () => done(127));
     child.on('exit', (code, signal) => done(code ?? (signal ? 128 : 1)));
@@ -1048,7 +1069,7 @@ export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
     return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost) || owned === false, stuck: Boolean(r.stuck), readBack };
   }
   if (r.lost) return { ok: false, lost: true, summary: 'the landing lock was lost during the merge command' };
-  if (r.stuck) return { ok: false, stuck: true, summary: `the merge command timed out (PR state ${after?.state || 'unknown'}); the landing lock is kept` };
+  if (r.stuck) return { ok: false, stuck: true, interrupted: Boolean(r.interrupted), summary: `the merge command ${r.interrupted ? `was interrupted (${interruptedBy})` : 'timed out'} (PR state ${after?.state || 'unknown'}); the landing lock is kept` };
   if (r.status !== 0) return { ok: false, summary: `merge command exit ${r.status}` };
   return { ok: false, summary: `PR state is ${after?.state || 'unknown'} after the merge command` };
 }
@@ -1150,10 +1171,14 @@ export async function runStep(argv, { cwd, env = childEnv(), lock = null, cfg, l
   const onTick = () => { if (lock && !lock.refresh()) { lost = true; return false; } return true; };
   const r = await runAsync(argv, { cwd, env, tickMs: lock ? tickMs(cfg?.lockTtlMin) : 0, onTick, timeoutMs: commandTimeoutMs(cfg) });
   if (!lost && lock && !lock.stillHeld()) lost = true;
-  if (lost) return { status: r.status, lost: true, stuck: Boolean(r.stuck) };
+  if (lost) return { status: r.status, lost: true, stuck: Boolean(r.stuck), interrupted: Boolean(r.interrupted) };
   if (r.stuck) {
-    if (lock) lock.keep(`${label} timed out after ${Math.round(commandTimeoutMs(cfg) / 60000) || '<1'} min; a process it started may still run`);
-    return { status: r.status, stuck: true };
+    if (lock) {
+      lock.keep(r.interrupted
+        ? `${label} was interrupted (${interruptedBy}); its known processes were stopped, but one it started may still run`
+        : `${label} timed out after ${Math.round(commandTimeoutMs(cfg) / 60000) || '<1'} min; a process it started may still run`);
+    }
+    return { status: r.status, stuck: true, interrupted: Boolean(r.interrupted) };
   }
   return { status: r.status };
 }
@@ -1179,6 +1204,13 @@ export async function runCommands(entries, dir, lock, cfg) {
     // The lock is someone else's now: nothing is kept or released for it, and since processes
     // this command started may survive, the checkout must not be reused (stuck).
     if (lost) return { ok: false, lost: true, stuck: Boolean(r.stuck), name, cmd, status: r.status, summary: `${what}: the landing lock was lost, so it was stopped` };
+    if (r.stuck && r.interrupted) {
+      // Interrupted: stopped like a timeout, but it is the lander that stops, not a failure of
+      // the PR: no retry and no bounce; the lock is kept and nothing more lands.
+      const summary = `${what} was interrupted (${interruptedBy}); its known processes were stopped, but one it started may still run, so the landing lock is kept`;
+      if (lock) lock.keep(summary);
+      return { ok: false, stuck: true, interrupted: true, name, cmd, status: r.status, summary };
+    }
     if (r.stuck) {
       // Something it started may still run in the checkout: the lock must outlive it.
       const summary = `${what} timed out after ${Math.round(limit / 60000) || '<1'} min; its known processes were stopped, but one it started may still run, so the landing lock is kept`;

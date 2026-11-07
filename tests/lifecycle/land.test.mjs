@@ -1438,6 +1438,50 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), true);
   });
 
+  // The lander interrupted while a gate runs (Ctrl-C, SIGTERM): the gate and the child it started
+  // are stopped, nothing is bounced, merged or reset, `landing` stays, the lock is kept and
+  // reported, and the exit is 128 + the signal, never 0. (POSIX signals: a disposable lander.)
+  for (const [sig, code] of [['SIGTERM', 143], ['SIGINT', 130]]) {
+    test(`run: ${sig} while the gate runs stops its process tree, keeps the lock, leaves the checkout and exits ${code}`, { timeout: 180000, skip: process.platform === 'win32' ? 'POSIX signals' : false }, async () => {
+      const t = setup();
+      queuePr(t, 1);
+      advanceMain(t, 'other.txt', 'x\n');
+      Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_STUCK_MS: '5000' });
+      const p = spawn(process.execPath, [LAND_QUEUE, 'run', '--repo', 'o/r', '--json'], { cwd: t.work, env: t.env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      p.stdout.on('data', (d) => { out += d; });
+      const exited = new Promise((res) => p.on('exit', (c, s) => res({ c, s })));
+      const selfFile = `${t.env.LAND_TEST_GATE}.self`;
+      const childFile = `${t.env.LAND_TEST_GATE}.child`;
+      for (let i = 0; i < 600 && !(fs.existsSync(selfFile) && fs.existsSync(childFile)); i++) await new Promise((res) => setTimeout(res, 100));
+      assert.ok(fs.existsSync(selfFile), 'the gate started');
+      const gatePid = Number(fs.readFileSync(selfFile, 'utf8'));
+      const childPid = Number(fs.readFileSync(childFile, 'utf8'));
+      const lander = `${t.work}-lander`;
+      const headBefore = sh(lander, t.env, 'rev-parse', 'HEAD');
+      p.kill(sig);
+      const { c } = await exited;
+      assert.equal(c, code, `exit ${c}; ${out}`);
+      const rep = JSON.parse(out);
+      assert.equal(rep.interrupted, sig);
+      assert.match(rep.aborted[0]?.reason || '', new RegExp(`was interrupted \\(${sig}\\)`));
+      assert.deepEqual(rep.merged, []);
+      assert.deepEqual(rep.bounced, [], 'an interruption is not the PR failing');
+      assert.match(rep.alerts.join('\n'), new RegExp(`interrupted by ${sig}`));
+      assert.ok(rep.lockRetained?.sha, 'the lock is kept and reported');
+      assert.equal(lockExists(t), true);
+      for (const [name, pid] of [['gate', gatePid], ['its child', childPid]]) {
+        let alive = true;
+        try { process.kill(pid, 0); } catch { alive = false; }
+        assert.equal(alive, false, `${name} was stopped`);
+      }
+      assert.deepEqual(prOf(t, 1).labels, ['landing'], 'left for the next lander');
+      assert.equal(state(t).comments.length, 0, 'no bounce comment');
+      assert.equal(sh(lander, t.env, 'rev-parse', 'HEAD'), headBefore, 'the checkout was not reset');
+      assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 1, 'no retry');
+    });
+  }
+
   // ---- landing steps that run repo code (hooks, merge wrappers) are bounded and refresh the lock
 
   // A pre-push hook in the shared hooks folder that runs only while <tmp>/push-hook-flag exists.
