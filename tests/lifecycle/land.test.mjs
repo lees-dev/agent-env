@@ -1798,25 +1798,30 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), false);
   });
 
-  // The sweep fetches the base before it resets the lander checkout; another lander can take the
-  // lock during that fetch. The checkout is reset only while the lock is still ours: here the
-  // sweep stops as lost, nothing is paused, and the sweep stays due.
-  test('run: lock taken during the sweep fetch: checkout not reset, no pause, the sweep stays due', () => {
-    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
-    queuePr(t, 1);
-    // Lock reads up to the merge and the sweep's start; read 8 is the check after its fetch.
-    const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 8, pr: 1, steal: true }; saveState(t, s);
-    const rep = runQueue(t);
-    const after = state(t);
-    assert.ok(after.mutateAfter.stolen, 'the lock was taken during the sweep');
-    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
-    assert.equal(rep.sweep?.lost, true);
-    assert.match(rep.alerts.join('\n'), /wide sweep on main stopped: the landing lock was lost; it stays due/);
-    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.bare, t.env, 'rev-parse', 'main'), 'the checkout was not reset to the base');
-    assert.equal(after.variables?.AGENT_LANDING_PAUSED, undefined, 'not paused');
-    assert.equal(JSON.parse(fs.readFileSync(path.join(t.env.HOME, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'the sweep stays due');
-    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
-  });
+  // The sweep checks ownership before it touches the lander checkout (landerCheckout may abort a
+  // half-finished rebase there) and again after its fetch, before the reset. With the lock taken
+  // at either point (and the new holder rebasing in the checkout), the sweep stops as lost:
+  // nothing is reset or aborted, nothing is paused, and the sweep stays due.
+  for (const [n, when] of [[10, 'before the sweep touches the checkout'], [11, 'during the sweep fetch']]) {
+    test(`run: lock taken ${when}: the new holder's rebase stays, checkout not reset, no pause, the sweep stays due`, () => {
+      const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+      queuePr(t, 1);
+      // Lock reads up to the merge (its ownership checks included); read 10 is the sweep's
+      // first check, 11 the one after its fetch.
+      const s = state(t); s.mutateAfter = { kind: 'lockGet', n, pr: 1, steal: true, foreignRebase: `${t.work}-lander` }; saveState(t, s);
+      const rep = runQueue(t);
+      const after = state(t);
+      assert.ok(after.mutateAfter.stolen, 'the lock was taken during the sweep');
+      assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+      assert.equal(rep.sweep?.lost, true);
+      assert.match(rep.alerts.join('\n'), /wide sweep on main stopped: the landing lock was lost; it stays due/);
+      assert.ok(fs.existsSync(after.mutateAfter.rebaseDir), 'the new holder rebase is still in progress');
+      assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.bare, t.env, 'rev-parse', 'main'), 'the checkout was not reset to the base');
+      assert.equal(after.variables?.AGENT_LANDING_PAUSED, undefined, 'not paused');
+      assert.equal(JSON.parse(fs.readFileSync(path.join(t.env.HOME, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'the sweep stays due');
+      assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+    });
+  }
 
   test('run: a fresh lock held by another lander means busy, nothing touched', () => {
     const t = setup();
@@ -2219,7 +2224,7 @@ describe('land-queue', () => {
     queuePr(t, 1);
     queuePr(t, 2);
     // Reads of PR 1 that answer: the third is the run's recovery read; the lock moves after it.
-    const s = state(t); s.failViewAfterMerge = 1; s.failViewTimes = 2; s.mutateAfter = { kind: 'prView', n: 3, pr: 1, steal: true }; saveState(t, s);
+    const s = state(t); s.failViewAfterMerge = 1; s.failViewTimes = 2; s.mutateAfter = { kind: 'prView', n: 3, pr: 1, steal: true, foreignRebase: `${t.work}-lander` }; saveState(t, s);
     const rep = runQueue(t);
     const after = state(t);
     assert.ok(after.mutateAfter.stolen);
@@ -2229,6 +2234,49 @@ describe('land-queue', () => {
     assert.equal(prOf(t, 1).state, 'MERGED');
     assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched after the loss');
     assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the next PR was not started');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'counted once; the sweep stays due');
+    assert.ok(fs.existsSync(after.mutateAfter.rebaseDir), 'the new holder rebase is still in progress');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
+  // One failed read-back, and the lock moves during the fresh read that confirms the merge: that
+  // read proves nothing about the lock. Counted once, then the run stops before any sweep; the new
+  // holder's rebase in the lander checkout is left alone.
+  test('run: a merge confirmed by a fresh read while the lock moved: counted, then stop; the new holder\'s rebase is untouched', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1);
+    queuePr(t, 2);
+    // Reads of PR 1 that answer: 1-2 the re-checks before the merge, 3 the fresh read after the
+    // failed read-back; the lock moves (and a rebase starts in the checkout) after it.
+    const s = state(t); s.failViewAfterMerge = 1; s.mutateAfter = { kind: 'prView', n: 3, pr: 1, steal: true, foreignRebase: `${t.work}-lander` }; saveState(t, s);
+    const rep = runQueue(t);
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen && after.mutateAfter.rebaseDir);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /#1 merged, but the landing lock was lost: stopped before any sweep or other landing/);
+    assert.equal(rep.sweep, null, 'no sweep');
+    assert.ok(fs.existsSync(after.mutateAfter.rebaseDir), 'the new holder\'s rebase is still in progress');
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched after the loss');
+    assert.deepEqual(prOf(t, 2).labels, ['queued']);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'counted once; the sweep stays due');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
+  test('merge-now: a merge confirmed by a fresh read while the lock moved: MERGED and counted, no sweep, the lock left to its holder', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    const head = makePr(t, 1);
+    // Reads of PR 1 that answer: 1 before the lock, 2 under it, 3 the last read, 4 the fresh
+    // read after the failed read-back; the lock moves after it.
+    const s = state(t); s.failViewAfterMerge = 1; s.mutateAfter = { kind: 'prView', n: 4, pr: 1, steal: true }; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen);
+    assert.equal(r.status, 0, r.err);
+    const j = JSON.parse(r.out);
+    assert.equal(j.result, 'MERGED');
+    assert.equal(j.sweep, null, 'no sweep after the loss');
+    assert.match(r.err, /#1 merged, but the landing lock was lost: no wide sweep now/);
+    assert.equal(fs.existsSync(`${t.work}-lander`), false, 'the lander checkout was not touched');
     assert.equal(JSON.parse(fs.readFileSync(path.join(t.home, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'counted once; the sweep stays due');
     assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
   });
@@ -2757,6 +2805,26 @@ describe('land-queue', () => {
     const rep = runQueue(t);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
     assert.equal(fs.readFileSync(out, 'utf8').trim(), 'clean');
+  });
+
+  // A pre-rebase hook that refuses: the rebase fails with no conflicted file. The bounce says
+  // so (exit status, no claimed conflict) and never posts the hook's output.
+  test('run: a refusing pre-rebase hook bounces as a failed rebase, not a conflict; its output is not posted', () => {
+    const t = setup();
+    queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    const hook = path.join(t.work, '.git', 'hooks', 'pre-rebase');
+    fs.writeFileSync(hook, '#!/bin/sh\necho HOOK-OUTPUT-MARKER\necho HOOK-OUTPUT-MARKER >&2\nexit 1\n');
+    fs.chmodSync(hook, 0o755);
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err);
+    const rep = JSON.parse(r.out);
+    assert.equal(rep.bounced.length, 1);
+    assert.match(rep.bounced[0].reason, /^rebase onto main failed \(exit \d+\) with no conflicted files; rebase by hand/);
+    assert.doesNotMatch(rep.bounced[0].reason, /conflicts in/);
+    for (const [where, text] of [['body', prOf(t, 1).body], ['comment', state(t).comments.map((c) => c.body).join('\n')], ['report', r.out]]) {
+      assert.doesNotMatch(text, /HOOK-OUTPUT-MARKER/, `${where}: no hook output`);
+    }
   });
 
   test('run: merged PRs lose every queue label', () => {

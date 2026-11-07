@@ -190,7 +190,7 @@ async function landOne(ctx, pr, wantIn = null) {
   const want = wantIn || { base: gatedBase, headRef: pr.headRefName };
   const { base } = want;
   const baseRef = `refs/remotes/origin/${base}`;
-  const dir = landerCheckout(mainRoot, base);
+  const dir = landerCheckout(mainRoot, base, lock);
   // Resets of the checkout happen only while this lander still owns the lock: after a loss it
   // may be another lander's.
   const resetOwned = () => { if (lock.stillHeld()) resetTo(dir, baseRef); };
@@ -230,6 +230,7 @@ async function landOne(ctx, pr, wantIn = null) {
       git(['rebase', '--abort'], { cwd: dir });
       resetOwned();
       const list = files.slice(0, 10).join(', ');
+      if (!files.length) return bounceOwned(ctx, pr, `rebase onto ${base} failed (exit ${rb.status}) with no conflicted files; rebase by hand, then re-gate and re-review`);
       return bounceOwned(ctx, pr, `rebase onto ${base} conflicts in ${files.length} file(s)${list ? `: ${list}` : ''}; re-gate and re-review after resolving`);
     }
     const rebasedSha = gitOk(['rev-parse', 'HEAD'], { cwd: dir });
@@ -428,13 +429,13 @@ function settleAfterError(gh, pr, res, report, lock) {
 // One decision for every confirmed merge, whether the merge path saw it or a fresh read after
 // an error did: it is counted; after a lost lock or a landing step that may still run, the run
 // stops (no sweep, reset or other PR); otherwise a sweep it made due runs before anything else
-// lands. A merge recovered after an error proves nothing about the lock, so ownership is checked
-// first. Returns true when the run must stop.
-async function countMerge(ctx, report, merged, { lost = false, stuck = false, recovered = false } = {}) {
+// lands. A read that confirms a merge proves nothing about the lock, so ownership (and a kept
+// lock) is checked here for every merge, before any sweep. Returns true when the run must stop.
+async function countMerge(ctx, report, merged, { lost = false, stuck = false } = {}) {
   report.merged.push(merged);
   try { bumpMergeCount(ctx.gh.repo); } catch (e) { report.alerts.push(`the merge count was not updated (${firstLine(e?.message || e)}); the next wide sweep may run late`); }
   let why = lost ? 'the landing lock was lost' : stuck ? 'the merge command timed out (the landing lock is kept)' : '';
-  if (!why && recovered) {
+  if (!why) {
     if (ctx.lock?.keepReason) why = 'a landing step timed out (the landing lock is kept)';
     else if (ctx.lock && !ctx.lock.stillHeld()) why = 'the landing lock was lost';
   }
@@ -551,7 +552,7 @@ async function runRepoSteps(t, opts, report) {
       if (!settled) throw e;
       res = settled;
       report.alerts.push(`#${pr.number} merged, but reading it back failed (${firstLine(e?.message || e)}); confirmed merged from a fresh read`);
-      if (await countMerge(ctx, report, settled.merged, { recovered: true })) lost = true;
+      if (await countMerge(ctx, report, settled.merged)) lost = true;
     } finally {
       if (!releaseLock(ctx, report)) lost = true;
     }

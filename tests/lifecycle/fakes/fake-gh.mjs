@@ -3,6 +3,7 @@
 // under test see a consistent remote through both gh and git.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 
 const STATE = process.env.FAKE_GH_STATE;
 const BARE = process.env.FAKE_GH_BARE;
@@ -188,6 +189,18 @@ function countAndMutate(s, kind) {
     const g = (...a) => spawnSync('git', ['-C', BARE, ...a], { encoding: 'utf8', shell: false }).stdout.trim();
     m.stolen = g('commit-tree', g('rev-parse', `${lock}^{tree}`), '-m', `agent-landing-lock host=other pid=1 at=${new Date().toISOString()} ttl=45`);
     g('update-ref', lock, m.stolen);
+    // foreignRebase: the new holder starts a rebase in the lander checkout (this path), which
+    // the old holder must leave alone (`git rebase --abort` would remove this state).
+    if (m.foreignRebase) {
+      const w = (...a) => spawnSync('git', ['-C', m.foreignRebase, ...a], { encoding: 'utf8', shell: false }).stdout.trim();
+      const dir = path.join(w('rev-parse', '--absolute-git-dir'), 'rebase-merge');
+      const head = w('rev-parse', 'HEAD');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'head-name'), 'detached HEAD\n');
+      fs.writeFileSync(path.join(dir, 'orig-head'), `${head}\n`);
+      fs.writeFileSync(path.join(dir, 'onto'), `${head}\n`);
+      m.rebaseDir = dir;
+    }
   }
 }
 

@@ -1041,8 +1041,11 @@ export async function mergePinned(gh, cfg, { pr, sha, cwd, lock = null }) {
     // both are reported with it, and the caller stops before any sweep, reset or other PR.
     // Labels are cleared only while the lock is ours and nothing may still run (the next lander
     // clears a leftover).
-    if (!r.lost && !r.stuck && (!lock || lock.stillHeld())) clearQueueLabels(gh, after);
-    return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost), stuck: Boolean(r.stuck), readBack };
+    // A read that confirms the merge says nothing about the lock: ownership is checked here, after
+    // it, and a lock that moved is reported as lost (never left false).
+    const owned = r.lost || r.stuck ? null : (!lock || lock.stillHeld());
+    if (owned) clearQueueLabels(gh, after);
+    return { ok: true, mergeSha: after.mergeCommit?.oid || null, lost: Boolean(r.lost) || owned === false, stuck: Boolean(r.stuck), readBack };
   }
   if (r.lost) return { ok: false, lost: true, summary: 'the landing lock was lost during the merge command' };
   if (r.stuck) return { ok: false, stuck: true, summary: `the merge command timed out (PR state ${after?.state || 'unknown'}); the landing lock is kept` };
@@ -1070,7 +1073,7 @@ export function clearQueueLabels(gh, pr) {
 // lock is never replaced, and a checkout holding work is refused with that work intact.
 export const LANDER_LOCK_REASON = 'land-queue lander checkout';
 
-export function landerCheckout(mainRoot, base) {
+export function landerCheckout(mainRoot, base, lock = null) {
   const dir = `${mainRoot}-lander`;
   const mainCommon = canonKey(gitOk(['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: mainRoot }));
   let exists = true;
@@ -1100,7 +1103,9 @@ export function landerCheckout(mainRoot, base) {
     if (ignored) refuse(`it has ${ignored} ignored file(s)`);
     gitOk(['worktree', 'lock', '--reason', LANDER_LOCK_REASON, dir], { cwd: mainRoot });
   } else if (inProgress.some((f) => f.startsWith('rebase-'))) {
-    // The lander's own checkout: leave a half-finished rebase of an earlier run (either backend).
+    // The lander's own checkout: leave a half-finished rebase of an earlier run (either backend),
+    // only while the lock is ours: after a loss the rebase may be another lander's, in flight.
+    if (lock && !lock.stillHeld()) throw new LandError(`the landing lock was lost; ${dir} (a rebase in progress) was left untouched`);
     git(['rebase', '--abort'], { cwd: dir });
   }
   return dir;
@@ -1247,7 +1252,10 @@ export function sweepDue(repo, cfg) {
 // Run the repo's wide sweep on its base in the lander checkout. The caller holds the landing
 // lock. Red sets the repo pause. Returns { ok, cmd, status, lost }.
 export async function runSweep({ cfg, mainRoot, lock }) {
-  const dir = landerCheckout(mainRoot, cfg.base);
+  // Before the checkout is touched at all (landerCheckout may abort a half-finished rebase there):
+  // after a loss it may be another lander's.
+  if (lock && !lock.stillHeld()) return { ok: false, lost: true, summary: 'the landing lock was lost before the sweep' };
+  const dir = landerCheckout(mainRoot, cfg.base, lock);
   fetchBranch(dir, cfg.base);
   // Fetching can outlast ownership: never reset a new holder's checkout.
   if (lock && !lock.stillHeld()) return { ok: false, lost: true, summary: 'the landing lock was lost before the sweep' };
