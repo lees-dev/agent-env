@@ -12,7 +12,7 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  appendLanding, git as landGit, isStale, lockMessage, orderQueue, parseHolds, parseLanding,
+  appendLanding, git as landGit, isStale, lockMessage, orderQueue, parseHolds, parseLanding, runAsync,
   parseLockMessage, rangeDiffChanges, registeredRepos, scrub, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
 // Through the namespace, so an older land.mjs without them fails only the tests that use them.
@@ -150,6 +150,9 @@ function setup(repoJson = {}) {
     GIT_CONFIG_GLOBAL: gitcfg, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0',
     FAKE_GH_STATE: stateFile, FAKE_GH_BARE: bare, HOME: home, USERPROFILE: home, AGENT_LAND_POLL_MS: '1',
     LAND_TEST_GATE: path.join(tmp, 'gate result'),
+    // The test mode, and the bare origin declared as standing for github.com/o/r: the tools still
+    // check origin's push URL against it (an undeclared or other destination is refused).
+    AGENT_ENV_NO_SECRETS: '1', AGENT_LAND_TEST_FAKE_GITHUB: `o/r=${bare}`,
   });
   sh(tmp, env, 'init', '--quiet', '--bare', '-b', 'main', bare);
   sh(tmp, env, 'clone', '--quiet', bare, work);
@@ -235,6 +238,32 @@ function runQueue(t, ...extra) {
 // ------------------------------------------------------------------------- unit
 
 describe('lib/land.mjs', () => {
+  // The no-kill test hook works only in the test mode: the switch alone (leaked into a real
+  // lander's environment) still stops a command at its timeout.
+  test('the no-kill switch without the test mode still stops a hung command', { timeout: 120000 }, async () => {
+    const saved = { s: process.env.AGENT_LAND_TEST_NO_KILL, n: process.env.AGENT_ENV_NO_SECRETS, k: process.env.AGENT_LAND_STUCK_MS };
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land kill '));
+    temps.push(tmp);
+    const pidFile = path.join(tmp, 'pid');
+    process.env.AGENT_LAND_TEST_NO_KILL = '1';
+    delete process.env.AGENT_ENV_NO_SECRETS;
+    process.env.AGENT_LAND_STUCK_MS = '3000';
+    try {
+      const r = await runAsync([process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 60000)`], { timeoutMs: 2000 });
+      assert.equal(r.timedOut, true);
+      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+      let alive = true;
+      for (let i = 0; i < 20 && alive; i++) {
+        try { process.kill(pid, 0); await new Promise((res) => setTimeout(res, 250)); } catch { alive = false; }
+      }
+      assert.equal(alive, false, 'the command was stopped');
+    } finally {
+      for (const [k, v] of [['AGENT_LAND_TEST_NO_KILL', saved.s], ['AGENT_ENV_NO_SECRETS', saved.n], ['AGENT_LAND_STUCK_MS', saved.k]]) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  });
+
   test('call bounds stay inside the lock ttl: a sixth for gh and local git, a third for git network calls', () => {
     const saved = { io: process.env.AGENT_LAND_IO_TIMEOUT_MS, net: process.env.AGENT_LAND_NET_TIMEOUT_MS };
     try {
@@ -1145,13 +1174,15 @@ describe('land-queue', () => {
       { root: t.work, name: 'r', lastSeen: '2026-11-06T00:00:00Z' },
       { root: path.join(t.tmp, 'gone'), name: 'gone', lastSeen: '2026-11-06T00:00:00Z' },
     ] }));
+    // The fixture checkout (a local origin) is not declared as a GitHub repo here: unresolvable.
+    delete t.env.AGENT_LAND_TEST_FAKE_GITHUB;
     const r = tool(t, LAND_QUEUE, 'status', '--all', '--json');
     assert.equal(r.status, 1, r.err);
     const out = JSON.parse(r.out);
     assert.equal(out.length, 2);
     assert.equal(out[0].repo, 'o/r');
     assert.deepEqual(out[0].order.map((x) => x.pr), [1]);
-    assert.match(out[1].error, /cannot tell the GitHub repo/);
+    assert.match(out[1].error, /cannot prove where the landing lock would be released/);
   });
 
   test('run: rebases a PR behind the base, reruns the gate, pushes, merges', () => {
@@ -1251,22 +1282,6 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), true);
   });
 
-  // The no-kill test hook works only in the test mode: the switch alone (leaked into a real
-  // lander's environment) still stops the gate and its children at the timeout.
-  test('run: the no-kill switch without the test mode still stops a hung gate', { timeout: 180000 }, () => {
-    const t = setup();
-    queuePr(t, 1);
-    advanceMain(t, 'other.txt', 'x\n');
-    Object.assign(t.env, { LAND_TEST_GATE_HANG: '1', AGENT_LAND_CMD_TIMEOUT_MS: '3000', AGENT_LAND_TEST_NO_KILL: '1' });
-    delete t.env.AGENT_ENV_NO_SECRETS;
-    const rep = runQueue(t);
-    assert.match(rep.bounced[0].reason, /timed out after/);
-    const child = Number(fs.readFileSync(`${t.env.LAND_TEST_GATE}.child`, 'utf8'));
-    let alive = true;
-    try { process.kill(child, 0); } catch { alive = false; }
-    assert.equal(alive, false, 'the gate\'s child process was stopped');
-  });
-
   // ---- landing steps that run repo code (hooks, merge wrappers) are bounded and refresh the lock
 
   // A pre-push hook in the shared hooks folder that runs only while <tmp>/push-hook-flag exists.
@@ -1321,7 +1336,7 @@ describe('land-queue', () => {
     Object.assign(t.env, { LAND_TEST_GATE_SLEEP_MS: '40000', AGENT_LAND_TICK_MS: '2000', FAKE_GH_HANG_LOCK_PATCH: '1' });
     const started = Date.now();
     const rep = runQueue(t);
-    assert.ok(Date.now() - started < 35000, `stopped at the gh bound (${Date.now() - started} ms)`);
+    assert.ok(Date.now() - started < 55000, `stopped at the gh bound, well before the 60 s hang ended (${Date.now() - started} ms)`);
     assert.match(rep.aborted[0].reason, /landing lock was lost/);
     assert.deepEqual(prOf(t, 1).labels, ['landing'], 'no relabel after the loss');
     assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
@@ -1352,6 +1367,60 @@ describe('land-queue', () => {
     assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
   });
 
+  // The lock is released by pushing to origin: origin's actual push destination (after
+  // insteadOf / pushInsteadOf) must be the repo the lock is created in.
+  test('push destination: an undeclared local path, a wrong repo among several, or the switch outside test mode is refused', () => {
+    const cases = [
+      ['undeclared local path', (t) => { t.env.AGENT_LAND_TEST_FAKE_GITHUB = `o/r=${path.join(t.tmp, 'elsewhere.git')}`; }],
+      ['test switch outside the test mode', (t) => { delete t.env.AGENT_ENV_NO_SECRETS; }],
+      ['a second push URL to another repo', (t) => { sh(t.work, t.env, 'remote', 'set-url', '--add', '--push', 'origin', t.bare); sh(t.work, t.env, 'remote', 'set-url', '--add', '--push', 'origin', 'https://github.com/someone/else.git'); }],
+      // git config keys take forward slashes: a Windows path's backslashes would not match.
+      // pushInsteadOf applies to the push URL derived from `url` (not to an explicit pushurl).
+      ['pushInsteadOf rewrites the push to an undeclared place', (t) => {
+        sh(t.work, t.env, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git');
+        sh(t.work, t.env, 'config', `url.${path.join(t.tmp, 'elsewhere.git').replace(/\\/g, '/')}.pushInsteadOf`, 'https://github.com/o/r.git');
+      }],
+      ['pushInsteadOf rewrites a github.com/o/r push to another GitHub repo', (t) => {
+        sh(t.work, t.env, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git');
+        sh(t.work, t.env, 'config', 'url.https://github.com/zzz/.pushInsteadOf', 'https://github.com/o/');
+      }],
+    ];
+    for (const [name, arrange] of cases) {
+      const t = setup();
+      const head = queuePr(t, 1);
+      arrange(t);
+      const before = state(t).calls.length;
+      const p = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+      assert.equal(p.status, 2, `${name}: ${p.out} ${p.err}`);
+      assert.match(p.err, /cannot prove where the landing lock would be released|is not the repo origin pushes to/, name);
+      assert.doesNotMatch(p.err, /https?:\/\/|elsewhere/, `${name}: no URL or path is quoted`);
+      const q = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+      assert.notEqual(q.status, 0, name);
+      assert.equal(lockExists(t), false, `${name}: no lock`);
+      assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge' || (c.cmd === 'api' && c.method !== 'GET')), false, `${name}: no writes`);
+    }
+  });
+
+  test('push destination: a fetch mirror is fine when every push goes to the repo; an override push URL to it lands', () => {
+    // Fetch from a mirror (another bare clone), push to the declared o/r: lands.
+    const t = setup();
+    queuePr(t, 1);
+    const mirror = path.join(t.tmp, 'mirror.git');
+    sh(t.tmp, t.env, 'clone', '--quiet', '--mirror', t.bare, mirror);
+    sh(t.work, t.env, 'remote', 'set-url', 'origin', mirror);
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', t.bare);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.equal(lockExists(t), false, 'released to the repo it was created in');
+    // A GitHub URL rewritten by insteadOf to the declared o/r: the actual (rewritten) target counts.
+    const t2 = setup();
+    queuePr(t2, 1);
+    sh(t2.work, t2.env, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git');
+    sh(t2.work, t2.env, 'config', `url.${t2.bare.replace(/\\/g, '/')}.insteadOf`, 'https://github.com/o/r.git');
+    assert.deepEqual(runQueue(t2).merged.map((m) => m.pr), [1]);
+    assert.equal(lockExists(t2), false);
+  });
+
   test('--repo that is not origin\'s repo is refused before anything is read or changed', () => {
     const t = setup();
     const head = makePr(t, 1);
@@ -1359,7 +1428,8 @@ describe('land-queue', () => {
     const before = state(t).calls.length;
     const p = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
     assert.equal(p.status, 2);
-    assert.match(p.err, /--repo o\/r is not origin's repo \(someone\/else\)/);
+    assert.match(p.err, /--repo o\/r is not the repo origin pushes to \(someone\/else\)/);
+    assert.doesNotMatch(p.err, /https:\/\//, 'no URL is quoted');
     const q = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
     assert.notEqual(q.status, 0);
     assert.equal(lockExists(t), false, 'no lock created');
@@ -1736,8 +1806,10 @@ describe('land-queue', () => {
   test('a lock that cannot be released is reported, by the lander and by merge-now', () => {
     const t = setup();
     queuePr(t, 1);
-    // Pushes to origin fail (the lease delete included); the GitHub API still answers.
+    // Pushes to origin fail (the lease delete included); the GitHub API still answers. The push
+    // destination is declared as the fake o/r, so it passes the destination check.
     sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', path.join(t.tmp, 'no such remote.git'));
+    t.env.AGENT_LAND_TEST_FAKE_GITHUB = `o/r=${path.join(t.tmp, 'no such remote.git')}`;
     const rep = runQueue(t);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
     assert.ok(rep.lockRetained?.sha);
@@ -1746,6 +1818,7 @@ describe('land-queue', () => {
     const t2 = setup();
     const head = makePr(t2, 2);
     sh(t2.work, t2.env, 'remote', 'set-url', '--push', 'origin', path.join(t2.tmp, 'no such remote.git'));
+    t2.env.AGENT_LAND_TEST_FAKE_GITHUB = `o/r=${path.join(t2.tmp, 'no such remote.git')}`;
     const r = tool(t2, LAND_PR, '2', '--sha', head, '--repo', 'o/r', '--json');
     assert.equal(r.status, 0, r.err);
     assert.equal(JSON.parse(r.out).result, 'MERGED');

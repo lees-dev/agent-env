@@ -492,6 +492,15 @@ function envRole(f) {
 
 const NESTED_ENV_CAP = 200;
 
+// An env file's key count, or why it was not read: a link that leaves the repo is never followed
+// (outside), and one that cannot be read is unreadable; both need a check by hand. No values.
+function envRead(p, root) {
+  try { inside(root, p); } catch { return { keys: null, outside: true }; }
+  let text;
+  try { text = fs.readFileSync(p, 'utf8'); } catch { return { keys: null, unreadable: true }; }
+  return { keys: text.split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length };
+}
+
 function envFiles(root) {
   const out = [];
   const tracked = (f) => git(['ls-files', '--error-unmatch', '--', f], root).ok;
@@ -505,8 +514,7 @@ function envFiles(root) {
       try { st = fs.statSync(p); } catch { out.push({ file: f, keys: 0, tracked: tracked(f), role: envRole(f), dangling: true }); continue; }
     }
     if (!st.isFile()) continue;
-    const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
-    out.push({ file: f, keys, tracked: tracked(f), role: envRole(f) });
+    out.push({ file: f, ...envRead(p, root), tracked: tracked(f), role: envRole(f) });
   }
   // A tracked root env file deleted from the checkout is still in git history: listed too.
   const rootTracked = git(['ls-files', '-z', '--', '.env', '.env.*'], root);
@@ -538,8 +546,7 @@ function envFiles(root) {
         try { st = fs.statSync(p); } catch { out.push({ file: f, keys: 0, tracked: true, role: envRole(base), dangling: true }); continue; }
       }
       if (!st.isFile()) continue;
-      const keys = (readText(p, root) || '').split(/\r?\n/).filter((l) => /^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(l)).length;
-      out.push({ file: f, keys, tracked: true, role: envRole(base) });
+      out.push({ file: f, ...envRead(p, root), tracked: true, role: envRole(base) });
     }
   }
   const op = readText(path.join(root, '.env.op'), root);
@@ -698,6 +705,8 @@ function main() {
       for (const e of ev.env.files) {
         const tracked = e.tracked && e.role !== 'template' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
         if (e.dangling) L.push(`WARN  ${e.file}: a link to nothing`);
+        else if (e.outside) L.push(`WARN  ${e.file}: a link that leaves the repo, so it was not read${tracked}; check it by hand`);
+        else if (e.unreadable) L.push(`WARN  ${e.file}: could not be read${tracked}; check it by hand`);
         else if (e.missing) L.push(`WARN  ${e.file}: tracked in git but not in the checkout (still in history: rotate its values)`);
         else if (e.role === 'source') L.push(`INFO  ${e.file}: ${e.keys} keys${tracked}; migrate with agent-secret import`);
         else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);

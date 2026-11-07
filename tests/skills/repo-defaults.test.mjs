@@ -932,6 +932,44 @@ describe('repo-defaults apply.mjs', () => {
     assert.equal(help.status, 0);
   });
 
+  test('env report: an env link that leaves the repo is listed as outside, never read (root and nested)', (t) => {
+    const r = repo({ 'apps/web/README.md': 'x\n' });
+    const outside = path.join(path.dirname(r.work), 'outside.env');
+    fs.writeFileSync(outside, 'OUT_KEY=plainvalue\n');
+    try {
+      fs.symlinkSync(outside, path.join(r.work, '.env'), 'file');
+      fs.symlinkSync(outside, path.join(r.work, 'apps', 'web', '.env'), 'file');
+    } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    git(r.work, r.e, 'add', '-A');
+    git(r.work, r.e, 'commit', '--quiet', '-m', 'links');
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+    const by = Object.fromEntries(JSON.parse(p.stdout).env.files.map((f) => [f.file, f]));
+    assert.deepEqual(by['.env'], { file: '.env', keys: null, outside: true, tracked: true, role: 'source' });
+    assert.deepEqual(by['apps/web/.env'], { file: 'apps/web/.env', keys: null, outside: true, tracked: true, role: 'source' });
+    const txt = run(r, '--inspect').out;
+    assert.match(txt, /WARN {2}\.env: a link that leaves the repo, so it was not read \(TRACKED IN GIT: remove it and rotate\); check it by hand/);
+    assert.match(txt, /WARN {2}apps\/web\/\.env: a link that leaves the repo/);
+    assert.doesNotMatch(p.stdout + txt, /plainvalue|outside\.env/, 'no values, no target path');
+  });
+
+  test('env report: an env file that cannot be read is listed as unreadable, not as 0 keys', (t) => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) { t.skip('needs POSIX file modes and a non-root user'); return; }
+    const r = repo({});
+    const f = path.join(r.work, '.env.production');
+    fs.writeFileSync(f, 'K=plainvalue\n');
+    fs.chmodSync(f, 0o000);
+    try {
+      const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+      assert.deepEqual(JSON.parse(p.stdout).env.files.find((e) => e.file === '.env.production'), { file: '.env.production', keys: null, unreadable: true, tracked: false, role: 'source' });
+      assert.match(run(r, '--inspect').out, /WARN {2}\.env\.production: could not be read; check it by hand/);
+    } finally {
+      fs.chmodSync(f, 0o600);
+    }
+  });
+
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {
     const r = repo();
     git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');

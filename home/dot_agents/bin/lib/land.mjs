@@ -332,16 +332,53 @@ export function slugFromRemote(cwd) {
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
-// The repo the tools act on (--repo, else origin's). The landing lock is created there through
-// the API but released with `git push origin`, so --repo must be origin's own repo: a different
-// one is refused before anything is read or changed. An origin that names no GitHub repo (a
-// local path, a mirror) cannot be checked, so --repo is taken as given there.
+// owner/name of a GitHub URL (https, ssh://, or scp-style git@github.com:owner/name), or null.
+function githubSlug(url) {
+  const m = String(url).trim().match(/^(?:https?:\/\/(?:[^@/\s]+@)?github\.com\/|ssh:\/\/(?:[^@/\s]+@)?github\.com(?::\d+)?\/|(?:[^@/\s:]+@)?github\.com:)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+// Test mode only (AGENT_ENV_NO_SECRETS=1): AGENT_LAND_TEST_FAKE_GITHUB="owner/name=<path>"
+// declares one local bare repo as standing for that GitHub repo, so fixtures go through the
+// same push-destination check. Without the test mode it is ignored.
+function fakeGithub() {
+  if (process.env.AGENT_ENV_NO_SECRETS !== '1') return null;
+  const m = String(process.env.AGENT_LAND_TEST_FAKE_GITHUB || '').match(/^([^=\s/]+\/[^=\s/]+)=(.+)$/);
+  return m ? { slug: m[1], path: m[2] } : null;
+}
+function samePath(a, b) {
+  const real = (p) => { try { return fs.realpathSync(path.resolve(p)); } catch { return path.resolve(p); } };
+  return canonKey(real(a)) === canonKey(real(b));
+}
+
+// The GitHub repo that origin's pushes reach, from origin's actual push URLs (`get-url --push
+// --all` applies insteadOf and pushInsteadOf). Every one must name the same github.com repo.
+// { slug } or { slug: null, reason }; a reason never quotes a URL (it may hold credentials).
+export function pushTarget(root) {
+  const r = git(['remote', 'get-url', '--push', '--all', 'origin'], { cwd: root });
+  const urls = r.status === 0 ? r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+  if (!urls.length) return { slug: null, reason: 'origin has no push URL' };
+  const fake = fakeGithub();
+  const slugs = urls.map((u) => githubSlug(u) || (fake && samePath(u, fake.path) ? fake.slug : null));
+  const unknown = slugs.filter((s) => !s).length;
+  if (unknown) return { slug: null, reason: `${unknown} of origin's ${urls.length} push URL(s) name no github.com repo` };
+  if (new Set(slugs.map((s) => s.toLowerCase())).size > 1) return { slug: null, reason: `origin's ${urls.length} push URLs name different repos` };
+  return { slug: slugs[0] };
+}
+
+// The repo the tools act on (--repo, else the one origin pushes to). The landing lock is created
+// there through the API but released with `git push origin`, so origin's push URLs must all
+// reach that same GitHub repo; anything that cannot be proven is refused (exit 2) before
+// anything is read or changed. The fetch URL may differ (a mirror).
 export function resolveRepo(root, explicit) {
-  const origin = slugFromRemote(root);
-  if (explicit && origin && origin.toLowerCase() !== String(explicit).toLowerCase()) {
-    throw new LandError(`--repo ${explicit} is not origin's repo (${origin}): the landing lock is released through origin, so run from a checkout of ${explicit}`, 2);
+  const t = pushTarget(root);
+  if (!t.slug) {
+    throw new LandError(`cannot prove where the landing lock would be released: ${t.reason}; the lock is released by pushing to origin, whose push URL must be github.com/${explicit || '<owner>/<name>'}`, 2);
   }
-  return explicit || origin;
+  if (explicit && t.slug.toLowerCase() !== String(explicit).toLowerCase()) {
+    throw new LandError(`--repo ${explicit} is not the repo origin pushes to (${t.slug}): the landing lock is released through origin, so run from a checkout that pushes to ${explicit}`, 2);
+  }
+  return explicit || t.slug;
 }
 
 // range-diff status lines: "1:  abc1234 = 1:  def5678 subject". Anything but "=" is a change.
