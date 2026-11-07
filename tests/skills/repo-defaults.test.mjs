@@ -14,7 +14,9 @@ const SKILL = path.resolve(HERE, '../../home/dot_agents/skills/exact_repo-defaul
 const APPLY = path.join(SKILL, 'scripts', 'apply.mjs');
 const BLOCK = fs.readFileSync(path.join(SKILL, 'assets', 'agents-block.md'), 'utf8').trimEnd();
 const temps = [];
-after(() => { for (const t of temps) fs.rmSync(t, { recursive: true, force: true }); });
+// A fake gh still sleeping out a timed-out call may hold a file for a moment (Windows):
+// cleanup is best effort, never a test failure.
+after(() => { for (const t of temps) { try { fs.rmSync(t, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }); } catch { /* left for the OS temp cleanup */ } } });
 
 // The real git binary (Git for Windows: the cmd\ launcher), for the forwarding shim.
 function realGit() {
@@ -968,6 +970,113 @@ describe('repo-defaults apply.mjs', () => {
     } finally {
       fs.chmodSync(f, 0o600);
     }
+  });
+
+  test('env report: .env.local.example and the like are template candidates: a manual check, no import or rotate directive', () => {
+    const r = repo({ '.env.local.example': 'A=x\nB=y\n', '.env': 'REAL=plainvalue\n' });
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+    const by = Object.fromEntries(JSON.parse(p.stdout).env.files.map((f) => [f.file, f]));
+    assert.equal(by['.env.local.example'].role, 'template-candidate');
+    assert.equal(by['.env'].role, 'source');
+    const txt = run(r, '--inspect').out;
+    const line = txt.split('\n').find((l) => l.includes('.env.local.example'));
+    assert.match(line, /looks like a template, 2 keys \(tracked in git\); check by hand that it holds no real values/);
+    assert.doesNotMatch(line, /agent-secret import|remove it and rotate/);
+    assert.match(txt, /INFO {2}\.env: 1 keys \(TRACKED IN GIT: remove it and rotate\); migrate with agent-secret import/, 'a real source keeps its warning');
+  });
+
+  test('workflows: comments and quoted values are not triggers; keys, flow lists and a top-level sequence are', () => {
+    const r = repo({
+      '.github/workflows/a.yml': 'on:\n  push:\n  # pull_request:\njobs: {}\n',
+      '.github/workflows/b.yml': 'on: [push] # pull_request\njobs: {}\n',
+      '.github/workflows/c.yml': 'on:\n  workflow_dispatch:\n    inputs:\n      x:\n        description: "run # pull_request"\njobs: {}\n',
+      '.github/workflows/d.yml': 'on:\n- push\n- pull_request\njobs: {}\n',
+      '.github/workflows/e.yml': 'on:\n  "pull_request":\n    branches: [main]\njobs: {}\n',
+      '.github/workflows/f.yml': 'on: [push, merge_group]\njobs: {}\n',
+      '.github/workflows/g.yml': 'on:\n  push:\n    branches: [pull_request]\njobs: {}\n',
+      '.github/workflows/h.yml': "name: 'pull_request'\non: push\njobs: {}\n",
+    });
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
+    assert.deepEqual(JSON.parse(p.stdout).gatingWorkflows, [
+      { file: '.github/workflows/d.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/e.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/f.yml', triggers: ['merge_group'] },
+    ]);
+  });
+
+  test('detection: a package.json with a byte-order mark is read (and left as it is)', () => {
+    const pkg = '\uFEFF' + JSON.stringify({ name: 'x', packageManager: 'yarn@1.22.22', scripts: { gate: 'echo ok' } });
+    const r = repo({ 'package.json': pkg, 'yarn.lock': '' });
+    const d = run(r, '--inspect', '--json').json.detection;
+    assert.equal(d.install, 'yarn install --frozen-lockfile');
+    assert.equal(d.gate, 'yarn run gate');
+    assert.equal(read(r, 'package.json'), pkg, 'not rewritten');
+  });
+
+  test('rulesets: an origin on a look-alike host is not GitHub (nothing is queried); a real github.com remote is', () => {
+    const AT = '@';
+    const r = repo();
+    const bin = path.join(path.dirname(r.work), 'fake bin');
+    const log = path.join(path.dirname(r.work), 'gh.log');
+    fs.mkdirSync(bin);
+    const rec = path.join(bin, 'rec.mjs');
+    fs.writeFileSync(rec, [
+      "import fs from 'node:fs';",
+      "import { spawnSync } from 'node:child_process';",
+      'const [tool, ...args] = process.argv.slice(2);',
+      "if (tool === 'gh') { fs.appendFileSync(process.env.REC_LOG, args.join(' ') + '\\n'); process.stdout.write('[]'); process.exit(0); }",
+      "process.exit(spawnSync(process.env.REC_REAL_GIT, args, { stdio: 'inherit' }).status ?? 1);",
+    ].join('\n'));
+    for (const tool of ['git', 'gh']) {
+      if (process.platform === 'win32') fs.writeFileSync(path.join(bin, `${tool}.cmd`), `@"${process.execPath}" "${rec}" ${tool} %*\r\n`);
+      else { fs.writeFileSync(path.join(bin, tool), `#!/bin/sh\nexec "${process.execPath}" "${rec}" ${tool} "$@"\n`); fs.chmodSync(path.join(bin, tool), 0o755); }
+    }
+    const pk = Object.keys(r.e).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const e = { ...r.e, [pk]: `${bin}${path.delimiter}${r.e[pk]}`, REC_LOG: log, REC_REAL_GIT: GIT };
+    const rulesetsFor = (url) => {
+      git(r.work, r.e, 'remote', 'set-url', 'origin', url);
+      fs.writeFileSync(log, '');
+      const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--json'], { env: e, encoding: 'utf8', shell: false });
+      return { rs: JSON.parse(p.stdout).rulesets, calls: fs.readFileSync(log, 'utf8').trim() };
+    };
+    for (const url of ['https://notgithub.com/o/r.git', 'https://github.com.evil.example/o/r', `https://github.com${AT}evil.example/o/r`, 'https://evil.example/github.com/o/r']) {
+      const { rs, calls } = rulesetsFor(url);
+      assert.equal(rs.skipped, 'origin is not on GitHub', url);
+      assert.equal(calls, '', `${url}: no gh call`);
+    }
+    for (const url of ['https://github.com/o/sample-app.git', `git${AT}github.com:o/sample-app.git`]) {
+      const { calls } = rulesetsFor(url);
+      assert.match(calls, /repos\/o\/sample-app\/rulesets/, url);
+    }
+  });
+
+  test('rulesets: one time budget for the whole report; out of time it stops and says so', { timeout: 120000 }, () => {
+    const r = repo();
+    git(r.work, r.e, 'remote', 'set-url', 'origin', 'https://github.com/o/sample-app.git');
+    const bin = path.join(path.dirname(r.work), 'fake bin');
+    fs.mkdirSync(bin);
+    const fake = path.join(bin, 'fake-gh.mjs');
+    fs.writeFileSync(fake, [
+      "import { spawnSync } from 'node:child_process';",
+      'const [tool, ...args] = process.argv.slice(2);',
+      "if (tool === 'git') process.exit(spawnSync(process.env.REC_REAL_GIT, args, { stdio: 'inherit' }).status ?? 1);",
+      "const route = args.find((a) => a.startsWith('repos/'));",
+      "if (route === 'repos/o/sample-app/rulesets') { process.stdout.write(JSON.stringify(Array.from({ length: 50 }, (_, i) => ({ id: i + 1, name: `r${i + 1}` })))); process.exit(0); }",
+      'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);',
+      "process.stdout.write(JSON.stringify({ rules: [{ type: 'required_status_checks' }] }));",
+    ].join('\n'));
+    for (const tool of ['git', 'gh']) {
+      if (process.platform === 'win32') fs.writeFileSync(path.join(bin, `${tool}.cmd`), `@"${process.execPath}" "${fake}" ${tool} %*\r\n`);
+      else { fs.writeFileSync(path.join(bin, tool), `#!/bin/sh\nexec "${process.execPath}" "${fake}" ${tool} "$@"\n`); fs.chmodSync(path.join(bin, tool), 0o755); }
+    }
+    const pk = Object.keys(r.e).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const e = { ...r.e, [pk]: `${bin}${path.delimiter}${r.e[pk]}`, REC_REAL_GIT: GIT, REPO_DEFAULTS_RULESET_BUDGET_MS: '5000' };
+    const started = Date.now();
+    const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--json'], { env: e, encoding: 'utf8', shell: false });
+    assert.ok(Date.now() - started < 30000, `bounded (${Date.now() - started} ms)`);
+    const rs = JSON.parse(p.stdout).rulesets;
+    assert.match(rs.incomplete, /ran out of time; \d+ of 50 rulesets were read in full/);
+    assert.ok(rs.list.length >= 1 && rs.list.length < 50, 'what it read is kept');
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

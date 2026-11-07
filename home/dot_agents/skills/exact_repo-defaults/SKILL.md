@@ -31,7 +31,7 @@ The global rule `repo-defaults` (`~/.agents/docs/agents/repo-defaults.md`) says 
 
 ## Left for separate PRs (from `--inspect`)
 
-- **PR-gating CI**: workflows triggered by `pull_request`, `pull_request_target` or `merge_group`, and rulesets with required checks or a merge queue. Remove them in their own PR (`pr-standards`); keep release and deploy workflows and non-gating backstops. Ruleset edits are the owner's.
+- **PR-gating CI**: workflows triggered by `pull_request`, `pull_request_target` or `merge_group`, and rulesets with required checks or a merge queue. Remove them in their own PR (`pr-standards`); keep release and deploy workflows and non-gating backstops. Ruleset edits are the owner's. `--inspect` does not check classic branch protection: before that PR deletes the workflows, check with the owner which required checks branch protection still demands.
 - **Secrets**: env files with values (`.env`, `.env.production`, ...; not templates such as `.env.example`, and not `.env.local`, which worktree setup writes from `.env.op`). Move them into the 1Password vault `agent-repos` with `node "$HOME/.agents/bin/agent-secret.mjs" import` and commit `.env.op` (format: `assets/env.op.example`). A tracked env file holding values means a leaked secret: tell the owner and rotate it.
 
 ## Assets

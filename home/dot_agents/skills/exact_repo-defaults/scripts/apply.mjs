@@ -356,7 +356,8 @@ function yarnInstall(root, pkg) {
 
 export function detect(root) {
   const has = (f) => fs.existsSync(path.join(root, f));
-  const pkg = json(readText(path.join(root, 'package.json'), root) ?? 'null').value || null;
+  // A leading byte-order mark is not JSON: dropped before parsing (the file is only read).
+  const pkg = json((readText(path.join(root, 'package.json'), root) ?? 'null').replace(/^\uFEFF/, '')).value || null;
   let pm = null;
   let install = null;
   if (has('pnpm-lock.yaml')) { pm = 'pnpm'; install = 'pnpm install --frozen-lockfile'; }
@@ -485,6 +486,8 @@ function todos(root) {
 // from `.env.op`, and `.env.local.pre-op` is a source that import already retired.
 function envRole(f) {
   if (/^\.env\.(example|sample|template|dist)$/.test(f)) return 'template';
+  // .env.local.example and the like: probably a template, but only a look at it can tell.
+  if (/^\.env\..+\.(example|sample|template|dist)$/.test(f)) return 'template-candidate';
   if (f === '.env.local') return 'generated';
   if (f === '.env.local.pre-op') return 'retired';
   return 'source';
@@ -558,6 +561,54 @@ function envFiles(root) {
   return { envOp: op === null ? null : { refs: refs.length, foreignVaultRefs: foreign }, envOpIgnored, files: out, nestedIncomplete };
 }
 
+const GATING_TRIGGERS = ['pull_request_target', 'pull_request', 'merge_group'];
+
+// A YAML line without its comment: a `#` at the start or after a space, outside quotes.
+function stripYamlComment(line) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) { if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") q = c;
+    else if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
+// The event names a workflow's `on:` names: as a scalar or flow list on the `on:` line, or as
+// keys or `- item`s in its block, which runs to the next top-level key (a top-level `- item`
+// belongs to the block). Comments are dropped and quoted values are not names.
+function workflowTriggers(text) {
+  const lines = String(text).split(/\r?\n/).map(stripYamlComment);
+  const start = lines.findIndex((l) => /^(on|"on"|'on')\s*:/.test(l));
+  if (start < 0) return [];
+  const names = new Set();
+  const word = (s) => s.replace(/^['"]|['"]$/g, '').trim();
+  const head = lines[start].replace(/^(on|"on"|'on')\s*:/, '').trim();
+  if (head) {
+    // `on: push`, `on: [push, pull_request]`, `on: {pull_request: {...}}`
+    for (const part of head.replace(/[[\]{}]/g, ',').split(',')) {
+      const n = word(part.split(':')[0]);
+      if (n) names.add(n);
+    }
+  }
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim()) continue;
+    if (/^\S/.test(l) && !/^-\s/.test(l)) break;
+    let m;
+    if ((m = l.match(/^\s*-\s+(['"]?[A-Za-z_]+['"]?)\s*$/))) names.add(word(m[1]));
+    else if ((m = l.match(/^(\s*)(['"]?[A-Za-z_]+['"]?)\s*:/))) {
+      // Only the block's own keys (its first indent level), not keys nested under an event.
+      const indent = m[1].length;
+      const first = lines.slice(start + 1, i + 1).find((x) => x.trim() && /^\s*['"]?[A-Za-z_]+['"]?\s*:/.test(x));
+      const firstIndent = first ? first.match(/^\s*/)[0].length : indent;
+      if (indent === firstIndent) names.add(word(m[2]));
+    }
+  }
+  return [...names];
+}
+
 // Workflows that run on pull requests or the merge queue gate PRs; release/deploy ones do not.
 // A folder that cannot be listed (a file, no permission) is reported as { error }, so it never
 // stops the report or loses the actions already applied.
@@ -571,13 +622,37 @@ function gatingWorkflows(root) {
     const text = readText(path.join(dir, f), root);
     // One that cannot be read (a folder, no permission, a link out of the repo) might gate PRs.
     if (text === null) { out.push({ file: `.github/workflows/${f}`, triggers: [], unreadable: true }); continue; }
-    // The `on:` block runs to the next top-level key (or the end of the file).
-    const on = text.match(/^(on|"on"|'on'):[^\n]*\n?(?:[ \t#][^\n]*\n?|\r?\n)*/m);
-    const section = on ? on[0] : text;
-    const triggers = ['pull_request_target', 'pull_request', 'merge_group'].filter((t) => new RegExp(`\\b${t}\\b`).test(section));
-    if (triggers.length) out.push({ file: `.github/workflows/${f}`, triggers });
+    const triggers = workflowTriggers(text).filter((t) => GATING_TRIGGERS.includes(t));
+    if (triggers.length) out.push({ file: `.github/workflows/${f}`, triggers: GATING_TRIGGERS.filter((t) => triggers.includes(t)) });
   }
   return out;
+}
+
+// owner/name when a remote URL's host is exactly github.com (https, ssh://, or scp style
+// form "user-at-github.com:owner/name"); look-alike hosts and ambiguous URLs give null, so no ruleset of
+// another repo is ever read. Only reports use this; a mirror origin just skips the report.
+function githubRepoOf(raw) {
+  const url = String(raw).trim();
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f\\?#]/.test(url) || (url.match(/@/g) || []).length > 1) return null;
+  let host;
+  let pathPart;
+  const s = url.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/]*)(\/.*)$/);
+  if (s) {
+    if (!['https', 'ssh'].includes(s[1].toLowerCase())) return null;
+    const a = s[2].match(/^(?:[^@]*@)?([^@:]+)(?::\d{1,5})?$/);
+    if (!a) return null;
+    host = a[1];
+    pathPart = s[3];
+  } else {
+    const a = url.match(/^(?:[A-Za-z0-9._-]+@)?([^@:/]+):([^/].*)$/);
+    if (!a) return null;
+    host = a[1];
+    pathPart = `/${a[2]}`;
+  }
+  if (host.toLowerCase() !== 'github.com') return null;
+  const p = pathPart.match(/^\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/);
+  return p ? `${p[1]}/${p[2]}` : null;
 }
 
 // The rules that gate PRs on CI; every other rule (deletion, force-push, reviews) stays.
@@ -591,30 +666,48 @@ const RULESET_MAX_PAGES = 20;
 function rulesets(root, offline) {
   if (offline) return { skipped: 'offline' };
   const remote = git(['remote', 'get-url', 'origin'], root);
-  const m = remote.ok ? remote.out.match(/github\.com[:/]+([^/\s]+)\/([^/\s]+?)(\.git)?\/?$/i) : null;
-  if (!m) return { skipped: 'origin is not on GitHub' };
-  const route = `repos/${m[1]}/${m[2]}/rulesets`;
+  const slug = remote.ok ? githubRepoOf(remote.out) : null;
+  if (!slug) return { skipped: 'origin is not on GitHub' };
+  const route = `repos/${slug}/rulesets`;
+  // One time budget for the whole report (REPO_DEFAULTS_RULESET_BUDGET_MS overrides 2 min):
+  // each call gets what is left (at most 30 s); out of time, it stops with what it has.
+  const v = Number(process.env.REPO_DEFAULTS_RULESET_BUDGET_MS);
+  const deadline = Date.now() + (Number.isFinite(v) && v > 0 ? v : 120000);
+  let outOfTime = false;
   const api = (r, params = []) => {
-    const c = child('gh', ['api', '--method', 'GET', r, ...params.flatMap((x) => ['-f', x])], root, { timeout: 30000 });
+    const left = deadline - Date.now();
+    if (left <= 0) { outOfTime = true; return undefined; }
+    const c = child('gh', ['api', '--method', 'GET', r, ...params.flatMap((x) => ['-f', x])], root, { timeout: Math.min(30000, left) });
+    if (Date.now() >= deadline && c.status !== 0) outOfTime = true;
     return c.status === 0 ? json(c.stdout).value : undefined;
   };
   const all = [];
   let incomplete = null;
   for (let page = 1; ; page++) {
     if (page > RULESET_MAX_PAGES) { incomplete = `more than ${RULESET_MAX_PAGES * RULESET_PAGE} rulesets; only the first ${all.length} were checked`; break; }
-    const v = api(route, [`per_page=${RULESET_PAGE}`, `page=${page}`]);
-    if (!Array.isArray(v)) {
-      if (page === 1) return { skipped: 'gh api failed (no gh, no access, or no network)' };
-      incomplete = `page ${page} of the ruleset list could not be read; only the first ${all.length} were checked`;
+    const pageData = api(route, [`per_page=${RULESET_PAGE}`, `page=${page}`]);
+    if (!Array.isArray(pageData)) {
+      if (page === 1 && !outOfTime) return { skipped: 'gh api failed (no gh, no access, or no network)' };
+      incomplete = outOfTime ? `the ruleset check ran out of time listing page ${page}; ${all.length} listed so far` : `page ${page} of the ruleset list could not be read; only the first ${all.length} were checked`;
       break;
     }
-    all.push(...v.filter((x) => x && typeof x === 'object'));
-    if (v.length < RULESET_PAGE) break;
+    all.push(...pageData.filter((x) => x && typeof x === 'object'));
+    if (pageData.length < RULESET_PAGE) break;
   }
   const list = [];
   const unreadable = [];
+  let checked = 0;
   for (const x of all) {
+    if (outOfTime || Date.now() >= deadline) {
+      incomplete = `the ruleset check ran out of time; ${checked} of ${all.length} rulesets were read in full (the rest are not reported)`;
+      break;
+    }
     const d = Number.isSafeInteger(x.id) ? api(`${route}/${x.id}`) : undefined;
+    if (outOfTime) {
+      incomplete = `the ruleset check ran out of time; ${checked} of ${all.length} rulesets were read in full (the rest are not reported)`;
+      break;
+    }
+    checked++;
     if (!d || typeof d !== 'object' || !Array.isArray(d.rules)) { unreadable.push({ name: x.name, id: x.id ?? null }); continue; }
     const gating = [...new Set(d.rules.map((r) => r?.type).filter((t) => GATING_RULES.has(t)))];
     if (gating.length) list.push({ name: x.name, enforcement: x.enforcement, target: x.target, rules: gating });
@@ -703,11 +796,12 @@ function main() {
     if (ev.env.envOpIgnored) L.push('WARN  .env.op would be ignored by a .gitignore rule: add `!.env.op` to .gitignore so it is committed');
     if (mode !== 'check') {
       for (const e of ev.env.files) {
-        const tracked = e.tracked && e.role !== 'template' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
+        const tracked = e.tracked && e.role !== 'template' && e.role !== 'template-candidate' ? ' (TRACKED IN GIT: remove it and rotate)' : '';
         if (e.dangling) L.push(`WARN  ${e.file}: a link to nothing`);
         else if (e.outside) L.push(`WARN  ${e.file}: a link that leaves the repo, so it was not read${tracked}; check it by hand`);
         else if (e.unreadable) L.push(`WARN  ${e.file}: could not be read${tracked}; check it by hand`);
         else if (e.missing) L.push(`WARN  ${e.file}: tracked in git but not in the checkout (still in history: rotate its values)`);
+        else if (e.role === 'template-candidate') L.push(`INFO  ${e.file}: looks like a template, ${e.keys} keys${e.tracked ? ' (tracked in git)' : ''}; check by hand that it holds no real values (rotate any it does)`);
         else if (e.role === 'source') L.push(`INFO  ${e.file}: ${e.keys} keys${tracked}; migrate with agent-secret import`);
         else L.push(`INFO  ${e.file}: ${e.role}, ${e.keys} keys${tracked}`);
       }

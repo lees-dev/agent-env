@@ -357,7 +357,7 @@ function githubSlug(raw) {
     pathPart = rest.slice(slash);
     const kind = scheme[1].toLowerCase();
     const m = kind === 'https'
-      ? authority.match(/^(?:[A-Za-z0-9._~%!$&'()*+,;=-]+(?::[A-Za-z0-9._~%!$&'()*+,;=-]*)?@)?([^@:]+)(?::(443))?$/)
+      ? authority.match(/^(?:[A-Za-z0-9._~%!$&'()*+,;=:-]*@)?([^@:]+)(?::(443))?$/)
       : kind === 'ssh' ? authority.match(/^(?:[A-Za-z0-9._-]+@)?([^@:]+)(?::\d{1,5})?$/) : null;
     if (!m) return null;
     host = m[1];
@@ -627,11 +627,24 @@ export class LandingLock {
   // for another reason (a token that cannot create refs, a protected name): that is an error to
   // fix, not a busy lock. Only the HTTP status is reported, never the API's own message.
   acquire({ baseSha, baseTree }) {
+    // A lock already there: busy (or stale) without making a lock commit for nothing. Taking
+    // the lock is still the atomic create below, with its own time stamp.
+    const present = this.read();
+    if (present) return { held: false, holder: present, stale: isStale(present, this.ttlMin) };
     for (let attempt = 1; ; attempt++) {
       const sha = this.makeCommit(baseTree, baseSha);
       const r = this.gh.api('POST', this.route('refs'), { fields: { ref: `refs/heads/${LOCK_REF}`, sha } });
       if (r.ok) { this.commit = sha; heldLock = this; return { held: true }; }
-      if (r.status !== 422) throw new LandError(`could not create the lock ref (HTTP ${r.status})`);
+      if (r.status !== 422) {
+        // The answer was lost (a network error, a 5xx): the create may still have happened.
+        // Only our own commit at the ref is ours to adopt; another holder's is busy; nothing
+        // there yet is not proof the lock is free, so it is reported, never retried blind.
+        let now = null;
+        try { now = this.read(); } catch { now = null; }
+        if (now?.sha === sha) { this.commit = sha; heldLock = this; return { held: true }; }
+        if (now) return { held: false, holder: now, stale: isStale(now, this.ttlMin) };
+        throw new LandError(`creating the landing lock ref failed (HTTP ${r.status}) and its outcome is unknown: check refs/heads/${LOCK_REF} in ${this.gh.repo} before running again`);
+      }
       const holder = this.read();
       if (holder) return { held: false, holder, stale: isStale(holder, this.ttlMin) };
       if (attempt >= 3) {
@@ -721,12 +734,16 @@ export class LandingLock {
 }
 
 // What to tell the user when release() kept the lock.
+// The command deletes exactly this lock (a lease on its sha): if another lander has taken the
+// lock since, git refuses it, and that lock must be left alone.
 export function retainedLockMessage(lock) {
-  const remove = `git push --no-verify origin :refs/heads/${LOCK_REF}`;
+  const sha = lock.retained?.sha || lock.commit;
+  const remove = `git push --no-verify --force-with-lease=refs/heads/${LOCK_REF}:${sha} origin :refs/heads/${LOCK_REF}`;
+  const lease = 'it deletes only this lock; if git refuses it (stale info), another lander holds the lock now: leave it';
   if (lock.keepReason) {
-    return `the landing lock is kept because ${lock.keepReason}; stop that command's processes in the lander checkout first, then remove the lock with: ${remove}`;
+    return `the landing lock is kept because ${lock.keepReason}; once that command's processes in the lander checkout have stopped and no lander run is active, remove it with: ${remove} (${lease})`;
   }
-  return `the landing lock could not be released (${lock.retained?.reason}); it blocks every lander until it is deleted, or reclaimed as stale after its ttl (${lock.ttlMin} min); once no lander run is active, remove it with: ${remove}`;
+  return `the landing lock could not be released (${lock.retained?.reason}); it blocks every lander until it is deleted, or reclaimed as stale after its ttl (${lock.ttlMin} min); once no lander run is active, remove it with: ${remove} (${lease})`;
 }
 
 export function baseTreeOf(cwd, ref) {
@@ -773,8 +790,9 @@ export function parseLanding(body) {
   for (const raw of lines) {
     const l = strip(raw);
     let m;
-    if ((m = l.match(/^Gate:\s*pass\s*@\s*([0-9a-f]{7,40})\b\s*(.*)$/i))) gates.push({ sha: m[1], note: m[2].replace(/^\(|\)$/g, '') });
-    else if ((m = l.match(/^Gate:\s*pending\s*@\s*([0-9a-f]{40})\b/i))) pending.push(m[1]);
+    // SHAs are matched case-insensitively and kept in lower case, as git and GitHub write them.
+    if ((m = l.match(/^Gate:\s*pass\s*@\s*([0-9a-f]{7,40})\b\s*(.*)$/i))) gates.push({ sha: m[1].toLowerCase(), note: m[2].replace(/^\(|\)$/g, '') });
+    else if ((m = l.match(/^Gate:\s*pending\s*@\s*([0-9a-f]{40})\b/i))) pending.push(m[1].toLowerCase());
     else if ((m = l.match(/^Queued:\s*(\S+)/i))) queuedAt = m[1];
     else if ((m = l.match(/^Bounced:\s*(\S+)\s*(.*)$/i))) bounces.push({ at: m[1], reason: m[2] });
   }

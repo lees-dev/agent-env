@@ -25,7 +25,7 @@ A repo describes itself in `.agents/repo.json` (version 1). Every key is optiona
 | `base` | `origin/HEAD`, else `main` | Base branch |
 | `env.template`, `env.output` | `.env.op`, `.env.local` | 1Password references in, injected file out (must be git-ignored and untracked) |
 | `ports` | `{}` | `{"PORT": 3000}`: each name gets `base + hash % 900`, probed free, stable per worktree |
-| `setup`, `gate`, `affectedGate` | `[]` | Commands, split into argv without a shell. Use a script for pipes or `&&` |
+| `setup`, `gate`, `affectedGate` | `[]` | Commands, split into argv without a shell. Use a script for pipes or `&&`. A gate (and a sweep) must stop every process it starts before it exits; setup may start services the gate uses, and the gate stops them. The lander stops what a command started only when it times out or loses the lock |
 | `ghWrapper` | none | Command that replaces `gh` (for example an identity wrapper), split like `setup` |
 | `branchPattern` | `^agent/([A-Z]+-\d+)` | Group 1 is the ticket id |
 | `remoteBranchDelete` | `^(agent\|revert)/` | Merged branches matching this lose their remote head at teardown |

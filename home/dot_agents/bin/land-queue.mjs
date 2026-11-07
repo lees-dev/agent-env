@@ -543,7 +543,8 @@ async function runRepoSteps(t, opts, report) {
 }
 
 async function unpauseRepo(t) {
-  const ctx = context(t);
+  // Only the wide sweep runs here: the landing gate is not needed.
+  const ctx = context(t, { needGate: false });
   const { gh, cfg } = ctx;
   if (!gh.isPaused()) return { repo: t.repo, paused: false, sweep: null, note: 'not paused' };
   // Nothing can show the base is green without a sweep: the pause stays for the owner to clear.
@@ -556,17 +557,26 @@ async function unpauseRepo(t) {
       return { repo: t.repo, paused: true, sweep: null, busy: true, note: probe.stale.length ? 'the landing lock is stale; the lander reclaims it' : 'the landing lock is busy; try again after the lander finishes' };
     }
     let r;
+    // The pause is cleared while the lock is still held, after the green sweep: once the lock
+    // is released, another lander's red sweep may set a new pause, which must not be cleared.
+    let cleared = false;
+    let clearError = null;
     try {
       r = await runSweep(ctx);
       sweep = { ok: r.ok, cmd: r.cmd, status: r.status };
+      if (r.ok && !r.lost && !r.stuck && ctx.lock.stillHeld()) {
+        try { gh.setPaused(false); cleared = true; } catch (e) { clearError = firstLine(e?.message || e); }
+      } else if (r.ok && !r.lost && !r.stuck) {
+        r = { ...r, ok: false, lost: true };
+      }
     } finally {
       if (!releaseLock(ctx, probe)) process.stderr.write(`WARNING: ${probe.alerts.at(-1)}\n`);
     }
     if (r.lost) return { repo: t.repo, paused: true, sweep, note: 'the landing lock was lost during the sweep; the pause stays', lockRetained: probe.lockRetained || null };
     if (r.stuck || r.timedOut) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} did not finish (${r.summary}); the pause stays`, lockRetained: probe.lockRetained || null };
     if (!r.ok) return { repo: t.repo, paused: true, sweep, note: `wide sweep on ${cfg.base} is still red (${r.summary})`, lockRetained: probe.lockRetained || null };
+    if (!cleared) return { repo: t.repo, paused: true, sweep, note: `the sweep is green, but the pause could not be cleared (${clearError}); clear it again with land-queue unpause`, lockRetained: probe.lockRetained || null };
   }
-  gh.setPaused(false);
   return { repo: t.repo, paused: false, sweep, note: 'cleared AGENT_LANDING_PAUSED' };
 }
 

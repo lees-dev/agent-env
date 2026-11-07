@@ -209,6 +209,8 @@ function api(rest) {
       s.variables[v[1]] = o.f.value;
     } else if (method === 'DELETE') {
       if (!(v[1] in s.variables)) { save(s); die('Not Found', 404); }
+      // Whether the landing lock was held when the pause was cleared (unpause's order).
+      if (v[1] === 'AGENT_LANDING_PAUSED') s.pauseClearedWithLock = git('rev-parse', '--verify', 'refs/heads/agent-landing-lock').ok;
       delete s.variables[v[1]];
     }
     save(s);
@@ -246,6 +248,20 @@ function api(rest) {
     if (s.lockApiDown) die('Server Error', 500);
     // Test hook: the next refFail422 creates fail with 422 and create nothing (not contention).
     if (s.refFail422 > 0) { s.refFail422 -= 1; save(s); die('Validation Failed', 422); }
+    // Test hook: the create's answer is lost (no HTTP status) after the ref was written: with
+    // 'own' the caller's commit is there; with 'foreign' another lander's commit is.
+    if (s.refCreateLostAnswer) {
+      const kind = s.refCreateLostAnswer;
+      delete s.refCreateLostAnswer;
+      let sha = o.f.sha;
+      if (kind === 'foreign') {
+        sha = git('commit-tree', git('rev-parse', `${o.f.sha}^{tree}`).out, '-m', `agent-landing-lock host=other pid=1 at=${new Date().toISOString()} ttl=45`).out;
+        s.foreignLock = sha;
+      }
+      git('update-ref', o.f.ref, sha, '');
+      save(s);
+      die('read: connection reset by peer');
+    }
     const r = git('update-ref', o.f.ref, o.f.sha, '');
     if (!r.ok) die('Reference already exists', 422);
     process.stdout.write(JSON.stringify({ ref: o.f.ref, object: { sha: o.f.sha } }));

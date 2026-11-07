@@ -259,12 +259,17 @@ describe('lib/land.mjs', () => {
       'http://github.com/o/r', 'https://github.com/o/r?x=1', 'https://github.com/o/r#f', 'https://github.com:8443/o/r',
       `git${AT}github.com:/o/r`, `https://u\\${AT}github.com/o/r`, `https://a${AT}b${AT}github.com/o/r`, 'github.com:o/r/extra',
       'https://github.com/o', 'git://github.com/o/r', 'https://%67ithub.com/o/r', 'https://github.com./o/r', 'https://github.com/o/r\tx',
+      // Malformed authorities around the userinfo: still refused.
+      `https://localhost:${cred}?${AT}github.com/o/r`, 'https://github.com:/o/r', 'https://github.com:443:1/o/r', `https://user:pass${AT}github.com:22/o/r`,
     ]) {
       assert.equal(target(url), null, `refused: ${JSON.stringify(url)}`);
     }
     for (const url of [
       'https://github.com/o/r.git', 'https://github.com:443/o/r', `https://x-access-token:${cred}${AT}github.com/o/r.git`,
       `ssh://git${AT}github.com:22/o/r.git`, `ssh://git${AT}github.com/o/r`, `git${AT}github.com:o/r.git`, 'https://GitHub.com/o/r/',
+      // userinfo as git reads it (proven through a local proxy: git connects to github.com:443):
+      // a password with a colon, an empty user, an empty userinfo.
+      `https://user:pa:ss${AT}github.com/o/r.git`, `https://:${cred}${AT}github.com/o/r.git`, `https://${AT}github.com/o/r.git`,
     ]) {
       assert.equal(target(url), 'o/r', `accepted: ${JSON.stringify(url)}`);
     }
@@ -1861,8 +1866,23 @@ describe('land-queue', () => {
     const rep = runQueue(t);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
     assert.ok(rep.lockRetained?.sha);
-    assert.match(rep.alerts.join('\n'), /landing lock could not be released.*git push --no-verify origin :refs\/heads\/agent-landing-lock/);
+    assert.match(rep.alerts.join('\n'), /landing lock could not be released.*git push --no-verify --force-with-lease=refs\/heads\/agent-landing-lock:[0-9a-f]{40} origin :refs\/heads\/agent-landing-lock/);
     assert.equal(lockExists(t), true);
+    // The printed command deletes only that lock: with origin reachable again, a replacement lock
+    // (another lander's) survives it; the retained one is deleted by it.
+    const cmd = rep.alerts.join('\n').match(/remove it with: (git push \S+ \S+ origin :refs\/heads\/agent-landing-lock)/)[1].split(' ');
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', t.bare);
+    const retained = lockSha(t);
+    setLock(t, 0);
+    const replacement = lockSha(t);
+    const refused = spawnSync(cmd[0], cmd.slice(1), { cwd: t.work, env: t.env, encoding: 'utf8' });
+    assert.notEqual(refused.status, 0, 'the lease refuses a lock that changed');
+    assert.equal(lockSha(t), replacement, 'the replacement holder keeps its lock');
+    sh(t.bare, t.env, 'update-ref', 'refs/heads/agent-landing-lock', retained);
+    const ok = spawnSync(cmd[0], cmd.slice(1), { cwd: t.work, env: t.env, encoding: 'utf8' });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(lockExists(t), false, 'the retained lock is deleted');
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', path.join(t.tmp, 'no such remote.git'));
     const t2 = setup();
     const head = makePr(t2, 2);
     sh(t2.work, t2.env, 'remote', 'set-url', '--push', 'origin', path.join(t2.tmp, 'no such remote.git'));
@@ -1985,6 +2005,74 @@ describe('land-queue', () => {
     assert.deepEqual(prOf(t, 1).labels, []);
     const counts = path.join(t.home, '.agents', 'state', 'land-queue.json');
     assert.equal(JSON.parse(fs.readFileSync(counts, 'utf8'))['o/r'].merges, 1);
+  });
+
+  // SHAs in the Landing section count whatever their case: GitHub and git print lower case.
+  test('run: upper-case SHAs in Gate: pass and Gate: pending lines are the same heads', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t);
+    const p = s.prs.find((x) => x.number === 1);
+    p.body = p.body.replace(/(Gate: pass @ )([0-9a-f]{40})/, (_, a, sha) => a + sha.toUpperCase());
+    saveState(t, s);
+    assert.match(prOf(t, 1).body, /Gate: pass @ [0-9A-F]{40}/);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.bounced, []);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    // A pending line written in upper case is recognised as the pushed gated head too.
+    const t2 = setup();
+    queuePr(t2, 1);
+    advanceMain(t2, 'other.txt', 'x\n');
+    const s2 = state(t2); s2.failBodyEditMatching = '(lander rebase)'; saveState(t2, s2);
+    assert.equal(tool(t2, LAND_QUEUE, 'run', '--repo', 'o/r', '--json').status, 1);
+    const s3 = state(t2);
+    const p3 = s3.prs.find((x) => x.number === 1);
+    p3.body = p3.body.replace(/(Gate: pending @ )([0-9a-f]{40})/, (_, a, sha) => a + sha.toUpperCase());
+    saveState(t2, s3);
+    const rep2 = runQueue(t2);
+    assert.deepEqual(rep2.bounced, []);
+    assert.deepEqual(rep2.merged.map((m) => m.pr), [1]);
+  });
+
+  test('lock: a busy lock makes no lock commit while waiting', () => {
+    const t = setup();
+    const head = makePr(t, 1);
+    setLock(t, 0);
+    t.env.AGENT_LAND_LOCK_WAIT_MS = '600';
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 2);
+    assert.match(r.out, /^REFUSED the landing lock stayed busy/);
+    assert.equal(state(t).calls.some((c) => c.cmd === 'api' && c.method === 'POST' && c.route === 'commits'), false, 'no commit made for a known busy lock');
+  });
+
+  for (const kind of ['own', 'foreign']) {
+    test(`lock: a create whose answer is lost: ${kind === 'own' ? 'our own ref is adopted and released' : 'another holder\'s ref is never adopted'}`, () => {
+      const t = setup();
+      queuePr(t, 1);
+      const s = state(t); s.refCreateLostAnswer = kind; saveState(t, s);
+      const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+      const rep = JSON.parse(r.out);
+      if (kind === 'own') {
+        assert.equal(r.status, 0, r.err);
+        assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+        assert.equal(lockExists(t), false, 'adopted, then released');
+      } else {
+        assert.equal(rep.busy, true, 'another holder: busy');
+        assert.deepEqual(rep.merged, []);
+        assert.equal(lockSha(t), state(t).foreignLock, 'the other holder keeps its lock');
+      }
+    });
+  }
+
+  test('unpause needs no landing gate (only the wide sweep), and clears the pause while it still holds the lock', () => {
+    const t = setup({ gate: [], affectedGate: [], wideSweep: 'node scripts/sweep.mjs' });
+    const s = state(t); s.variables = { AGENT_LANDING_PAUSED: '1' }; saveState(t, s);
+    const r = tool(t, LAND_QUEUE, 'unpause', '--repo', 'o/r', '--json');
+    assert.equal(r.status, 0, r.err || r.out);
+    assert.equal(JSON.parse(r.out).paused, false);
+    assert.equal('AGENT_LANDING_PAUSED' in state(t).variables, false);
+    assert.equal(state(t).pauseClearedWithLock, true, 'cleared before the lock was released');
+    assert.equal(lockExists(t), false);
   });
 
   test('run: a pushed rebased head whose gate line was not written is recognised next run (no bounce)', () => {
