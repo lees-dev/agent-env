@@ -436,7 +436,7 @@ describe('repo-defaults apply.mjs', () => {
   });
 
   test('skill commands use "$HOME/..." (PowerShell 5.1 passes ~ to node literally)', () => {
-    for (const f of [path.join(SKILL, 'SKILL.md'), path.join(SKILL, 'assets', 'agents-block.md'), path.join(SKILL, '..', 'exact_land-queue', 'SKILL.md')]) {
+    for (const f of [path.join(SKILL, 'SKILL.md'), path.join(SKILL, 'assets', 'agents-block.md'), path.join(SKILL, 'assets', 'env.op.example'), path.join(SKILL, '..', 'exact_land-queue', 'SKILL.md')]) {
       assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /node ~\//, f);
     }
   });
@@ -1039,6 +1039,16 @@ describe('repo-defaults apply.mjs', () => {
       '.github/workflows/n.yml': 'on:\n  - push\n  - pull_request_target\njobs: {}\n',
       // Quoted names nested under an event are values, not events.
       '.github/workflows/o.yml': 'on:\n  push:\n    paths:\n      - "merge_group"\n    tags: ["pull_request"]\njobs: {}\n',
+      // A flow mapping over several lines: its keys are events, values nested in it are not.
+      '.github/workflows/p.yml': 'on: {push: {},\n  pull_request: {}}\njobs: {}\n',
+      '.github/workflows/q.yml': 'on: {push: {branches: [pull_request]},\n  workflow_dispatch: {}}\njobs: {}\n',
+      '.github/workflows/r.yml': 'on: {\n  "merge_group": {types: [checks_requested]}, # pull_request in a comment\n  push: {}\n}\njobs: {}\n',
+      // Flow continuations in column 0 (valid YAML): a sequence and a mapping.
+      '.github/workflows/s.yml': 'on: [push,\npull_request]\njobs: {}\n',
+      '.github/workflows/t.yml': 'on: [\npull_request_target\n]\njobs: {}\n',
+      '.github/workflows/u.yml': 'on: {push: {},\npull_request: {}}\njobs: {}\n',
+      // Never closed, then a top-level key: jobs and what is under it are not events.
+      '.github/workflows/v.yml': 'on: [push,\njobs:\n  pull_request: {}\n',
     });
     const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
     assert.deepEqual(JSON.parse(p.stdout).gatingWorkflows, [
@@ -1049,6 +1059,11 @@ describe('repo-defaults apply.mjs', () => {
       { file: '.github/workflows/j.yml', triggers: ['merge_group'] },
       { file: '.github/workflows/l.yml', triggers: ['pull_request_target'] },
       { file: '.github/workflows/n.yml', triggers: ['pull_request_target'] },
+      { file: '.github/workflows/p.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/r.yml', triggers: ['merge_group'] },
+      { file: '.github/workflows/s.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/t.yml', triggers: ['pull_request_target'] },
+      { file: '.github/workflows/u.yml', triggers: ['pull_request'] },
     ]);
   });
 
@@ -1125,6 +1140,30 @@ describe('repo-defaults apply.mjs', () => {
     const rs = JSON.parse(p.stdout).rulesets;
     assert.match(rs.incomplete, /ran out of time; \d+ of 50 rulesets were read in full/);
     assert.ok(rs.list.length >= 1 && rs.list.length < 50, 'what it read is kept');
+  });
+
+  test('t3.json: a name used twice is drift by itself; apply renames the kept one, keeps everything else, then is idempotent', () => {
+    const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
+    const custom = { name: 'Agent setup', command: 'npm run custom', icon: 'gear' };
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, custom] }) });
+    const item = run(r, '--inspect', '--json').json.items.find((i) => i.name === 't3.json');
+    assert.equal(item.status, 'outdated');
+    assert.match(item.detail, /1 script name\(s\) used twice/);
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 0, a.out);
+    const t3 = JSON.parse(read(r, 't3.json'));
+    assert.deepEqual(t3.scripts, [...want.scripts, { ...custom, name: 'Agent setup (kept)' }]);
+    const bytes = read(r, 't3.json');
+    const again = run(r, '--apply', '--json');
+    assert.equal(again.json.drift, 0);
+    assert.equal(read(r, 't3.json'), bytes);
+  });
+
+  test('.agents/repo.json: adding missing keys names them, and which still hold a TODO', () => {
+    const r = repo({ 'package.json': JSON.stringify({ name: 'x' }), '.agents/repo.json': JSON.stringify({ version: 1, repo: 'sample-app' }) });
+    const a = run(r, '--apply', '--json');
+    const line = a.json.actions.find((x) => /repo\.json/.test(x));
+    assert.match(line, /^added \d+ key\(s\) to \.agents\/repo\.json: .*\bgate\b.*\(fill in the TODO\(repo-defaults\) in .*\bgate\b/);
   });
 
   test('git and gh children never see OP_SERVICE_ACCOUNT_TOKEN', () => {

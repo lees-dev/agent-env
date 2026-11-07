@@ -294,6 +294,11 @@ function t3Json(root) {
   if (setupIdx < 0 || scripts[setupIdx].runOnWorktreeCreate !== true || scripts[setupIdx].async !== false) problems.push('no blocking Agent setup script');
   else if (firstCreate !== setupIdx) problems.push('another runOnWorktreeCreate script comes first (T3 runs only the first)');
   const tdIdx = scripts.findIndex(isTeardown);
+  // T3 shows one script per name: a repeated name hides a script.
+  const seenNames = new Set();
+  const repeated = new Set();
+  for (const s of scripts) { if (typeof s.name === 'string') { if (seenNames.has(s.name)) repeated.add(s.name); seenNames.add(s.name); } }
+  if (repeated.size) problems.push(`${repeated.size} script name(s) used twice (T3 shows only one of each)`);
   if (tdIdx < 0 || scripts[tdIdx].runOnSettle !== true) problems.push('no Agent teardown script');
   else if (firstSettle !== tdIdx) problems.push('another runOnSettle script comes first (T3 runs only the first)');
   if ([setupIdx, tdIdx].some((i) => i >= 0 && LEGACY_COMMANDS.includes(norm(scripts[i].command)))) {
@@ -447,7 +452,9 @@ function repoJson(root) {
         // the name detected from origin: existing .env.op references keep their prefix.
         for (const k of missing) out[k] = k === 'itemPrefix' && typeof cur.repo === 'string' && cur.repo ? cur.repo : tmpl[k];
         writeIn(root, p, `${JSON.stringify(out, null, 2)}\n`);
-        return `added ${missing.length} key(s) to .agents/repo.json`;
+        // Name what was added, and which of it still holds a TODO to fill in (step 4).
+        const todo = missing.filter((k) => JSON.stringify(out[k]).includes(TODO));
+        return `added ${missing.length} key(s) to .agents/repo.json: ${missing.join(', ')}${todo.length ? ` (fill in the ${TODO} in ${todo.join(', ')})` : ''}`;
       },
     };
   }
@@ -598,6 +605,43 @@ function stripYamlComment(line) {
   return line;
 }
 
+// How deep the brackets of a flow value still are at its end (quotes respected).
+function flowDepth(s) {
+  let depth = 0;
+  let q = null;
+  for (const c of s) {
+    if (q) { if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") q = c;
+    else if (c === '[' || c === '{') depth++;
+    else if (c === ']' || c === '}') depth--;
+  }
+  return depth;
+}
+
+// The top-level items of a flow value: a sequence's entries, a mapping's keys; a scalar is
+// itself. Quotes are removed from the result; nested values are skipped.
+function flowItems(s) {
+  const unquote = (x) => x.trim().replace(/^['"]|['"]$/g, '').trim();
+  if (!/^[[{]/.test(s)) return [unquote(s.split(':')[0])];
+  const isMap = s[0] === '{';
+  const items = [];
+  let depth = 0;
+  let q = null;
+  let cur = '';
+  let inKey = true;
+  for (const c of s) {
+    if (q) { if (depth === 1 && inKey) cur += c; if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") { q = c; if (depth === 1 && inKey) cur += c; continue; }
+    if (c === '[' || c === '{') { depth++; continue; }
+    if (c === ']' || c === '}') { depth--; if (depth === 0) { items.push(cur); cur = ''; } continue; }
+    if (depth !== 1) continue;
+    if (c === ',') { items.push(cur); cur = ''; inKey = true; continue; }
+    if (isMap && c === ':') { inKey = false; continue; }
+    if (inKey) cur += c;
+  }
+  return items.map(unquote).filter(Boolean);
+}
+
 // The event names a workflow's `on:` names: as a scalar or flow list on the `on:` line, or as
 // keys or `- item`s in its block, which runs to the next top-level key (a top-level `- item`
 // belongs to the block). Comments are dropped and quoted values are not names.
@@ -608,18 +652,26 @@ function workflowTriggers(text) {
   const names = new Set();
   const word = (s) => s.trim().replace(/^['"]|['"]$/g, '').trim();
   let head = lines[start].replace(/^(on|"on"|'on')\s*:/, '').trim();
-  // A flow sequence can continue across lines; do not consume the next top-level key.
-  for (let i = start + 1; head.startsWith('[') && !head.includes(']') && i < lines.length; i++) {
-    if (/^\S/.test(lines[i]) && !/^\]/.test(lines[i])) break;
-    head += ` ${lines[i].trim()}`;
+  // A flow value ([...] or {...}) can continue over lines, in any column, up to the line where
+  // its brackets close (outside quotes). One that never closes is malformed: only its indented
+  // lines are taken, so the next top-level key (jobs:) is never read as part of it.
+  if (/^[[{]/.test(head) && flowDepth(head) > 0) {
+    let acc = head;
+    let closed = false;
+    for (let i = start + 1; i < lines.length; i++) {
+      acc += ` ${lines[i].trim()}`;
+      if (flowDepth(acc) <= 0) { closed = true; break; }
+    }
+    if (closed) head = acc;
+    else {
+      for (let i = start + 1; i < lines.length && !/^\S/.test(lines[i]); i++) head += ` ${lines[i].trim()}`;
+    }
   }
   if (head) {
-    // `on: push`, `on: [push, pull_request]`, `on: {pull_request: {...}}`: an inline value has no
-    // block under it, so nothing after this line is an event.
-    for (const part of head.replace(/[[\]{}]/g, ',').split(',')) {
-      const n = word(part.split(':')[0]);
-      if (n) names.add(n);
-    }
+    // `on: push`, `on: [push, pull_request]`, `on: {push: {...}, pull_request: {}}`: the events
+    // are the flow's own items (a mapping's keys), never values nested inside them. An inline
+    // value has no block under it, so nothing after it is an event.
+    for (const n of flowItems(head)) if (/^[A-Za-z_]+$/.test(n)) names.add(n);
     return [...names];
   }
   // The block: events are its entries at one indent, the first entry's (a key, or a `- item`,

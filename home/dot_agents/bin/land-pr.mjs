@@ -14,7 +14,8 @@
 // is still ours. A moved base or anyone else in line queues the PR instead. Every change to the
 // PR (release-hold, merge, queue) is made under the landing lock on a fresh read; land-pr waits
 // up to 10 min for a busy lock, then refuses with nothing changed (a stale lock refuses at once).
-// Queue: label `queued`, write a `## Landing` section (`Gate: pass @ <sha>`). Unheld `queued` +
+// Queue: label `queued`, write a `## Landing` section (`Gate: pass @ <sha> base=<branch>`: the
+// gate is proof for that base only; the lander bounces a PR that targets another). Unheld `queued` +
 // `landing` PRs count toward the repo's capacity (maxQueued, default 5). When it is full, or
 // older PRs are already waiting, the PR gets `queue-waiting`; the lander admits it when a slot
 // frees. A PR already `queued` only gets its gated sha refreshed. A `queue-waiting` PR stays
@@ -51,7 +52,7 @@
 // .agents/repo.json) exit 1 (a config error exits 2); bad usage exits 2.
 import {
   Gh, LandError, LandingLock,
-  addHold, baseTreeOf, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
+  addHold, baseTreeOf, depName, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
   holderId, isAncestor, labelNames, listQueue, listWaiting, loadRepoConfig, mainCheckout, mergePinned, parseArgs, parseHolds,
   parseLanding, pollMs, print, removeHold, repoTop, resolveRepo, retainedLockMessage, setLabels, sweepDue, unmetDeps,
   validateLandingCommands, writeLanding,
@@ -70,7 +71,7 @@ function refusal(gh, pr, { ignoreHold = false } = {}) {
   if (labels.includes('landing')) return 'landing (the lander is landing it now)';
   if (!ignoreHold && labels.includes('queue-hold')) return 'queue-hold (held by the owner, a full stop or an agent editing it)';
   const deps = unmetDeps(gh, pr);
-  if (deps.length) return `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged`;
+  if (deps.length) return `Depends-on ${deps.map(depName).join(', ')} not merged`;
   if (gh.isPaused()) return 'repo paused (AGENT_LANDING_PAUSED=1)';
   return '';
 }
@@ -307,7 +308,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     if (why) return refuse(why);
     const prev = parseLanding(pr.body);
     const inLine = labelNames(pr).some((l) => l === 'queued' || l === 'queue-waiting');
-    const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString() });
+    const body = writeLanding(removeHold(pr.body, holder), { gateSha: sha, queuedAt: inLine && prev.queuedAt ? prev.queuedAt : new Date().toISOString(), base: want.base });
     // The label is the caller's only while nobody removed it since the caller's hold: a removal
     // after that (the owner cleared it, maybe set it again) makes the current label someone
     // else's. Unknown (no baseline, or the events cannot be read) counts as someone else's.
@@ -419,7 +420,8 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
   gh.ensureLabels();
   const prev = parseLanding(pr.body);
   const queuedAt = (queued || waitingNow) && prev.queuedAt ? prev.queuedAt : new Date().toISOString();
-  const body = writeLanding(pr.body, { gateSha: sha, queuedAt });
+  // The gate line records the base this run validated (its first read), with the gated sha.
+  const body = writeLanding(pr.body, { gateSha: sha, queuedAt, base: want.base });
   if (body !== pr.body) { gh.prEdit(n, { body }); pr.body = body; }
   const common = { pr: n, sha, refreshed: queued || waitingNow, requeue: blocked, released, current, lock: null };
 

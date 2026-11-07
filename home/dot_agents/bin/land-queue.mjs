@@ -38,6 +38,7 @@
 // Exit: 0 when every repo was processed (bounces included), 1 on an error, 2 on bad usage.
 import path from 'node:path';
 import {
+  depName,
   BOUNCE_MARKER, Gh, LandError, LandingLock,
   appendLanding, baseTreeOf, clearQueueLabels, confirmPending, bumpMergeCount, capacityUsed, captureToken, childEnv, classifyQueue, dueSweep, fetchBranch,
   firstLine, git, gitOk, isAncestor, isStale, labelNames, landerCheckout, listQueue, listWaiting, loadRepoConfig,
@@ -121,7 +122,7 @@ function recheck(gh, pr, want, expectHead, lock) {
   if (labelNames(p).includes('queue-hold')) return { requeue: 'queue-hold appeared' };
   if (p.isDraft) return { requeue: 'the PR was made a draft' };
   const deps = unmetDeps(gh, p);
-  if (deps.length) return { requeue: `Depends-on ${deps.map((d) => `#${d}`).join(', ')} not merged` };
+  if (deps.length) return { requeue: `Depends-on ${deps.map(depName).join(', ')} not merged` };
   if (gh.isPaused()) return { requeue: 'repo paused', paused: true };
   if (!lock.stillHeld()) return { requeue: 'the landing lock was lost', lost: true };
   return null;
@@ -145,7 +146,7 @@ function abort(gh, pr, r, stage, lock) {
 
 // ---------------------------------------------------------------- one PR
 
-async function landOne(ctx, pr) {
+async function landOne(ctx, pr, wantIn = null) {
   const { gh, cfg, mainRoot, lock, root } = ctx;
   // A retry after a moved base starts here again: nothing is changed unless the lock is ours.
   if (!lock.stillHeld()) return { aborted: { pr: pr.number, reason: 'the landing lock was lost before the landing' }, lost: true };
@@ -163,6 +164,13 @@ async function landOne(ctx, pr) {
     gated = pr.headRefOid;
   }
   if (!gated) return bounceOwned(ctx, pr, 'no `Gate: pass @ <sha>` line in the ## Landing section');
+  // The gate proves its sha against one base: the base on that same line. A line without a base
+  // proves none; a PR that now targets another base was never gated there. Both need a new gate
+  // and review on the PR's base, then land-pr; the lander never moves an old proof to a new base.
+  const gatedBase = parseLanding(pr.body).gatedBase;
+  if (!gatedBase) return bounceOwned(ctx, pr, 'the gate line names no base (`Gate: pass @ <sha> base=<branch>`): run the gate and the review on the PR base, then land-pr again');
+  const prBase = pr.baseRefName || cfg.base;
+  if (prBase !== gatedBase) return bounceOwned(ctx, pr, `the PR targets ${prBase}, but its gate ran against ${gatedBase}: re-gate and re-review on ${prBase}, then land-pr again`);
   if (!pr.headRefOid.startsWith(gated)) {
     // GitHub can lag behind a push: it may still show the head this lander replaced (the gate
     // before its last `lander rebase` gate). The branch itself decides: if origin already has the
@@ -177,8 +185,10 @@ async function landOne(ctx, pr) {
     return bounceOwned(ctx, pr, `head changed after the gate (head ${pr.headRefOid.slice(0, 12)}, gated ${gated.slice(0, 12)})`);
   }
   const head = pr.headRefOid;
-  const base = pr.baseRefName || cfg.base;
-  const want = { base, headRef: pr.headRefName };
+  // The base is the gated base; a retry keeps the base and head branch the first attempt
+  // validated (never a new target).
+  const want = wantIn || { base: gatedBase, headRef: pr.headRefName };
+  const { base } = want;
   const baseRef = `refs/remotes/origin/${base}`;
   const dir = landerCheckout(mainRoot, base);
   // Resets of the checkout happen only while this lander still owns the lock: after a loss it
@@ -262,7 +272,7 @@ async function landOne(ctx, pr) {
     if (pre) { if (!pre.lost) resetOwned(); return abort(gh, pr, pre, 'the push', lock); }
     // Record the gated rebased head before pushing it, as pending: if recording `pass` after the
     // push fails, the next run recognises the pushed head as this lander's gated one.
-    const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started)`);
+    const pendingBody = appendLanding(pr.body, `Gate: pending @ ${landSha} (lander rebase, push started) base=${base}`);
     gh.prEdit(pr.number, { body: pendingBody });
     pr.body = pendingBody;
     // The push runs the repo's pre-push hook: a landing step (lock refreshed, command timeout).
@@ -291,7 +301,7 @@ async function landOne(ctx, pr) {
   const first = recheck(gh, pr, want, landSha, lock);
   if (first) return abort(gh, pr, first, 'the merge', lock);
   fetchBranch(dir, base);
-  if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing` };
+  if (!isAncestor(baseRef, landSha, dir)) return { retry: true, note: `${base} moved during the landing`, want };
   const last = recheck(gh, pr, want, landSha, lock);
   if (last) return abort(gh, pr, last, 'the merge', lock);
   const m = await mergePinned(gh, cfg, { pr: pr.number, sha: landSha, cwd: root, lock });
@@ -494,11 +504,18 @@ async function runRepoSteps(t, opts, report) {
       if (!lost && q.eligible.length) {
         pr = q.eligible[0];
         // If the base moves before the merge, redo the rebase and validation (bounded).
+        let want = null;
         for (let k = 1; ; k++) {
-          res = await landOne(ctx, pr);
+          res = await landOne(ctx, pr, want);
           if (!res.retry) break;
           if (k >= MAX_BASE_RETRIES) { res = bounceOwned(ctx, pr, `could not land after ${k} tries: ${res.note}`); break; }
+          want = res.want;
           pr = gh.prView(pr.number);
+          // The retry's fresh read gets every check before any work: still open (closed or
+          // merged: `landing` goes, no bounce), the validated base and branch, no hold, not a
+          // draft, Depends-on met, no pause, the lock ours (else back to queued, no bounce).
+          const pre = recheck(gh, pr, want, pr.headRefOid, ctx.lock);
+          if (pre) { res = abort(gh, pr, pre, 'the retry', ctx.lock); break; }
         }
       }
       if (res?.merged) {
@@ -599,7 +616,7 @@ function statusRepo(t) {
 function statusText(s) {
   const lines = [`${s.repo}: ${s.paused ? 'PAUSED, ' : ''}lock ${s.lock ? `held by ${s.lock.host} pid ${s.lock.pid}, ${s.lock.ageMin} min${s.lock.stale ? ' (STALE)' : ''}` : 'free'}`];
   s.order.forEach((r, i) => lines.push(`  ${i + 1}. #${r.pr} p${r.priority} ${r.labels.join(',')} ${r.title}`));
-  for (const w of s.waiting) lines.push(`  waiting #${w.pr} on ${w.dependsOn.map((d) => `#${d}`).join(', ')}`);
+  for (const w of s.waiting) lines.push(`  waiting #${w.pr} on ${w.dependsOn.map(depName).join(', ')}`);
   if (s.queueWaiting.length) lines.push(`  queue full, waiting: ${s.queueWaiting.map((n) => `#${n}`).join(', ')}`);
   if (s.held.length) lines.push(`  held: ${s.held.map((n) => `#${n}`).join(', ')}`);
   if (!s.order.length && !s.waiting.length) lines.push('  queue empty');

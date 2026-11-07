@@ -785,41 +785,66 @@ export function parseLanding(body) {
   const bounces = [];
   // `Gate: pending @ <sha>`: the lander rebased and gated <sha>, then started its push; it
   // becomes `pass` once the push is recorded (see land-queue landOne).
+  // Each gate line names the base it was gated against: `Gate: pass @ <sha> [(note)] base=<branch>`.
+  // The gate's proof is that pair: only the last pass line's base counts (gatedBase), and a line
+  // without one (written before bases were recorded) proves no base at all.
   const pending = [];
+  const pendingBases = {};
   let queuedAt = null;
+  const baseOf = (rest) => {
+    const b = rest.match(/(?:^|\s)base=(\S+)\s*$/);
+    return { base: b ? b[1] : null, rest: b ? rest.slice(0, b.index).trim() : rest.trim() };
+  };
   for (const raw of lines) {
     const l = strip(raw);
     let m;
     // SHAs are matched case-insensitively and kept in lower case, as git and GitHub write them.
-    if ((m = l.match(/^Gate:\s*pass\s*@\s*([0-9a-f]{7,40})\b\s*(.*)$/i))) gates.push({ sha: m[1].toLowerCase(), note: m[2].replace(/^\(|\)$/g, '') });
-    else if ((m = l.match(/^Gate:\s*pending\s*@\s*([0-9a-f]{40})\b/i))) pending.push(m[1].toLowerCase());
-    else if ((m = l.match(/^Queued:\s*(\S+)/i))) queuedAt = m[1];
+    if ((m = l.match(/^Gate:\s*pass\s*@\s*([0-9a-f]{7,40})\b\s*(.*)$/i))) {
+      const { base, rest } = baseOf(m[2]);
+      gates.push({ sha: m[1].toLowerCase(), note: rest.replace(/^\(|\)$/g, ''), base });
+    } else if ((m = l.match(/^Gate:\s*pending\s*@\s*([0-9a-f]{40})\b\s*(.*)$/i))) {
+      pending.push(m[1].toLowerCase());
+      pendingBases[m[1].toLowerCase()] = baseOf(m[2]).base;
+    } else if ((m = l.match(/^Queued:\s*(\S+)/i))) queuedAt = m[1];
     else if ((m = l.match(/^Bounced:\s*(\S+)\s*(.*)$/i))) bounces.push({ at: m[1], reason: m[2] });
   }
   const text = String(body || '');
   const pm = text.match(/^[ \t]*(?:[-*][ \t]+)?Linear-Priority:[ \t]*([0-4])\b/im);
   let priority = pm ? Number(pm[1]) : DEFAULT_PRIORITY;
   if (priority === 0) priority = DEFAULT_PRIORITY; // Linear 0 = "no priority": treat as the default
+  // Depends-on names PRs of this repo as #n. A reference to another repo (owner/name#n, or a
+  // pull or issue URL) is not read as a local number: it is kept, as written, in dependsOnOther,
+  // and it blocks landing until the line is fixed (see unmetDeps).
   const dependsOn = [];
+  const dependsOnOther = [];
   for (const m of text.matchAll(/^[ \t]*(?:[-*][ \t]+)?Depends-on:[ \t]*(.+)$/gim)) {
-    for (const d of m[1].matchAll(/#(\d+)/g)) dependsOn.push(Number(d[1]));
+    for (const tok of m[1].split(/[\s,]+/).filter(Boolean)) {
+      const local = tok.match(/^\(?#(\d+)[).;:]*$/);
+      if (local) dependsOn.push(Number(local[1]));
+      else if (/#\d+/.test(tok) || /\/(pull|issues)\/\d+/i.test(tok)) dependsOnOther.push(tok.replace(/[).;:,]+$/, ''));
+    }
   }
-  return { gates, gatedSha: gates.length ? gates[gates.length - 1].sha : null, pending, queuedAt, bounces, priority, dependsOn };
+  const lastGate = gates.length ? gates[gates.length - 1] : null;
+  return { gates, gatedSha: lastGate ? lastGate.sha : null, gatedBase: lastGate ? lastGate.base : null, pending, pendingBases, queuedAt, bounces, priority, dependsOn, dependsOnOther };
 }
 
-// Turn the lander's `Gate: pending @ <sha>` line into `Gate: pass @ <sha> (lander rebase)`.
+// Turn the lander's `Gate: pending @ <sha> ... base=<b>` line into `Gate: pass @ <sha> (lander
+// rebase) base=<b>`: the same base it was gated against, never another.
 export function confirmPending(body, sha) {
   const text = String(body || '').replace(/\r\n/g, '\n');
+  const base = parseLanding(text).pendingBases[String(sha).toLowerCase()];
   return text.split('\n').map((l) => (new RegExp(`^([-*][ \\t]+)?Gate:\\s*pending\\s*@\\s*${sha}\\b.*$`, 'i').test(l.trim())
-    ? `- Gate: pass @ ${sha} (lander rebase)` : l)).join('\n');
+    ? `- Gate: pass @ ${sha} (lander rebase)${base ? ` base=${base}` : ''}` : l)).join('\n');
 }
 
 // Write the section for a fresh enqueue by land-pr: one Gate line, Queued time, earlier bounces kept.
 // Other lines in the section (Bounced:, Hold-By:, notes) are kept.
-export function writeLanding(body, { gateSha, queuedAt }) {
+// The gate line records the base the gate ran against (land-pr's first validated read).
+export function writeLanding(body, { gateSha, queuedAt, base }) {
+  if (!base) throw new LandError('writeLanding needs the base the gate ran against');
   const parts = splitLanding(body);
   const rest = parts.lines.filter((l) => !/^(Gate|Queued):/i.test(strip(l)));
-  parts.lines = [`- Gate: pass @ ${gateSha}`, `- Queued: ${queuedAt}`, ...rest];
+  parts.lines = [`- Gate: pass @ ${gateSha} base=${base}`, `- Queued: ${queuedAt}`, ...rest];
   return joinLanding(parts);
 }
 
@@ -900,12 +925,19 @@ export function listWaiting(gh) {
 }
 
 // Unmerged Depends-on PRs of `pr` (numbers).
+// The Depends-on entries not met: local PR numbers not merged, and every reference to another
+// repo (never met: only this repo's PRs are supported).
 export function unmetDeps(gh, pr) {
-  return parseLanding(pr.body).dependsOn.filter((d) => {
+  const l = parseLanding(pr.body);
+  const local = l.dependsOn.filter((d) => {
     if (d === pr.number) return false;
     try { return gh.prView(d, 'number,state').state !== 'MERGED'; } catch { return true; }
   });
+  return [...local, ...l.dependsOnOther];
 }
+
+// How a Depends-on entry is shown: #n, or another repo's reference marked as unsupported.
+export const depName = (d) => (typeof d === 'number' ? `#${d}` : `${d} (another repo: not supported; use #n of this repo)`);
 
 // Split the queue into eligible PRs (in order), held PRs, and PRs waiting on a dependency.
 export function classifyQueue(gh, prs) {
@@ -926,7 +958,8 @@ export function classifyQueue(gh, prs) {
   for (const pr of orderQueue(prs)) {
     if (labelNames(pr).includes('queue-hold')) { held.push(pr.number); continue; }
     if (pr.isDraft) { drafts.push(pr.number); continue; }
-    const deps = parseLanding(pr.body).dependsOn.filter((d) => d !== pr.number && depOpen(d));
+    const l = parseLanding(pr.body);
+    const deps = [...l.dependsOn.filter((d) => d !== pr.number && depOpen(d)), ...l.dependsOnOther];
     if (deps.length) { waiting.push({ pr: pr.number, dependsOn: deps }); continue; }
     eligible.push(pr);
   }

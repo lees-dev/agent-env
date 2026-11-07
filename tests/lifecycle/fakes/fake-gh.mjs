@@ -106,6 +106,9 @@ function pr(sub, rest) {
       const cur = git('rev-parse', `refs/heads/${base}`).out;
       const c = spawnSync('git', ['-C', BARE, 'commit-tree', `${cur}^{tree}`, '-p', cur, '-m', 'base moved'], { encoding: 'utf8', shell: false }).stdout.trim();
       git('update-ref', `refs/heads/${base}`, c, cur);
+      // thenMutate: a change armed now, applied after the PR's next two reads (the lander's wait
+      // for its push and its full re-check before the base check), so only the retry sees it.
+      if (s.thenMutate) { s.mutateAfter = { kind: 'prView', n: 2, pr: p.number, ...s.thenMutate }; delete s.thenMutate; }
     }
     if (s.holdAfterLanderGate === p.number && /\(lander rebase\)/.test(p.body || '')) p.labels.push('queue-hold');
     log(s, { cmd: 'pr edit', pr: p.number, add, remove, body: o['body-file'] === '-' });
@@ -171,6 +174,8 @@ function countAndMutate(s, kind) {
   if (m.base) p.baseRefName = m.base;
   if (m.appendBody) p.body = `${p.body || ''}${m.appendBody}`;
   if (m.addLabel) p.labels = [...new Set([...(p.labels || []), m.addLabel])];
+  if (m.draft) p.isDraft = true;
+  if (m.state) p.state = m.state;
   if (m.steal) {
     const lock = 'refs/heads/agent-landing-lock';
     const g = (...a) => spawnSync('git', ['-C', BARE, ...a], { encoding: 'utf8', shell: false }).stdout.trim();

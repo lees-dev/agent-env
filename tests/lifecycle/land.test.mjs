@@ -12,7 +12,7 @@ import { after, describe, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  appendLanding, git as landGit, isStale, lockMessage, orderQueue, parseHolds, parseLanding, runAsync,
+  appendLanding, confirmPending, git as landGit, isStale, lockMessage, orderQueue, parseHolds, parseLanding, runAsync,
   parseLockMessage, rangeDiffChanges, registeredRepos, scrub, splitArgv, writeLanding,
 } from '../../home/dot_agents/bin/lib/land.mjs';
 // Through the namespace, so an older land.mjs without them fails only the tests that use them.
@@ -197,7 +197,7 @@ function queuePr(t, n, opts = {}) {
   const s = state(t);
   const p = s.prs.find((x) => x.number === n);
   p.labels = [...new Set(['queued', ...(opts.labels || [])])];
-  p.body = writeLanding(p.body, { gateSha: head, queuedAt: opts.queuedAt || `2026-11-06T0${n}:00:00Z` });
+  p.body = writeLanding(p.body, { gateSha: head, queuedAt: opts.queuedAt || `2026-11-06T0${n}:00:00Z`, base: opts.base || 'main' });
   saveState(t, s);
   return head;
 }
@@ -408,9 +408,9 @@ describe('lib/land.mjs', () => {
 
   test('Landing section: write, append, parse; other text kept', () => {
     const body = 'Summary\n\nLinear-Priority: 1\nDepends-on: #4, #7\n\n## Tests\n\nok\n';
-    const a = writeLanding(body, { gateSha: 'a'.repeat(40), queuedAt: '2026-11-06T00:00:00Z' });
+    const a = writeLanding(body, { gateSha: 'a'.repeat(40), queuedAt: '2026-11-06T00:00:00Z', base: 'main' });
     assert.match(a, /## Tests\n\nok/);
-    assert.equal(writeLanding(a, { gateSha: 'a'.repeat(40), queuedAt: '2026-11-06T00:00:00Z' }), a, 'idempotent');
+    assert.equal(writeLanding(a, { gateSha: 'a'.repeat(40), queuedAt: '2026-11-06T00:00:00Z', base: 'main' }), a, 'idempotent');
     const b = appendLanding(appendLanding(a, 'Bounced: 2026-11-06T01:00:00Z conflict'), `Gate: pass @ ${'b'.repeat(40)} (lander rebase)`);
     const l = parseLanding(b);
     assert.equal(l.gatedSha, 'b'.repeat(40));
@@ -418,8 +418,16 @@ describe('lib/land.mjs', () => {
     assert.equal(l.bounces.length, 1);
     assert.equal(l.priority, 1);
     assert.deepEqual(l.dependsOn, [4, 7]);
-    const c = writeLanding(b, { gateSha: 'c'.repeat(40), queuedAt: '2026-11-07T00:00:00Z' });
+    const c = writeLanding(b, { gateSha: 'c'.repeat(40), queuedAt: '2026-11-07T00:00:00Z', base: 'main' });
     assert.equal(parseLanding(c).gates.length, 1, 're-queue resets the gate lines');
+    // The gated base is the last gate line's own: an older line's base never vouches for it.
+    assert.equal(parseLanding(a).gatedBase, 'main');
+    assert.equal(l.gatedBase, null, 'the last gate line names no base: no base is proven');
+    assert.equal(parseLanding(c).gatedBase, 'main');
+    const d = parseLanding(appendLanding(a, `Gate: pass @ ${'d'.repeat(40)} (lander rebase) base=release/1.2`));
+    assert.deepEqual(d.gates.at(-1), { sha: 'd'.repeat(40), note: 'lander rebase', base: 'release/1.2' });
+    const pend = appendLanding(a, `Gate: pending @ ${'e'.repeat(40)} (lander rebase, push started) base=release/1.2`);
+    assert.match(confirmPending(pend, 'e'.repeat(40)), new RegExp(`- Gate: pass @ ${'e'.repeat(40)} \\(lander rebase\\) base=release/1\\.2`));
     assert.equal(parseLanding(c).bounces.length, 1, 're-queue keeps the bounce history');
     assert.equal(parseLanding('Linear-Priority: 0').priority, 3, 'no priority means the default');
     assert.equal(parseLanding('').priority, 3);
@@ -544,7 +552,7 @@ describe('land-pr', () => {
     const take = calls.findIndex((c) => c.cmd === 'api' && c.method === 'POST' && c.route === 'refs');
     const edit = calls.findIndex((c) => c.cmd === 'pr edit');
     assert.ok(take >= 0 && edit > take, 'the lock is taken before the edit');
-    assert.match(prOf(t, 1).body, new RegExp(`## Landing\\n\\n- Gate: pass @ ${head}\\n- Queued: `));
+    assert.match(prOf(t, 1).body, new RegExp(`## Landing\\n\\n- Gate: pass @ ${head} base=main\\n- Queued: `));
     assert.equal(lockExists(t), false, 'released');
   });
 
@@ -1801,18 +1809,21 @@ describe('land-queue', () => {
     });
   }
 
-  test('run: a PR retargeted mid-gate is aborted, then validated again against its new base', () => {
+  test('run: a PR retargeted mid-gate is aborted, then bounced: its gate ran against the old base', () => {
     const t = setup();
     const head = queuePr(t, 1);
     advanceMain(t, 'other.txt', 'x\n');
     sh(t.bare, t.env, 'branch', 'other', 'main');
+    const otherBefore = sh(t.bare, t.env, 'rev-parse', 'refs/heads/other');
     t.env.LAND_TEST_GATE_ACTION = 'retarget:1';
     const rep = runQueue(t);
     assert.match(rep.aborted[0].reason, /base changed to other before the push/);
-    assert.notEqual(sh(t.bare, t.env, 'rev-parse', 'refs/heads/other'), head);
-    // The second round landed it on its new base, after a new rebase and gate.
-    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
-    assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 2);
+    // The next pass never lands it on the new base on the old proof: a new gate and land-pr first.
+    assert.match(rep.bounced[0].reason, /the PR targets other, but its gate ran against main/);
+    assert.deepEqual(rep.merged, []);
+    assert.equal(sh(t.bare, t.env, 'rev-parse', 'refs/heads/other'), otherBefore, 'nothing merged into other');
+    assert.notEqual(otherBefore, head);
+    assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 1);
   });
 
   test('run: a lost lock stops the gate at once; the replacement lock, the PR labels and the checkout are left alone', () => {
@@ -2127,11 +2138,12 @@ describe('land-queue', () => {
     const first = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
     assert.equal(first.status, 1, 'the run reports the failed edit');
     assert.deepEqual(prOf(t, 1).labels, ['queued'], 'back in line, not blocked');
-    assert.match(prOf(t, 1).body, /Gate: pending @ [0-9a-f]{40}/);
+    assert.match(prOf(t, 1).body, /Gate: pending @ [0-9a-f]{40} \(lander rebase, push started\) base=main/);
     const rep = runQueue(t);
     assert.deepEqual(rep.bounced, []);
     assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
     assert.equal(parseLanding(prOf(t, 1).body).bounces.length, 0, 'no fix attempt used');
+    assert.match(prOf(t, 1).body, /Gate: pass @ [0-9a-f]{40} \(lander rebase\) base=main/, 'the recovered pass line keeps its base');
   });
 
   // Recovery after an error reads the PR again; another lander can take the lock during that
@@ -2396,7 +2408,8 @@ describe('land-queue', () => {
     const p = s.prs.find((x) => x.number === 1);
     p.baseRefName = 'other';
     p.labels = ['queued'];
-    p.body = writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z' });
+    // Gated against "other", the base it targets.
+    p.body = writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z', base: 'other' });
     saveState(t, s);
     spawnSync('git', ['-C', t.work, 'update-ref', '-d', 'refs/remotes/origin/other'], { env: t.env });
     assert.equal(fs.existsSync(`${t.work}-lander`), false);
@@ -2439,7 +2452,7 @@ describe('land-queue', () => {
     sh(t.work, t.env, 'push', '--quiet', '-f', 'origin', 'HEAD:refs/heads/agent/LEE-1-change');
     const head = sh(t.work, t.env, 'rev-parse', 'HEAD');
     const s = state(t);
-    s.prs.push({ number: 1, title: 'f1', headRefName: 'agent/LEE-1-change', baseRefName: 'main', state: 'OPEN', labels: ['queued'], body: writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z' }) });
+    s.prs.push({ number: 1, title: 'f1', headRefName: 'agent/LEE-1-change', baseRefName: 'main', state: 'OPEN', labels: ['queued'], body: writeLanding('', { gateSha: head, queuedAt: '2026-11-06T01:00:00Z', base: 'main' }) });
     saveState(t, s);
     advanceMain(t, 'other.txt', 'x\n');
     const dir = `${t.work}-lander`;
@@ -2631,9 +2644,10 @@ describe('land-queue', () => {
       queuePr(t, 1);
       sh(t.bare, t.env, 'branch', 'other', 'main');
       const mainBefore = sh(t.bare, t.env, 'rev-parse', 'refs/heads/main');
-      // Lock reads: #1 when the lock is taken (it is read first), #2 at the start of the landing;
-      // the change lands right after #2, so only the re-checks before the merge see it.
-      const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 2, pr: 1, ...mutate }; saveState(t, s);
+      // Reads of PR #1 while it lands (no rebase): #1 is the full re-check before the base check,
+      // #2 the last re-check after it. The change lands right after #1, between the two, so only
+      // the last read before the merge can see it (removing that re-check makes this test fail).
+      const s = state(t); s.mutateAfter = { kind: 'prView', n: 1, pr: 1, ...mutate }; saveState(t, s);
       const rep = runQueue(t);
       assert.equal(state(t).mutateAfter.seen >= 1, true);
       check(t, rep, mainBefore);
@@ -2756,7 +2770,7 @@ describe('land-queue', () => {
     const s = state(t);
     const p = s.prs.find((x) => x.number === 1);
     p.labels = ['queued'];
-    p.body = writeLanding(p.body, { gateSha: head, queuedAt: '2026-11-06T01:00:00Z' });
+    p.body = writeLanding(p.body, { gateSha: head, queuedAt: '2026-11-06T01:00:00Z', base: 'main' });
     saveState(t, s);
     advanceMain(t, 'other.txt', 'x\n');
     const rep = runQueue(t);
@@ -2805,6 +2819,94 @@ describe('land-queue', () => {
     const gates = parseLanding(prOf(t, 1).body).gates.filter((g) => /lander rebase/.test(g.note));
     assert.equal(gates.length, 2, 'rebased and gated twice');
     assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 2);
+  });
+
+  // The base moves before the merge, and in that window the PR is closed, made a draft, held or
+  // retargeted: the retry's fresh read is checked before any work. No second rebase or gate, no
+  // bounce or comment; a closed PR just loses `landing`, the others go back to queued.
+  for (const [what, change, expect] of [
+    ['closed', { state: 'CLOSED' }, (t, rep) => { assert.match(rep.aborted[0].reason, /PR is CLOSED before the retry/); assert.equal(prOf(t, 1).labels.includes('landing'), false); }],
+    ['made a draft', { draft: true }, (t, rep) => { assert.match(rep.aborted[0].reason, /made a draft before the retry/); assert.deepEqual(prOf(t, 1).labels, ['queued']); }],
+    ['put on hold', { addLabel: 'queue-hold' }, (t, rep) => { assert.match(rep.aborted[0].reason, /queue-hold appeared before the retry/); assert.deepEqual(prOf(t, 1).labels.sort(), ['queue-hold', 'queued']); }],
+    // Back in line after the abort, the next pass bounces it: its gate ran against main.
+    ['retargeted', { base: 'other' }, (t, rep) => {
+      assert.match(rep.aborted[0].reason, /base changed to other before the retry/);
+      assert.match(rep.bounced[0]?.reason || '', /the PR targets other, but its gate ran against main/);
+    }],
+  ]) {
+    test(`run: the base moves and the PR is ${what} before the retry: no second rebase or gate, no bounce`, () => {
+      const t = setup();
+      queuePr(t, 1);
+      sh(t.bare, t.env, 'branch', 'other', 'main');
+      advanceMain(t, 'other.txt', 'x\n');
+      const s = state(t); s.advanceBaseAfterLanderGate = 1; s.thenMutate = change; saveState(t, s);
+      const rep = runQueue(t);
+      assert.ok(state(t).mutateAfter?.seen >= 2, 'the change came in the retry window');
+      if (what !== 'retargeted') {
+        assert.deepEqual(rep.bounced, []);
+        assert.deepEqual(state(t).comments || [], [], 'no comment');
+      }
+      assert.equal(sh(t.bare, t.env, 'log', '-1', '--format=%s', 'main'), 'base moved', 'nothing merged into main');
+      assert.equal(rep.merged.length, 0);
+      assert.equal(fs.readFileSync(`${t.env.LAND_TEST_GATE}.runs`, 'utf8').length, 1, 'gated once, not again');
+      assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+      expect(t, rep);
+    });
+  }
+
+  // Depends-on names this repo's PRs as #n; another repo's reference is not a local number.
+  test('Depends-on another repo (owner/name#n or a URL) is not a local PR: it blocks, named as unsupported', () => {
+    for (const ref of ['owner/other#12', 'https://github.com/owner/other/pull/12']) {
+      const t = setup();
+      queuePr(t, 1, { body: `Depends-on: ${ref}\n` });
+      const rep = runQueue(t);
+      assert.equal(rep.merged.length, 0, ref);
+      assert.deepEqual(rep.waiting, [{ pr: 1, dependsOn: [ref] }], ref);
+      const txt = tool(t, LAND_QUEUE, 'status', '--repo', 'o/r');
+      assert.match(txt.out, new RegExp(`waiting #1 on ${ref.replace(/[./]/g, '\\$&')} \\(another repo: not supported`));
+      const head = makePr(t, 2, { body: `Depends-on: ${ref}\n` });
+      const r = tool(t, LAND_PR, '2', '--sha', head, '--repo', 'o/r');
+      assert.equal(r.status, 2);
+      assert.match(r.out, /^REFUSED Depends-on .*another repo: not supported/);
+    }
+    // #n of this repo still works.
+    const t = setup();
+    queuePr(t, 1, { body: 'Depends-on: #7, #8\n' });
+    assert.deepEqual(runQueue(t).waiting, [{ pr: 1, dependsOn: [7, 8] }]);
+  });
+
+  // A gate is proof for the base it ran against, recorded on its line. A PR retargeted after its
+  // gate never lands on the new base on that proof, in this run or a later one; a new gate and
+  // land-pr on the new base (which records it) lets it land there.
+  test('run: a PR retargeted after its gate is bounced (this run and the next); a fresh land-pr on the new base lands it', () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    sh(t.bare, t.env, 'branch', 'other', 'main');
+    const s = state(t); s.prs.find((p) => p.number === 1).baseRefName = 'other'; saveState(t, s);
+    const first = runQueue(t);
+    assert.deepEqual(first.merged, []);
+    assert.match(first.bounced[0].reason, /the PR targets other, but its gate ran against main: re-gate and re-review on other/);
+    const second = runQueue(t);
+    assert.deepEqual(second.merged, [], 'the next run does not land it either');
+    assert.equal(sh(t.bare, t.env, 'log', '-1', '--format=%s', 'other'), sh(t.bare, t.env, 'log', '-1', '--format=%s', 'main'), 'nothing merged into other');
+    // The gate is run again on other (here: the same head passes), then land-pr records base=other.
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r');
+    assert.equal(r.status, 0, r.err || r.out);
+    assert.match(prOf(t, 1).body, new RegExp(`Gate: pass @ ${head} base=other`));
+    const third = runQueue(t);
+    assert.deepEqual(third.merged.map((m) => m.pr), [1]);
+  });
+
+  test('run: a gate line without a base (older format) proves no base: bounced for a fresh gate and land-pr', () => {
+    const t = setup();
+    queuePr(t, 1);
+    const s = state(t);
+    const p = s.prs.find((x) => x.number === 1);
+    p.body = p.body.replace(/ base=main/, '');
+    saveState(t, s);
+    const rep = runQueue(t);
+    assert.deepEqual(rep.merged, []);
+    assert.match(rep.bounced[0].reason, /the gate line names no base/);
   });
 
   test('run: a leftover landing label (crashed run) is reset to queued under the lock', () => {
