@@ -333,9 +333,45 @@ export function slugFromRemote(cwd) {
 }
 
 // owner/name of a GitHub URL (https, ssh://, or scp-style git@github.com:owner/name), or null.
-function githubSlug(url) {
-  const m = String(url).trim().match(/^(?:https?:\/\/(?:[^@/\s]+@)?github\.com\/|ssh:\/\/(?:[^@/\s]+@)?github\.com(?::\d+)?\/|(?:[^@/\s:]+@)?github\.com:)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
-  return m ? `${m[1]}/${m[2]}` : null;
+// owner/name of a push URL that git sends to github.com, or null. Parsed the way git routes it,
+// never by substring: anything that could make the host ambiguous is refused first (control
+// characters, spaces, a backslash, `?`, `#`, or more than one `@`), then the authority is
+// exactly what follows `scheme://` up to the first `/`, and its host must be github.com:
+//   https://[user[:pass]@]github.com[:443]/owner/name[.git][/]
+//   ssh://[user@]github.com[:port]/owner/name[.git][/]
+//   [user@]github.com:owner/name[.git][/]           (scp style: no scheme)
+const GH_PART = '[A-Za-z0-9._-]+';
+const GH_PATH = new RegExp(`^\\/(${GH_PART})\\/(${GH_PART}?)(?:\\.git)?\\/?$`);
+function githubSlug(raw) {
+  const url = String(raw);
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f\\?#]/.test(url) || (url.match(/@/g) || []).length > 1) return null;
+  const scheme = url.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\//);
+  let host;
+  let pathPart;
+  if (scheme) {
+    const rest = url.slice(scheme[0].length);
+    const slash = rest.indexOf('/');
+    if (slash < 0) return null;
+    const authority = rest.slice(0, slash);
+    pathPart = rest.slice(slash);
+    const kind = scheme[1].toLowerCase();
+    const m = kind === 'https'
+      ? authority.match(/^(?:[A-Za-z0-9._~%!$&'()*+,;=-]+(?::[A-Za-z0-9._~%!$&'()*+,;=-]*)?@)?([^@:]+)(?::(443))?$/)
+      : kind === 'ssh' ? authority.match(/^(?:[A-Za-z0-9._-]+@)?([^@:]+)(?::\d{1,5})?$/) : null;
+    if (!m) return null;
+    host = m[1];
+  } else {
+    // scp style: host:path, where git takes it only when no `/` comes before the `:`.
+    const m = url.match(/^(?:[A-Za-z0-9._-]+@)?([^@:/]+):(.*)$/);
+    if (!m) return null;
+    host = m[1];
+    pathPart = `/${m[2]}`;
+    if (m[2].startsWith('/')) return null;
+  }
+  if (host.toLowerCase() !== 'github.com') return null;
+  const p = pathPart.match(GH_PATH);
+  return p ? `${p[1]}/${p[2]}` : null;
 }
 
 // Test mode only (AGENT_ENV_NO_SECRETS=1): AGENT_LAND_TEST_FAKE_GITHUB="owner/name=<path>"

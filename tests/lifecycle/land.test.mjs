@@ -238,6 +238,38 @@ function runQueue(t, ...extra) {
 // ------------------------------------------------------------------------- unit
 
 describe('lib/land.mjs', () => {
+  // origin's push URLs as git stores and routes them: only an exact github.com destination
+  // counts. Strings are built with AT so no literal user@host appears in the source.
+  test('push destination parsing: ambiguous or non-GitHub URLs are refused; GitHub forms (with :443) are accepted', () => {
+    const AT = '@';
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land push url '));
+    temps.push(tmp);
+    const repo = path.join(tmp, 'repo');
+    spawnSync('git', ['init', '--quiet', repo]);
+    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git']);
+    const target = (url) => {
+      const r = spawnSync('git', ['-C', repo, 'remote', 'set-url', '--push', 'origin', url], { encoding: 'utf8' });
+      assert.equal(r.status, 0, `git stored ${JSON.stringify(url)}`);
+      return landLib.pushTarget(repo).slug;
+    };
+    const cred = 'plainword-cred-7f3a';
+    for (const url of [
+      `https://localhost?${AT}github.com/o/r`, `https://localhost#${AT}github.com/o/r`, `https://${cred}${AT}localhost?${AT}github.com/o/r`,
+      'https://github.com.evil.example/o/r', `https://github.com${AT}evil.example/o/r`, 'https://evil.example/github.com/o/r',
+      'http://github.com/o/r', 'https://github.com/o/r?x=1', 'https://github.com/o/r#f', 'https://github.com:8443/o/r',
+      `git${AT}github.com:/o/r`, `https://u\\${AT}github.com/o/r`, `https://a${AT}b${AT}github.com/o/r`, 'github.com:o/r/extra',
+      'https://github.com/o', 'git://github.com/o/r', 'https://%67ithub.com/o/r', 'https://github.com./o/r', 'https://github.com/o/r\tx',
+    ]) {
+      assert.equal(target(url), null, `refused: ${JSON.stringify(url)}`);
+    }
+    for (const url of [
+      'https://github.com/o/r.git', 'https://github.com:443/o/r', `https://x-access-token:${cred}${AT}github.com/o/r.git`,
+      `ssh://git${AT}github.com:22/o/r.git`, `ssh://git${AT}github.com/o/r`, `git${AT}github.com:o/r.git`, 'https://GitHub.com/o/r/',
+    ]) {
+      assert.equal(target(url), 'o/r', `accepted: ${JSON.stringify(url)}`);
+    }
+  });
+
   // The no-kill test hook works only in the test mode: the switch alone (leaked into a real
   // lander's environment) still stops a command at its timeout.
   test('the no-kill switch without the test mode still stops a hung command', { timeout: 120000 }, async () => {
@@ -1399,6 +1431,20 @@ describe('land-queue', () => {
       assert.equal(lockExists(t), false, `${name}: no lock`);
       assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge' || (c.cmd === 'api' && c.method !== 'GET')), false, `${name}: no writes`);
     }
+  });
+
+  test('push destination: a credential in a refused URL never reaches the output; nothing is read or written', () => {
+    const AT = '@';
+    const t = setup();
+    const head = queuePr(t, 1);
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', `https://user:plainword-cred-7f3a${AT}localhost?${AT}github.com/o/r`);
+    const before = state(t).calls.length;
+    const p = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
+    assert.equal(p.status, 2);
+    assert.match(p.err, /cannot prove where the landing lock would be released: 1 of origin's 1 push URL\(s\) name no github\.com repo/);
+    assert.doesNotMatch(p.out + p.err, /plainword-cred|localhost/);
+    assert.equal(state(t).calls.length, before, 'no gh call at all');
+    assert.equal(lockExists(t), false);
   });
 
   test('push destination: a fetch mirror is fine when every push goes to the repo; an override push URL to it lands', () => {
