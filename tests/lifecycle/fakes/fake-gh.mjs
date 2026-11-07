@@ -44,7 +44,7 @@ function view(pr) {
     number: pr.number, title: pr.title || `PR ${pr.number}`, state: pr.state || 'OPEN', isDraft: Boolean(pr.isDraft), isCrossRepository: Boolean(pr.isCrossRepository),
     headRefName: pr.headRefName, headRefOid: pr.state === 'MERGED' ? pr.headRefOid : headOid(pr), baseRefName: pr.baseRefName || 'main',
     labels: (pr.labels || []).map((name) => ({ name })), body: pr.body || '', createdAt: pr.createdAt || '2026-11-01T00:00:00Z',
-    mergeCommit: pr.mergeCommit ? { oid: pr.mergeCommit } : null, url: `https://github.com/o/r/pull/${pr.number}`,
+    mergeCommit: pr.mergeCommit ? { oid: typeof pr.mergeCommit === 'string' ? pr.mergeCommit : pr.mergeCommit.oid } : null, url: `https://github.com/o/r/pull/${pr.number}`,
   };
 }
 
@@ -274,7 +274,12 @@ function api(rest) {
     return;
   }
   if ((mm = p.match(/^ref\/(heads\/.+)$/)) && method === 'GET') {
-    if (mm[1] === 'heads/agent-landing-lock') { countAndMutate(s, 'lockGet'); save(s); }
+    if (mm[1] === 'heads/agent-landing-lock') {
+      countAndMutate(s, 'lockGet');
+      // Test hook: the next lockReadFail lock reads fail (no HTTP status).
+      if (s.lockReadFail > 0) { s.lockReadFail -= 1; save(s); die('Server Error', 500); }
+      save(s);
+    }
     const r = git('rev-parse', '--verify', `refs/${mm[1]}`);
     if (!r.ok) die('Not Found', 404);
     process.stdout.write(JSON.stringify({ ref: `refs/${mm[1]}`, object: { sha: r.out } }));
@@ -284,6 +289,23 @@ function api(rest) {
     const cur = git('rev-parse', '--verify', `refs/${mm[1]}`);
     if (!cur.ok) die('Reference does not exist', 422);
     if (o.F.force !== 'true' && !git('merge-base', '--is-ancestor', cur.out, o.f.sha).ok) die('Update is not a fast forward', 422);
+    // Test hook: a lock update whose answer is lost (no HTTP status). 'own': the update was
+    // applied; 'foreign': another lander's commit is there instead; 'unreadable': applied, and
+    // the next lock ref read fails too.
+    if (s.refPatchLostAnswer && mm[1] === 'heads/agent-landing-lock') {
+      const kind = s.refPatchLostAnswer;
+      delete s.refPatchLostAnswer;
+      let sha = o.f.sha;
+      if (kind === 'foreign') {
+        sha = git('commit-tree', git('rev-parse', `${o.f.sha}^{tree}`).out, '-m', `agent-landing-lock host=other pid=1 at=${new Date().toISOString()} ttl=45`).out;
+        s.foreignLock = sha;
+      }
+      if (kind === 'unreadable') s.lockReadFail = 1;
+      git('update-ref', `refs/${mm[1]}`, sha, cur.out);
+      s.patchedLock = sha;
+      save(s);
+      die('read: connection reset by peer');
+    }
     git('update-ref', `refs/${mm[1]}`, o.f.sha, cur.out);
     process.stdout.write(JSON.stringify({ object: { sha: o.f.sha } }));
     return;

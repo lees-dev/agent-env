@@ -466,6 +466,10 @@ describe('lib/land.mjs', () => {
     const s = scrub(`{"api_key": "plain1value", "client_secret":"two words here", 'TOKEN': 'q3value', "name": "kept"}`);
     assert.doesNotMatch(s, /plain1value|two words|words here|q3value/);
     assert.match(s, /"name": "kept"/, 'other keys are kept');
+    // Scrubbing twice changes nothing: a masked value does not swallow the text after it.
+    const once = scrub('{"api_key":"x","name":"KEPT"} TOKEN=abc next');
+    assert.equal(scrub(once), once);
+    assert.match(once, /"name":"KEPT"\} TOKEN=\[redacted\] next/);
   });
 
   test('rangeDiffChanges', () => {
@@ -1625,6 +1629,7 @@ describe('land-queue', () => {
       Object.assign(t.env, { AGENT_LAND_CMD_TIMEOUT_MS: then === 'hang' ? '4000' : '600000', AGENT_LAND_STUCK_MS: '3000' });
       const rep = runQueue(t);
       assert.deepEqual(rep.merged.map((m) => m.pr), [1], 'the confirmed merge is reported');
+      assert.match(String(rep.merged[0].mergeSha), /^[0-9a-f]{40}$/, 'the merge sha is a sha string');
       assert.equal(sweepCount(t), 1, 'counted once, and no sweep ran');
       assert.equal(rep.sweep, null);
       assert.match(rep.alerts.join('\n'), /#1 merged, but .*stopped before any sweep or other landing/);
@@ -1731,6 +1736,48 @@ describe('land-queue', () => {
     const again = runQueue(t, '--reclaim-stale');
     assert.equal(again.merged.length, 1);
     assert.match(again.alerts[0], /reclaimed a stale landing lock/);
+    assert.equal(lockExists(t), false);
+  });
+
+  // A lock update (refresh) whose answer is lost after GitHub applied it: only our own new
+  // commit is adopted. Another lander's commit is never adopted or removed; a ref that cannot be
+  // read leaves the outcome unknown (treated as lost), and the release still deletes our own
+  // commit there, so the lock is never reported released while it stays.
+  for (const kind of ['own', 'foreign', 'unreadable']) {
+    test(`lock: a refresh whose answer is lost (${kind})`, { timeout: 180000 }, () => {
+      const t = setup();
+      queuePr(t, 1);
+      // A moved base: rebase and gate; the gate runs long enough for lock refreshes.
+      advanceMain(t, 'other.txt', 'x\n');
+      Object.assign(t.env, { LAND_TEST_GATE_SLEEP_MS: '1500', AGENT_LAND_TICK_MS: '200' });
+      const s = state(t); s.refPatchLostAnswer = kind; saveState(t, s);
+      const rep = runQueue(t);
+      const after = state(t);
+      assert.ok(after.patchedLock, 'the refresh ran and its answer was lost');
+      if (kind === 'own') {
+        assert.deepEqual(rep.merged.map((m) => m.pr), [1], 'adopted: the landing went on');
+        assert.equal(lockExists(t), false, 'released');
+      } else if (kind === 'foreign') {
+        assert.deepEqual(rep.merged, []);
+        assert.equal(lockSha(t), after.foreignLock, 'the other lander keeps its lock');
+        assert.deepEqual(prOf(t, 1).labels, ['landing'], 'nothing changed after the loss');
+      } else {
+        assert.deepEqual(rep.merged, []);
+        assert.equal(rep.lockRetained ?? null, null);
+        assert.equal(lockExists(t), false, 'our own commit at the ref was deleted, not left behind as released');
+      }
+    });
+  }
+
+  test('lock: reclaiming a stale lock whose answer is lost adopts our own commit, lands, and releases it', () => {
+    const t = setup();
+    queuePr(t, 1);
+    setLock(t, 120);
+    const s = state(t); s.refPatchLostAnswer = 'own'; saveState(t, s);
+    const rep = runQueue(t, '--reclaim-stale');
+    assert.ok(state(t).patchedLock);
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.match(rep.alerts.join('\n'), /reclaimed a stale landing lock/);
     assert.equal(lockExists(t), false);
   });
 
@@ -2423,6 +2470,30 @@ describe('land-queue', () => {
     }
   });
 
+  // A quoted credential value with an escaped quote (JSON \") or a doubled one (YAML '') is
+  // masked to its real close, in the body, the comment and the report; an even run of
+  // backslashes still closes it, and a field after it is kept. Dummy values only.
+  for (const [kind, arg] of [
+    ['JSON escaped quote', '{"api_key":"ALPHA\\" BETA GAMMA","name":"KEPT"}'],
+    ['YAML doubled single quote', "'TOKEN':'ALPHA'' BETA GAMMA' name:KEPT"],
+    ['JSON escaped backslash before the close', '{"api_key":"ALPHA\\\\","name":"KEPT"}'],
+    ['hyphenated key', '{"token-value":"ALPHA BETA GAMMA","build-id":"KEPT"}'],
+  ]) {
+    test(`a bounce reason masks a quoted credential value to its real close (${kind}) in the body, comment and report`, () => {
+      const t = setup({ affectedGate: [`node scripts/gate.mjs ${arg}`] });
+      queuePr(t, 1);
+      advanceMain(t, 'other.txt', 'x\n');
+      fs.writeFileSync(t.env.LAND_TEST_GATE, 'fail');
+      const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--json');
+      assert.equal(r.status, 0, r.err);
+      assert.equal(JSON.parse(r.out).bounced.length, 1);
+      for (const [where, text] of [['body', prOf(t, 1).body], ['comment', state(t).comments.map((c) => c.body).join('\n')], ['report', r.out]]) {
+        assert.doesNotMatch(text, /ALPHA|BETA|GAMMA/, `${where}: no part of the value`);
+        assert.match(text, /KEPT/, `${where}: the field after it is kept`);
+      }
+    });
+  }
+
   test('a draft PR stays queued but is not landed; one made a draft mid-gate is aborted, not bounced', () => {
     const t = setup();
     queuePr(t, 1);
@@ -2780,9 +2851,11 @@ describe('land-queue', () => {
     ].join('\n'));
     queuePr(t, 1);
     t.cwd = t.tmp;
-    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--root', t.work, '--json');
+    // Text output: the merge sha is a sha (the stored {oid} shape is read as GitHub returns it).
+    const r = tool(t, LAND_QUEUE, 'run', '--repo', 'o/r', '--root', t.work);
     assert.equal(r.status, 0, r.err || r.out);
-    assert.deepEqual(JSON.parse(r.out).merged.map((m) => m.pr), [1]);
+    assert.match(r.out, /MERGED #1 [0-9a-f]{40}/);
+    assert.doesNotMatch(r.out, /\[object Object\]/);
   });
 
   // A mergeCmd that merges and then fails (a later step of a wrapper) still merged: counted and
@@ -2803,6 +2876,7 @@ describe('land-queue', () => {
       const rep = runQueue(t);
       if (merges) {
         assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+        assert.match(String(rep.merged[0].mergeSha), /^[0-9a-f]{40}$/, 'the merge sha is a sha string');
         assert.equal(rep.bounced.length, 0);
         assert.deepEqual(prOf(t, 1).labels.filter((l) => /^queue|^landing$/.test(l)), [], 'queue labels cleared');
         assert.equal(JSON.parse(fs.readFileSync(path.join(t.env.HOME, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'counted');

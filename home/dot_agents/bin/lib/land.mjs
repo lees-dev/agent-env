@@ -275,8 +275,10 @@ export function scrub(text) {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[redacted key]')
     .replace(/\b(postgres(ql)?|mysql|mongodb(\+srv)?|redis|amqps?):\/\/[^\s'"]+/gi, '$1://[redacted]')
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '[email]')
-    // KEY=v, KEY: v, and quoted keys and values ("api_key": "a b", 'TOKEN': 'x').
-    .replace(/\b([A-Z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|DATABASE_URL)[A-Z0-9_]*)["']?\s*[=:]\s*("[^"\n]*"?|'[^'\n]*'?|\S+)/gi, '$1=[redacted]')
+    // KEY=v, KEY: v, hyphenated keys, and quoted keys and values ("api_key": "a b", 'TOKEN': 'x'):
+    // a quoted value runs to its real close (\" and '' escapes). A value already masked stays as
+    // it is, so scrubbing twice changes nothing.
+    .replace(/\b([A-Z0-9_-]*(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|DATABASE_URL)[A-Z0-9_-]*)["']?\s*[=:]\s*(\[redacted\]|"(?:\\.|""|[^"\\\n])*"?|'(?:''|\\.|[^'\\\n])*'?|\S+)/gi, '$1=[redacted]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 [redacted]');
 }
 
@@ -610,6 +612,7 @@ export class LandingLock {
     this.ttlMin = ttlMin;
     this.cwd = cwd;
     this.commit = null;
+    this.unconfirmed = null;
   }
 
   route(suffix = '') { return `repos/${this.gh.repo}/git/${suffix}`; }
@@ -672,8 +675,23 @@ export class LandingLock {
   advance(fromSha, tree) {
     const next = this.makeCommit(tree, fromSha);
     const r = this.gh.api('PATCH', this.route(`refs/heads/${LOCK_REF}`), { fields: { sha: next }, typed: { force: 'false' } });
-    if (!r.ok) return false;
+    if (!r.ok) {
+      // The answer may be lost after GitHub moved the ref (as with a lost create): only our own
+      // new commit is ours to adopt. Another commit there is not ours. A ref that cannot be read
+      // leaves the outcome unknown: false, and release() also checks for that commit, so a lock
+      // of ours left at it is deleted or reported, never counted as released.
+      let cur;
+      try {
+        const g = this.gh.api('GET', this.route(`ref/heads/${LOCK_REF}`));
+        cur = g.ok ? g.data?.object?.sha : g.status === 404 ? null : undefined;
+      } catch { cur = undefined; }
+      if (cur !== next) {
+        if (cur === undefined) this.unconfirmed = next;
+        return false;
+      }
+    }
     this.commit = next;
+    this.unconfirmed = null;
     heldLock = this;
     return true;
   }
@@ -727,6 +745,16 @@ export class LandingLock {
       cur = g.ok ? g.data?.object?.sha : g.status === 404 ? null : mine;
     } catch {
       cur = mine;
+    }
+    // Our own commit from a refresh whose answer was lost and whose ref could not be read then:
+    // still ours. It is deleted the same way (leased on that commit), or reported.
+    const own = this.unconfirmed;
+    this.unconfirmed = null;
+    if (own && cur === own) {
+      const r2 = git(['push', '--no-verify', '--quiet', '--porcelain', `--force-with-lease=refs/heads/${LOCK_REF}:${own}`, 'origin', `:refs/heads/${LOCK_REF}`], { cwd: this.cwd });
+      if (r2.status === 0) return true;
+      this.retained = { sha: own, reason: firstLine(r2.stderr || r2.stdout) || `git push exit ${r2.status}` };
+      return false;
     }
     if (cur !== mine) return true;
     this.retained = { sha: mine, reason: firstLine(r.stderr || r.stdout) || `git push exit ${r.status}` };
