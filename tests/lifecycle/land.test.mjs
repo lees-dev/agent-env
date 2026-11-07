@@ -1469,6 +1469,34 @@ describe('land-queue', () => {
     assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
   });
 
+  // --repo spellings that differ only in case are one repo: its sweep counts are one record, and
+  // counts already written under another spelling are kept (added), so a due sweep is not lost.
+  test('sweep counts: case variants of --repo share one record; existing alias counts are folded in', { timeout: 180000 }, () => {
+    const t = setup({ sweepEveryMerges: 4, wideSweep: 'node scripts/sweep.mjs' });
+    const file = path.join(t.home, '.agents', 'state', 'land-queue.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ 'O/R': { merges: 3, sinceSweep: 3 }, 'o/r': { merges: 1, sinceSweep: 1 }, 'x/y': { merges: 7, sinceSweep: 2 } }));
+    queuePr(t, 1);
+    t.env.LAND_TEST_SWEEP = 'pass';
+    // 3 + 1 = 4: the sweep is due, so it runs first; then the merge counts 1.
+    const first = tool(t, LAND_QUEUE, 'run', '--repo', 'O/r', '--json');
+    assert.equal(first.status, 0, first.err || first.out);
+    assert.deepEqual(JSON.parse(first.out).merged.map((m) => m.pr), [1]);
+    let s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(Object.keys(s).sort(), ['o/r', 'x/y'], 'one record per repo; other repos untouched');
+    assert.equal(s['o/r'].merges, 5);
+    assert.equal(s['o/r'].sinceSweep, 1, 'swept (to 0) before the merge, then counted');
+    assert.deepEqual(s['x/y'], { merges: 7, sinceSweep: 2 });
+    // Another spelling adds to the same record.
+    queuePr(t, 2);
+    const second = tool(t, LAND_QUEUE, 'run', '--repo', 'o/R', '--json');
+    assert.equal(second.status, 0, second.err || second.out);
+    s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(Object.keys(s).sort(), ['o/r', 'x/y']);
+    assert.equal(s['o/r'].merges, 6);
+    assert.equal(s['o/r'].sinceSweep, 2);
+  });
+
   test('run: a stale lock is reported, not reclaimed, without --reclaim-stale', () => {
     const t = setup();
     queuePr(t, 1);

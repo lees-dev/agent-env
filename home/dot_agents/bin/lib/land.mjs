@@ -1042,8 +1042,33 @@ export function validateLandingCommands(cfg, { gate = true, merge = true } = {})
 
 // ---------------------------------------------------------------- wide sweep
 
+// GitHub repo names are case-insensitive (resolveRepo accepts `--repo O/R` for origin o/r), so
+// every spelling shares one record, under the lower-case name. Records written under other
+// spellings are folded in: their counts are added (each counted different merges), so a sweep
+// that is due is never lost, and the newest times are kept.
+const stateKey = (repo) => String(repo).toLowerCase();
+function foldedRecord(s, repo) {
+  const key = stateKey(repo);
+  const out = { merges: 0, sinceSweep: 0 };
+  for (const [k, v] of Object.entries(s || {})) {
+    if (stateKey(k) !== key || !v || typeof v !== 'object') continue;
+    for (const [f, x] of Object.entries(v)) {
+      if (f === 'merges' || f === 'sinceSweep') out[f] += Number(x) || 0;
+      else if (!(f in out) || (typeof x === 'string' && typeof out[f] === 'string' && x > out[f])) out[f] = x;
+    }
+  }
+  return out;
+}
+// Replace every spelling of repo's record with the one folded record; returns it.
+function foldInto(s, repo) {
+  const rec = foldedRecord(s, repo);
+  for (const k of Object.keys(s)) if (stateKey(k) === stateKey(repo)) delete s[k];
+  s[stateKey(repo)] = rec;
+  return rec;
+}
+
 export function sweepState(repo) {
-  return readJson(path.join(stateDir(), 'land-queue.json'), {})?.[repo] || {};
+  return foldedRecord(readJson(path.join(stateDir(), 'land-queue.json'), {}), repo);
 }
 
 export function sweepDue(repo, cfg) {
@@ -1122,17 +1147,20 @@ function updateState(fn) {
 
 export function bumpMergeCount(repo) {
   return updateState((s) => {
-    const cur = { merges: 0, sinceSweep: 0, ...(s[repo] || {}) };
+    const cur = foldInto(s, repo);
     cur.merges += 1;
     cur.sinceSweep += 1;
     cur.lastMergeAt = new Date().toISOString();
-    s[repo] = cur;
     return cur;
   });
 }
 
 export function markSwept(repo) {
-  updateState((s) => { s[repo] = { ...(s[repo] || {}), sinceSweep: 0, lastSweepAt: new Date().toISOString() }; });
+  updateState((s) => {
+    const cur = foldInto(s, repo);
+    cur.sinceSweep = 0;
+    cur.lastSweepAt = new Date().toISOString();
+  });
 }
 
 // Repos for --all: the engine's registry (~/.agents/state/repos.json), each root that still has
