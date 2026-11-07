@@ -472,6 +472,26 @@ describe('repo-defaults apply.mjs', () => {
     assert.ok(fs.lstatSync(path.join(r.work, 'CLAUDE.md')).isSymbolicLink());
   });
 
+  // A link to another file inside the repo is refused too (fixed by hand): apply never writes
+  // through a link, and the other items still apply.
+  test('CLAUDE.md linked to another file in the repo (docs/CLAUDE.md) is invalid; apply leaves both as they were', (t) => {
+    const r = repo();
+    fs.mkdirSync(path.join(r.work, 'docs'));
+    fs.writeFileSync(path.join(r.work, 'docs', 'CLAUDE.md'), 'Claude notes.\n');
+    try { fs.symlinkSync(path.join('docs', 'CLAUDE.md'), path.join(r.work, 'CLAUDE.md'), 'file'); } catch (e) {
+      if (e.code === 'EPERM') { t.skip('symlinks need Developer Mode on Windows'); return; }
+      throw e;
+    }
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 1, a.err);
+    const item = a.json.items.find((i) => i.name === 'CLAUDE.md');
+    assert.equal(item.status, 'invalid');
+    assert.match(item.detail, /link to docs.CLAUDE\.md, not this repo's AGENTS\.md: fix by hand/);
+    assert.ok(fs.lstatSync(path.join(r.work, 'CLAUDE.md')).isSymbolicLink(), 'the link stays');
+    assert.equal(read(r, 'docs/CLAUDE.md'), 'Claude notes.\n', 'the target is not written through');
+    assert.equal(a.json.items.find((i) => i.name === 'AGENTS.md block').status, 'ok', 'the other items still apply');
+  });
+
   test('t3.json: an engine script with extra repo fields is kept; a manual script keeps its async', () => {
     const want = JSON.parse(fs.readFileSync(path.join(SKILL, 'assets', 't3.json'), 'utf8'));
     const withIcon = { ...want.scripts[0], icon: 'rocket' };

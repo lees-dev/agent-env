@@ -213,6 +213,8 @@ async function landOne(ctx, pr, wantIn = null) {
     if (merges.status !== 0) return bounceOwned(ctx, pr, `cannot list the branch's commits (git rev-list exit ${merges.status})`);
     const mergeCount = merges.stdout.split(/\r?\n/).filter(Boolean).length;
     if (mergeCount) return bounceOwned(ctx, pr, `the branch has ${mergeCount} merge commit(s), which an automatic rebase would drop; rebase it onto ${base} by hand, then re-gate and re-review`);
+    // The reads and fetches above take time: the checkout is reset only while the lock is ours.
+    if (!lock.stillHeld()) return abort(gh, pr, { requeue: 'the landing lock was lost', lost: true }, 'the rebase', lock);
     resetTo(dir, head);
     // Repo hooks (pre-rebase, post-rewrite) run here: without the token, like every child, as a
     // landing step (lock refreshed, command timeout).

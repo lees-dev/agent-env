@@ -275,7 +275,8 @@ export function scrub(text) {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[redacted key]')
     .replace(/\b(postgres(ql)?|mysql|mongodb(\+srv)?|redis|amqps?):\/\/[^\s'"]+/gi, '$1://[redacted]')
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g, '[email]')
-    .replace(/\b([A-Z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|DATABASE_URL)[A-Z0-9_]*)\s*[=:]\s*\S+/gi, '$1=[redacted]')
+    // KEY=v, KEY: v, and quoted keys and values ("api_key": "a b", 'TOKEN': 'x').
+    .replace(/\b([A-Z0-9_]*(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|DATABASE_URL)[A-Z0-9_]*)["']?\s*[=:]\s*("[^"\n]*"?|'[^'\n]*'?|\S+)/gi, '$1=[redacted]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 [redacted]');
 }
 
@@ -1085,6 +1086,9 @@ function verifyLander(dir, mainRoot, mainCommon) {
   return refuse('it is not a registered worktree of this repository');
 }
 
+// Untracked files go; git-ignored ones (dependencies, caches, build output) stay, as a cache
+// between PRs: the gate contract (docs/lifecycle.md) has setup and the gate rebuild every output
+// the gate reads.
 export function resetTo(dir, ref) {
   gitOk(['checkout', '--quiet', '--detach', '--force', ref], { cwd: dir });
   gitOk(['clean', '-fdq'], { cwd: dir });

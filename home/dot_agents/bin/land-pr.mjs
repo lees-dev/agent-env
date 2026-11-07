@@ -48,8 +48,13 @@
 //   REFUSED <reason>        queue-hold, landing, unmerged Depends-on, the repo is paused
 //                           (AGENT_LANDING_PAUSED=1), no holder id, or a hold this caller
 //                           did not set: no merge, no label change                   exit 2
+//                           (one exception: after --release-hold has released the hold,
+//                           a refusal found later leaves that release in place; its
+//                           reason ends "your hold was already released and the gated
+//                           sha recorded". Nothing is rolled back.)
 // Errors (head is not the gated sha, draft, closed, retargeted, merge failed, no gate in
-// .agents/repo.json) exit 1 (a config error exits 2); bad usage exits 2.
+// .agents/repo.json) exit 1 (a config error exits 2); bad usage exits 2. An error after a
+// release likewise leaves the release in place.
 import {
   Gh, LandError, LandingLock,
   addHold, baseTreeOf, depName, bumpMergeCount, capacityUsed, captureToken, classifyQueue, dueSweep, fetchBranch, firstLine, gitOk,
@@ -293,11 +298,18 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     }
   };
   sameTarget(pr);
+  // Made a draft or found to be a fork while waiting for the lock: refused before any edit.
+  if (pr.isDraft) throw new LandError(`PR #${n} is a draft: mark it ready first`);
+  if (pr.isCrossRepository) return refuse('the PR is from a fork, which the land queue does not land; merge it by hand');
 
   // Release the caller's own hold and record the new gated sha in one edit. Every check runs
   // again on this fresh read first (only queue-hold itself is excepted; `landing`, an unmerged
   // Depends-on or a pause refuses with no edit at all).
   let released = false;
+  // A refusal after the release (a pause, a landing, an unmerged Depends-on, or an overdue sweep
+  // that is not green, all found later) is a partial result: the release stands, nothing is
+  // rolled back, and the reason says so.
+  const refuseNow = (why) => refuse(released ? `${why}; your hold was already released and the gated sha recorded` : why);
   if (args['release-hold']) {
     const holder = holderId(args.holder);
     const holds = parseHolds(pr.body);
@@ -334,7 +346,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
   }
 
   const refused = refusal(gh, pr);
-  if (refused) return refuse(refused);
+  if (refused) return refuseNow(refused);
   const labels = labelNames(pr);
   const blocked = labels.includes('queue-blocked');
   const { base, headRef } = want;
@@ -348,13 +360,13 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
     if (p.state === 'MERGED') return { done: mergedOut(p) };
     if (p.state !== 'OPEN') throw new LandError(`PR #${n} is ${p.state}`);
     if (p.isDraft) throw new LandError(`PR #${n} is a draft: mark it ready first`);
-    if (p.isCrossRepository) return { done: refuse('the PR is from a fork, which the land queue does not land; merge it by hand') };
+    if (p.isCrossRepository) return { done: refuseNow('the PR is from a fork, which the land queue does not land; merge it by hand') };
     if (p.headRefOid !== sha) throw new LandError(`PR #${n} head moved to ${p.headRefOid} while landing; re-run the gate`);
     if ((p.baseRefName || base) !== base || p.headRefName !== headRef) {
       throw new LandError(`PR #${n} now targets ${p.baseRefName} from ${p.headRefName}; re-run the gate and land-pr`);
     }
     const why = refusal(gh, p);
-    return why ? { done: refuse(why) } : null;
+    return why ? { done: refuseNow(why) } : null;
   };
 
   // Merge now: fair (nobody else in line), current, and not already in the queue system. The
@@ -370,7 +382,7 @@ async function underLock({ args, n, sha, cfg, root, repo, gh, lock, out, refuse,
       }
       if (s?.alert) process.stderr.write(`warning: ${s.alert}\n`);
       if (s && (!s.ok || s.lost || s.stop || s.paused)) {
-        return refuse(`an overdue wide sweep on ${base} did not finish green (${s.lost ? 'the landing lock was lost' : s.paused ? 'the repo is paused' : 'see the warning'}); nothing was merged`);
+        return refuseNow(`an overdue wide sweep on ${base} did not finish green (${s.lost ? 'the landing lock was lost' : s.paused ? 'the repo is paused' : 'see the warning'}); nothing was merged`);
       }
     }
     fetchBranch(root, base);

@@ -462,6 +462,12 @@ describe('lib/land.mjs', () => {
     assert.doesNotMatch(s, /u:p@|abc123|xxxxxxxx|me@example|abcdefghijkl/);
   });
 
+  test('scrub masks quoted credential keys and quoted values (JSON, YAML)', () => {
+    const s = scrub(`{"api_key": "plain1value", "client_secret":"two words here", 'TOKEN': 'q3value', "name": "kept"}`);
+    assert.doesNotMatch(s, /plain1value|two words|words here|q3value/);
+    assert.match(s, /"name": "kept"/, 'other keys are kept');
+  });
+
   test('rangeDiffChanges', () => {
     const out = '1:  aaaaaaa = 1:  bbbbbbb one\n2:  ccccccc ! 2:  ddddddd two\n    @@ inner diff\n-:  ------- > 3:  eeeeeee three\n';
     const r = rangeDiffChanges(out);
@@ -773,6 +779,46 @@ describe('land-pr', () => {
     assert.deepEqual(edits[0].remove, ['queue-hold']);
     assert.equal(edits[0].body, true, 'label and gated sha in the same edit');
     assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+  });
+
+  // Made a draft, or found to be a fork, while land-pr waits for the lock: the locked read
+  // refuses before the release edit, so the hold stays.
+  for (const [kind, change, status, msg] of [['draft', { draft: true }, 1, /is a draft/], ['fork', { fork: true }, 2, /from a fork/]]) {
+    test(`--release-hold: a PR that becomes a ${kind} while taking the lock keeps its hold (no edit)`, () => {
+      const t = setup();
+      const head = heldPr(t);
+      // Repo-variable read #1 is the unlocked refusal check; the change lands right after it.
+      const s = state(t); s.mutateAfter = { kind: 'varGet', n: 1, pr: 1, ...change }; saveState(t, s);
+      const body = prOf(t, 1).body;
+      const labels = [...prOf(t, 1).labels].sort();
+      const before = state(t).calls.length;
+      const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+      assert.equal(state(t).mutateAfter.seen >= 1, true);
+      assert.equal(r.status, status, `${r.out}\n${r.err}`);
+      assert.match(`${r.out}\n${r.err}`, msg);
+      assert.equal(state(t).calls.slice(before).some((c) => c.cmd === 'pr edit' || c.cmd === 'pr merge'), false, 'nothing changed');
+      assert.equal(prOf(t, 1).body, body, 'the Hold-By line stays');
+      assert.deepEqual([...prOf(t, 1).labels].sort(), labels, 'queue-hold stays');
+      assert.equal(lockExists(t), false);
+    });
+  }
+
+  // A reason found after the release (here `landing`, set right after the locked checks) is a
+  // partial result: REFUSED, the release stands, and the reason says so.
+  test('--release-hold: a refusal found after the release says the hold was already released', () => {
+    const t = setup();
+    const head = heldPr(t);
+    // Repo-variable reads: #1 unlocked checks, #2 the locked checks before the release.
+    const s = state(t); s.mutateAfter = { kind: 'varGet', n: 2, pr: 1, addLabel: 'landing' }; saveState(t, s);
+    const r = tool(t, LAND_PR, '1', '--sha', head, '--release-hold', '--holder', HOLDER, '--repo', 'o/r');
+    assert.equal(r.status, 2, r.err);
+    assert.match(r.out, /^REFUSED landing .*; your hold was already released and the gated sha recorded$/);
+    const p = prOf(t, 1);
+    assert.doesNotMatch(p.body, /Hold-By:/);
+    assert.equal(p.labels.includes('queue-hold'), false);
+    assert.equal(parseLanding(p.body).gatedSha, head);
+    assert.equal(state(t).calls.some((c) => c.cmd === 'pr merge'), false);
+    assert.equal(lockExists(t), false);
   });
 
   test('hold: adds queue-hold and a Hold-By line in one edit; holder defaults to $T3CODE_THREAD_ID', () => {
@@ -2165,6 +2211,24 @@ describe('land-queue', () => {
     assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched: the next lander recovers `landing`');
     assert.equal(prOf(t, 1).body, bodyBefore, 'body untouched');
     assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.work, t.env, 'rev-parse', 'origin/main'), 'the checkout was not reset');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
+  // The reads and fetches before the rebase take time; another lander can take the lock in that
+  // window. The lander checkout is reset to the PR head only while the lock is still ours.
+  test('run: lock taken before the rebase checkout reset: checkout, labels and the foreign lock untouched', () => {
+    const t = setup();
+    const head = queuePr(t, 1);
+    advanceMain(t, 'other.txt', 'x\n');
+    // Lock reads: 1 the acquire, 2 landOne's first check, 3 the check right before the reset.
+    const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 3, pr: 1, steal: true }; saveState(t, s);
+    const rep = runQueue(t);
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen, 'the lock was taken before the reset');
+    assert.deepEqual(rep.aborted, [{ pr: 1, reason: 'the landing lock was lost before the rebase' }]);
+    assert.deepEqual(rep.merged, []);
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), head, 'the checkout was not reset to the PR head');
+    assert.deepEqual(prOf(t, 1).labels, ['landing'], 'labels untouched: the next lander recovers `landing`');
     assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
   });
 

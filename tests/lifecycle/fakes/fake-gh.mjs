@@ -163,7 +163,7 @@ function label(sub, rest) {
 
 // Test hook: right after the n-th call of one kind ('varGet': a repo variable read, 'lockGet':
 // a landing-lock ref read), change one PR once, so only the reads after it see the change:
-// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel?, steal? }; kind 'prView' counts reads of PR `pr`.
+// s.mutateAfter = { kind, n, pr, base?, appendBody?, addLabel?, draft?, fork?, state?, steal? }; kind 'prView' counts reads of PR `pr`.
 // steal: another lander replaces the landing lock (its sha goes to mutateAfter.stolen).
 function countAndMutate(s, kind) {
   const m = s.mutateAfter;
@@ -175,6 +175,7 @@ function countAndMutate(s, kind) {
   if (m.appendBody) p.body = `${p.body || ''}${m.appendBody}`;
   if (m.addLabel) p.labels = [...new Set([...(p.labels || []), m.addLabel])];
   if (m.draft) p.isDraft = true;
+  if (m.fork) p.isCrossRepository = true;
   if (m.state) p.state = m.state;
   if (m.steal) {
     const lock = 'refs/heads/agent-landing-lock';
