@@ -1437,7 +1437,9 @@ describe('land-queue', () => {
     const AT = '@';
     const t = setup();
     const head = queuePr(t, 1);
-    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', `https://user:plainword-cred-7f3a${AT}localhost?${AT}github.com/o/r`);
+    // The old substring match read this as o/r (userinfo `localhost:<cred>?`); git's authority is
+    // `localhost:<cred>` (an invalid port, so nothing connects anywhere).
+    sh(t.work, t.env, 'remote', 'set-url', '--push', 'origin', `https://localhost:plainword-cred-7f3a?${AT}github.com/o/r`);
     const before = state(t).calls.length;
     const p = tool(t, LAND_PR, '1', '--sha', head, '--repo', 'o/r', '--json');
     assert.equal(p.status, 2);
