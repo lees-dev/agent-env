@@ -278,7 +278,7 @@ export function scrub(text) {
     // KEY=v, KEY: v, hyphenated keys, and quoted keys and values ("api_key": "a b", 'TOKEN': 'x'):
     // a quoted value runs to its real close (\" and '' escapes). A value already masked stays as
     // it is, so scrubbing twice changes nothing.
-    .replace(/\b([A-Z0-9_-]*(SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|CREDENTIAL|DATABASE_URL)[A-Z0-9_-]*)["']?\s*[=:]\s*(\[redacted\]|"(?:\\.|""|[^"\\\n])*"?|'(?:''|\\.|[^'\\\n])*'?|\S+)/gi, '$1=[redacted]')
+    .replace(/\b([A-Z0-9_-]*(SECRET|TOKEN|PASSWORD|PASSWD|API[-_]KEY|APIKEY|PRIVATE[-_]KEY|CREDENTIAL|DATABASE[-_]URL)[A-Z0-9_-]*)["']?\s*[=:]\s*(\[redacted\]|"(?:\\.|""|[^"\\\n])*"?|'(?:''|\\.|[^'\\\n])*'?|\S+)/gi, '$1=[redacted]')
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, '$1 [redacted]');
 }
 
@@ -1236,6 +1236,8 @@ export function sweepDue(repo, cfg) {
 export async function runSweep({ cfg, mainRoot, lock }) {
   const dir = landerCheckout(mainRoot, cfg.base);
   fetchBranch(dir, cfg.base);
+  // Fetching can outlast ownership: never reset a new holder's checkout.
+  if (lock && !lock.stillHeld()) return { ok: false, lost: true, summary: 'the landing lock was lost before the sweep' };
   resetTo(dir, `refs/remotes/origin/${cfg.base}`);
   const r = await runCommands([...named('setup', cfg.setup), ...sweepCommands(cfg)], dir, lock, cfg);
   // A command that could not be stopped may still use the checkout, and after a lost lock the

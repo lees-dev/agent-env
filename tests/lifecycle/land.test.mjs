@@ -1781,6 +1781,26 @@ describe('land-queue', () => {
     assert.equal(lockExists(t), false);
   });
 
+  // The sweep fetches the base before it resets the lander checkout; another lander can take the
+  // lock during that fetch. The checkout is reset only while the lock is still ours: here the
+  // sweep stops as lost, nothing is paused, and the sweep stays due.
+  test('run: lock taken during the sweep fetch: checkout not reset, no pause, the sweep stays due', () => {
+    const t = setup({ sweepEveryMerges: 1, wideSweep: 'node scripts/sweep.mjs' });
+    queuePr(t, 1);
+    // Lock reads up to the merge and the sweep's start; read 8 is the check after its fetch.
+    const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 8, pr: 1, steal: true }; saveState(t, s);
+    const rep = runQueue(t);
+    const after = state(t);
+    assert.ok(after.mutateAfter.stolen, 'the lock was taken during the sweep');
+    assert.deepEqual(rep.merged.map((m) => m.pr), [1]);
+    assert.equal(rep.sweep?.lost, true);
+    assert.match(rep.alerts.join('\n'), /wide sweep on main stopped: the landing lock was lost; it stays due/);
+    assert.notEqual(sh(`${t.work}-lander`, t.env, 'rev-parse', 'HEAD'), sh(t.bare, t.env, 'rev-parse', 'main'), 'the checkout was not reset to the base');
+    assert.equal(after.variables?.AGENT_LANDING_PAUSED, undefined, 'not paused');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(t.env.HOME, '.agents', 'state', 'land-queue.json'), 'utf8'))['o/r'].sinceSweep, 1, 'the sweep stays due');
+    assert.equal(lockSha(t), after.mutateAfter.stolen, 'the other lander keeps its lock');
+  });
+
   test('run: a fresh lock held by another lander means busy, nothing touched', () => {
     const t = setup();
     queuePr(t, 1);
@@ -2478,6 +2498,10 @@ describe('land-queue', () => {
     ['YAML doubled single quote', "'TOKEN':'ALPHA'' BETA GAMMA' name:KEPT"],
     ['JSON escaped backslash before the close', '{"api_key":"ALPHA\\\\","name":"KEPT"}'],
     ['hyphenated key', '{"token-value":"ALPHA BETA GAMMA","build-id":"KEPT"}'],
+    ['hyphen inside the keyword (api-key)', '{"api-key":"ALPHA","build-id":"KEPT"}'],
+    ['hyphen inside the keyword (x-api-key)', '{"x-api-key":"ALPHA BETA","build-id":"KEPT"}'],
+    ['hyphen inside the keyword (private-key)', "private-key='ALPHA GAMMA' build-id=KEPT"],
+    ['hyphen inside the keyword (database-url)', 'database-url=ALPHA build-id=KEPT'],
   ]) {
     test(`a bounce reason masks a quoted credential value to its real close (${kind}) in the body, comment and report`, () => {
       const t = setup({ affectedGate: [`node scripts/gate.mjs ${arg}`] });

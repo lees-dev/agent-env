@@ -108,7 +108,7 @@ The tree sha256 is the sha256 of these lines, sorted bytewise by relpath: `<targ
 | `herdr` | identical in both | 1 | `ec8f944a509de0497642390a564f27d23974efb874c28194d54ebb80ee48e9ab` |
 | `how` | identical in both | 3 | `c0681d3cc32d4164739a917c266b2dd5573d32037b8aba95a0b708e06664078b` |
 | `kun` | identical in both | 1 | `c5cafaca2a3c140002f140e96af2a2eb77423fe7d89251bef59e2b5577833892` |
-| `land-queue` | written here (2026-11-06) | 1 | `f94d06e1c4f1a020c68da3cb14c7611d0e0d45c777e57a69aa22f14e84177225` |
+| `land-queue` | written here (2026-11-06) | 1 | `d2595483b30c9e25c47a9060285cbf39d2e2750375b6f8311d5fb7d5de9feb1f` |
 | `leaving-pr-comments` | identical in both | 2 | `247ef56da1e550f14cc3b87cab818378f714c461fb42aa4ea441def39e03e661` |
 | `maintain-verification-skill` | identical in both | 1 | `367c331254656433db735dd0f14ba8cbe4edec2f0f7ad84a899908471f5eac13` |
 | `modernize` | identical in both | 2 | `8b49a15ce260749a1fd237bf775a07b507114b1fedc2dd26ecacbeac164f1b62` |
