@@ -237,7 +237,49 @@ function runQueue(t, ...extra) {
 
 // ------------------------------------------------------------------------- unit
 
+// git for the standalone tests below: no inherited GIT_* (a hook's GIT_DIR would point every
+// call at an outer repo) and an empty config of its own (no user insteadOf or hooks).
+function isolatedGitEnv(tmp, extra = {}) {
+  const cfg = path.join(tmp, 'gitconfig');
+  fs.writeFileSync(cfg, '');
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^GIT_/i.test(k)));
+  return { ...env, GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', ...extra };
+}
+// In-process calls (pushTarget, git) read process.env: run fn with it set to env, then put the
+// original back. Tests in one file run one after another, so nothing else sees the change.
+function withProcessEnv(env, fn) {
+  const saved = { ...process.env };
+  for (const k of Object.keys(process.env)) delete process.env[k];
+  Object.assign(process.env, env);
+  try { return fn(); } finally {
+    for (const k of Object.keys(process.env)) delete process.env[k];
+    Object.assign(process.env, saved);
+  }
+}
+
 describe('lib/land.mjs', () => {
+  // The standalone git tests run inside a hook-like environment (GIT_DIR and GIT_INDEX_FILE of an
+  // outer repo): that repo's config and index stay byte for byte the same.
+  test('standalone git tests leave an outer repo alone (inherited GIT_DIR / GIT_INDEX_FILE)', { timeout: 180000 }, () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land outer '));
+    temps.push(tmp);
+    const outer = path.join(tmp, 'outer');
+    const env = isolatedGitEnv(tmp);
+    spawnSync('git', ['init', '--quiet', outer], { env });
+    fs.writeFileSync(path.join(outer, 'f.txt'), 'x\n');
+    spawnSync('git', ['-C', outer, 'add', 'f.txt'], { env });
+    const bytes = () => [fs.readFileSync(path.join(outer, '.git', 'config')), fs.readFileSync(path.join(outer, '.git', 'index'))].map((b) => b.toString('base64'));
+    const before = bytes();
+    const r = spawnSync(process.execPath, ['--test', '--test-name-pattern=push destination parsing|hanging transport return at the bound', fileURLToPath(import.meta.url)], {
+      // NODE_TEST_CONTEXT would make the nested runner report to this one and run nothing.
+      env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT')), GIT_DIR: path.join(outer, '.git'), GIT_INDEX_FILE: path.join(outer, '.git', 'index'), GIT_WORK_TREE: outer },
+      encoding: 'utf8', timeout: 170000,
+    });
+    assert.equal(r.status, 0, (r.stdout || '').split('\n').filter((l) => /✖|Error/.test(l)).join('\n'));
+    assert.match(r.stdout, /pass 2\b/, 'both standalone tests ran');
+    assert.deepEqual(bytes(), before, 'the outer repo config and index are unchanged');
+  });
+
   // origin's push URLs as git stores and routes them: only an exact github.com destination
   // counts. Strings are built with AT so no literal user@host appears in the source.
   test('push destination parsing: ambiguous or non-GitHub URLs are refused; GitHub forms (with :443) are accepted', () => {
@@ -245,12 +287,13 @@ describe('lib/land.mjs', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'land push url '));
     temps.push(tmp);
     const repo = path.join(tmp, 'repo');
-    spawnSync('git', ['init', '--quiet', repo]);
-    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git']);
+    const env = isolatedGitEnv(tmp);
+    spawnSync('git', ['init', '--quiet', repo], { env });
+    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git'], { env });
     const target = (url) => {
-      const r = spawnSync('git', ['-C', repo, 'remote', 'set-url', '--push', 'origin', url], { encoding: 'utf8' });
+      const r = spawnSync('git', ['-C', repo, 'remote', 'set-url', '--push', 'origin', url], { env, encoding: 'utf8' });
       assert.equal(r.status, 0, `git stored ${JSON.stringify(url)}`);
-      return landLib.pushTarget(repo).slug;
+      return withProcessEnv(env, () => landLib.pushTarget(repo).slug);
     };
     const cred = 'plainword-cred-7f3a';
     for (const url of [
@@ -336,10 +379,11 @@ describe('lib/land.mjs', () => {
     fs.writeFileSync(path.join(bin, 'git-remote-hang'), '#!/bin/sh\nsleep 60\n');
     fs.chmodSync(path.join(bin, 'git-remote-hang'), 0o755);
     const repo = path.join(tmp, 'repo');
-    spawnSync('git', ['init', '--quiet', repo]);
-    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'hang::nowhere']);
-    const pk = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
-    const env = { ...process.env, [pk]: `${bin}${path.delimiter}${process.env[pk]}` };
+    const base = isolatedGitEnv(tmp);
+    spawnSync('git', ['init', '--quiet', repo], { env: base });
+    spawnSync('git', ['-C', repo, 'remote', 'add', 'origin', 'hang::nowhere'], { env: base });
+    const pk = Object.keys(base).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+    const env = { ...base, [pk]: `${bin}${path.delimiter}${base[pk]}` };
     const saved = process.env.AGENT_LAND_NET_TIMEOUT_MS;
     process.env.AGENT_LAND_NET_TIMEOUT_MS = '3000';
     try {
@@ -2371,7 +2415,7 @@ describe('land-queue', () => {
       const rep = runQueue(t);
       assert.match(rep.bounced[0].reason, /timed out after .* the landing lock is kept/);
       assert.ok(rep.lockRetained?.sha, 'the lock is reported as kept');
-      assert.match(rep.alerts.join('\n'), /the landing lock is kept because .* may still run.*; stop that command's processes/);
+      assert.match(rep.alerts.join('\n'), /the landing lock is kept because .* may still run.*; once that command's processes in the lander checkout have stopped and no lander run is active, remove it with: git push --no-verify --force-with-lease=/);
       assert.equal(lockExists(t), true, 'the lock outlives the command');
       assert.equal(rep.merged.length, 0);
       assert.deepEqual(prOf(t, 2).labels, ['queued'], 'the run stopped');
@@ -2587,9 +2631,9 @@ describe('land-queue', () => {
       queuePr(t, 1);
       sh(t.bare, t.env, 'branch', 'other', 'main');
       const mainBefore = sh(t.bare, t.env, 'rev-parse', 'refs/heads/main');
-      // Lock reads: #1 in the first full re-check before the merge; the change lands right after
-      // it, so only the last read before the merge sees it.
-      const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 1, pr: 1, ...mutate }; saveState(t, s);
+      // Lock reads: #1 when the lock is taken (it is read first), #2 at the start of the landing;
+      // the change lands right after #2, so only the re-checks before the merge see it.
+      const s = state(t); s.mutateAfter = { kind: 'lockGet', n: 2, pr: 1, ...mutate }; saveState(t, s);
       const rep = runQueue(t);
       assert.equal(state(t).mutateAfter.seen >= 1, true);
       check(t, rep, mainBefore);

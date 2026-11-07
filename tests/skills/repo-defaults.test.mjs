@@ -480,10 +480,41 @@ describe('repo-defaults apply.mjs', () => {
     const a = run(r, '--apply', '--json');
     assert.equal(a.status, 0, a.out);
     const t3 = JSON.parse(read(r, 't3.json'));
-    assert.deepEqual(t3.scripts.map((s) => s.name), ['Agent setup', 'Agent teardown', 'Agent setup', 'Watch']);
+    // The kept copy would share "Agent setup" with the canonical script (T3 shows one): renamed.
+    assert.deepEqual(t3.scripts.map((s) => s.name), ['Agent setup', 'Agent teardown', 'Agent setup (kept)', 'Watch']);
     assert.equal(t3.scripts[2].icon, 'rocket');
+    assert.equal(t3.scripts[2].command, withIcon.command, 'command unchanged');
     assert.equal(t3.scripts[3].async, true);
     assert.match(a.json.actions.join('\n'), /custom script\(s\) that call agent-worktree kept/);
+    assert.match(a.json.actions.join('\n'), /1 kept script\(s\) renamed/);
+  });
+
+  test('t3.json: kept scripts get unique names (canonical, earlier kept and existing "(kept)" names); nothing else changes; a second apply renames nothing', () => {
+    const extra = { icon: 'gear', cwd: 'tools', env: { A: '1' } };
+    const scripts = [
+      { name: 'Agent setup', command: 'npm run custom-setup', ...extra },
+      { name: 'Agent setup (kept)', command: 'npm run older' },
+      { name: 'Build', command: 'npm run build' },
+      { name: 'Build', command: 'npm run build:ci', ...extra },
+      { name: 'Lint', command: 'npm run lint' },
+    ];
+    const r = repo({ 't3.json': JSON.stringify({ defaultThreadEnvMode: 'local', scripts }) });
+    const a = run(r, '--apply', '--json');
+    assert.equal(a.status, 0, a.out);
+    const t3 = JSON.parse(read(r, 't3.json'));
+    assert.deepEqual(t3.scripts.map((s) => s.name), [
+      'Agent setup', 'Agent teardown', 'Agent setup (kept 2)', 'Agent setup (kept)', 'Build', 'Build (kept)', 'Lint',
+    ]);
+    // Every field but the name is exactly as it was.
+    const strip = ({ name, ...rest }) => rest;
+    assert.deepEqual(t3.scripts.slice(2).map(strip), scripts.map(strip));
+    assert.match(a.json.actions.join('\n'), /2 kept script\(s\) renamed/);
+    const bytes = read(r, 't3.json');
+    const again = run(r, '--apply', '--json');
+    assert.equal(again.status, 0);
+    assert.equal(again.json.drift, 0);
+    assert.doesNotMatch(again.json.actions.join('\n'), /renamed/);
+    assert.equal(read(r, 't3.json'), bytes, 'idempotent');
   });
 
   test('t3.json: a field named like an Object prototype member (constructor) still counts as extra', () => {
@@ -995,12 +1026,29 @@ describe('repo-defaults apply.mjs', () => {
       '.github/workflows/f.yml': 'on: [push, merge_group]\njobs: {}\n',
       '.github/workflows/g.yml': 'on:\n  push:\n    branches: [pull_request]\njobs: {}\n',
       '.github/workflows/h.yml': "name: 'pull_request'\non: push\njobs: {}\n",
+      // A flow list over several lines: closing ] in column 0, an inline comment, a quoted name.
+      '.github/workflows/i.yml': 'on: [push,\n  pull_request]\njobs: {}\n',
+      '.github/workflows/j.yml': 'on: [\n  push, # pull_request_target in a comment\n  "merge_group"\n]\njobs: {}\n',
+      // An unclosed list stops at the next top-level key: jobs and what is under it are not read.
+      '.github/workflows/k.yml': 'on: [push,\n  workflow_dispatch\njobs:\n  pull_request: {}\n',
+      // A quoted name with spaces around it in a one-line flow list.
+      '.github/workflows/l.yml': 'on: [ push, "pull_request_target" ]\njobs: {}\n',
+      // A branch filter as a block list is the same as g.yml's flow list: no event, not gating.
+      '.github/workflows/m.yml': 'on:\n  push:\n    branches:\n      - pull_request\njobs: {}\n',
+      // An event sequence at the block's own indent is events.
+      '.github/workflows/n.yml': 'on:\n  - push\n  - pull_request_target\njobs: {}\n',
+      // Quoted names nested under an event are values, not events.
+      '.github/workflows/o.yml': 'on:\n  push:\n    paths:\n      - "merge_group"\n    tags: ["pull_request"]\njobs: {}\n',
     });
     const p = spawnSync(process.execPath, [APPLY, '--repo', r.work, '--inspect', '--offline', '--json'], { env: r.e, encoding: 'utf8', shell: false });
     assert.deepEqual(JSON.parse(p.stdout).gatingWorkflows, [
       { file: '.github/workflows/d.yml', triggers: ['pull_request'] },
       { file: '.github/workflows/e.yml', triggers: ['pull_request'] },
       { file: '.github/workflows/f.yml', triggers: ['merge_group'] },
+      { file: '.github/workflows/i.yml', triggers: ['pull_request'] },
+      { file: '.github/workflows/j.yml', triggers: ['merge_group'] },
+      { file: '.github/workflows/l.yml', triggers: ['pull_request_target'] },
+      { file: '.github/workflows/n.yml', triggers: ['pull_request_target'] },
     ]);
   });
 

@@ -313,6 +313,7 @@ function t3Json(root) {
         if (c.runOnSettle) c.runOnSettle = false;
         return c;
       });
+      const renamed = uniqueKeptNames(want.scripts, others);
       const out = { ...cur, defaultThreadEnvMode: 'worktree', scripts: [...want.scripts, ...others] };
       writeIn(root, p, `${JSON.stringify(out, null, 2)}\n`);
       const kept = scripts.filter((s) => !isCanonical(s));
@@ -321,9 +322,31 @@ function t3Json(root) {
       const notes = [];
       if (demoted) notes.push(`${demoted} other automatic script(s) made manual: move that work into .agents/repo.json setup or .agents/hooks.mjs`);
       if (custom) notes.push(`${custom} custom script(s) that call agent-worktree kept: check them by hand`);
+      if (renamed) notes.push(`${renamed} kept script(s) renamed (" (kept)") so T3 shows every script; their commands are unchanged`);
       return `updated t3.json${notes.length ? ` (${notes.join('; ')})` : ''}`;
     },
   };
+}
+
+// T3 shows one script per name, so a kept script must not share a name with a canonical one or
+// with a kept script before it. Only such a script is renamed, to "<name> (kept)", then
+// "<name> (kept 2)" and so on, skipping every name already in the file; no other field changes.
+// Returns how many were renamed (none on a second run: the names are unique by then).
+function uniqueKeptNames(canonical, kept) {
+  const taken = new Set(canonical.map((s) => s.name));
+  const all = new Set([...taken, ...kept.map((s) => s.name)]);
+  let renamed = 0;
+  for (const s of kept) {
+    if (typeof s.name !== 'string' || !taken.has(s.name)) { taken.add(s.name); continue; }
+    let n = 1;
+    let name;
+    do { name = `${s.name} (kept${n > 1 ? ` ${n}` : ''})`; n++; } while (taken.has(name) || all.has(name));
+    s.name = name;
+    taken.add(name);
+    all.add(name);
+    renamed++;
+  }
+  return renamed;
 }
 
 // A copy of one of the canonical engine scripts: the same command (whitespace aside) and no
@@ -583,28 +606,35 @@ function workflowTriggers(text) {
   const start = lines.findIndex((l) => /^(on|"on"|'on')\s*:/.test(l));
   if (start < 0) return [];
   const names = new Set();
-  const word = (s) => s.replace(/^['"]|['"]$/g, '').trim();
-  const head = lines[start].replace(/^(on|"on"|'on')\s*:/, '').trim();
+  const word = (s) => s.trim().replace(/^['"]|['"]$/g, '').trim();
+  let head = lines[start].replace(/^(on|"on"|'on')\s*:/, '').trim();
+  // A flow sequence can continue across lines; do not consume the next top-level key.
+  for (let i = start + 1; head.startsWith('[') && !head.includes(']') && i < lines.length; i++) {
+    if (/^\S/.test(lines[i]) && !/^\]/.test(lines[i])) break;
+    head += ` ${lines[i].trim()}`;
+  }
   if (head) {
-    // `on: push`, `on: [push, pull_request]`, `on: {pull_request: {...}}`
+    // `on: push`, `on: [push, pull_request]`, `on: {pull_request: {...}}`: an inline value has no
+    // block under it, so nothing after this line is an event.
     for (const part of head.replace(/[[\]{}]/g, ',').split(',')) {
       const n = word(part.split(':')[0]);
       if (n) names.add(n);
     }
+    return [...names];
   }
+  // The block: events are its entries at one indent, the first entry's (a key, or a `- item`,
+  // which may sit in column 0). Anything deeper (branches, paths, types under an event) is not.
+  let eventIndent = null;
   for (let i = start + 1; i < lines.length; i++) {
     const l = lines[i];
     if (!l.trim()) continue;
     if (/^\S/.test(l) && !/^-\s/.test(l)) break;
+    const indent = l.match(/^\s*/)[0].length;
+    if (eventIndent === null) eventIndent = indent;
+    if (indent !== eventIndent) continue;
     let m;
     if ((m = l.match(/^\s*-\s+(['"]?[A-Za-z_]+['"]?)\s*$/))) names.add(word(m[1]));
-    else if ((m = l.match(/^(\s*)(['"]?[A-Za-z_]+['"]?)\s*:/))) {
-      // Only the block's own keys (its first indent level), not keys nested under an event.
-      const indent = m[1].length;
-      const first = lines.slice(start + 1, i + 1).find((x) => x.trim() && /^\s*['"]?[A-Za-z_]+['"]?\s*:/.test(x));
-      const firstIndent = first ? first.match(/^\s*/)[0].length : indent;
-      if (indent === firstIndent) names.add(word(m[2]));
-    }
+    else if ((m = l.match(/^\s*(['"]?[A-Za-z_]+['"]?)\s*:/))) names.add(word(m[1]));
   }
   return [...names];
 }
